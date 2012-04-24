@@ -60,7 +60,7 @@
           <XmlFormattingPolicy inheritsSet="Mono" inheritsScope="application/xml" scope="application/xml" />
           <TextStylePolicy inheritsSet="Mono" inheritsScope="text/plain" scope="text/plain" />
           <VersionControlPolicy inheritsSet="Mono" />
-          <ChangeLogPolicy inheritsSet="Mono" />
+          <ChangeLogPolicy UpdateMode="None" inheritsSet="Mono" />
           <CSharpFormattingPolicy inheritsSet="Mono" inheritsScope="text/x-csharp" scope="text/x-csharp" />
         </Policies>
       </Properties>
