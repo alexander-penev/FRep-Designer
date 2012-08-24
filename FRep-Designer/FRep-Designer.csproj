@@ -51,6 +51,7 @@
     <Compile Include="gtk-gui\MainWindow.cs" />
     <Compile Include="AssemblyInfo.cs" />
     <Compile Include="MainClass.cs" />
+    <Compile Include="Model\Solid.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
   <ProjectExtensions>
