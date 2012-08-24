@@ -9,16 +9,12 @@
     <widget-library name="../bin/Debug/FRep-Designer.exe" internal="true" />
   </import>
   <widget class="Gtk.Window" id="MainWindow" design-size="706 572">
-    <action-group name="Default">
-      <action id="FileAction">
+    <action-group name="Help">
+      <action id="aboutAction">
         <property name="Type">Action</property>
-        <property name="Label" translatable="yes">File</property>
-        <property name="ShortLabel" translatable="yes">File</property>
-      </action>
-      <action id="HelpAction">
-        <property name="Type">Action</property>
-        <property name="Label" translatable="yes">Help</property>
-        <property name="ShortLabel" translatable="yes">Help</property>
+        <property name="Label" translatable="yes">About...</property>
+        <property name="ShortLabel" translatable="yes">About...</property>
+        <property name="StockId">gtk-about</property>
       </action>
     </action-group>
     <action-group name="File">
@@ -53,12 +49,16 @@
         <signal name="Activated" handler="OnExitActionActivated" />
       </action>
     </action-group>
-    <action-group name="Help">
-      <action id="aboutAction">
+    <action-group name="Default">
+      <action id="FileAction">
         <property name="Type">Action</property>
-        <property name="Label" translatable="yes">About...</property>
-        <property name="ShortLabel" translatable="yes">About...</property>
-        <property name="StockId">gtk-about</property>
+        <property name="Label" translatable="yes">File</property>
+        <property name="ShortLabel" translatable="yes">File</property>
+      </action>
+      <action id="HelpAction">
+        <property name="Type">Action</property>
+        <property name="Label" translatable="yes">Help</property>
+        <property name="ShortLabel" translatable="yes">Help</property>
       </action>
     </action-group>
     <property name="MemberName" />
