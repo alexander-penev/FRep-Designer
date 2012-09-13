@@ -44,7 +44,7 @@ namespace FRepDesigner
         {
         }
 
-        public static float Eval (string expression, params object[] p)
+        public static float Eval(string expression, params object[] p)
         {
             MethodInfo mi;
 
