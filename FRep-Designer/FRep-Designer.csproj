@@ -54,6 +54,8 @@
     <Compile Include="MainClass.cs" />
     <Compile Include="Model\Solid.cs" />
     <Compile Include="Model\Evaluator.cs" />
+    <Compile Include="Model\FRepSolid.cs" />
+    <Compile Include="Model\Math3D.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
   <ProjectExtensions>
