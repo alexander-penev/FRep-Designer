@@ -56,6 +56,7 @@
     <Compile Include="Model\Evaluator.cs" />
     <Compile Include="Model\FRepSolid.cs" />
     <Compile Include="Model\Math3D.cs" />
+    <Compile Include="Model\Scene.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
   <ProjectExtensions>
