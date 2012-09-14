@@ -37,6 +37,7 @@
   <ItemGroup>
     <Compile Include="TestFRepSolid.cs" />
     <Compile Include="TestModelEvaluator.cs" />
+    <Compile Include="TestMath3D.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
   <ItemGroup>
