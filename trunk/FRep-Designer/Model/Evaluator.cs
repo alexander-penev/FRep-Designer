@@ -10,7 +10,7 @@ namespace FRepDesigner
     public static class Evaluator
     {
         private static Dictionary<string, MethodInfo> cachedEvaluators = new Dictionary<string, MethodInfo>();
-        private static string[] referenceAssemblies = {"System"};
+        private static string[] referenceAssemblies = {"System.dll"};
         private static string usingClauses = ""; 
         private static string embededFunctions = 
             "public const double pi = Math.PI;"+
