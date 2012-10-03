@@ -29,6 +29,80 @@ namespace FRepDesigner
             this.Y = y;
             this.Z = z;
         }
+        #region Vector to Vector
+        public static Vector3D operator +(Vector3D v1)
+        {
+            return
+                (
+                    new Vector3D
+                    (
+                    +v1.X,
+                    +v1.Y,
+                    +v1.Z
+                    )
+                    );
+        }
+        
+        public static Vector3D operator -(Vector3D v1)
+        {
+            return
+                (
+                    new Vector3D
+                    (
+                    -v1.X,
+                    -v1.Y,
+                    -v1.Z
+                    )
+                    );
+        }
+        
+        
+        public static Vector3D operator +(Vector3D v1, Vector3D v2)
+        {
+            return
+                (
+                    new Vector3D
+                    (
+                    v1.X + v2.X,
+                    v1.Y + v2.Y,
+                    v1.Z + v2.Z
+                    )
+                    );
+        }
+        
+        public static Vector3D operator -(Vector3D v1, Vector3D v2)
+        {
+            return
+                (
+                    new Vector3D
+                    (
+                    v1.X - v2.X,
+                    v1.Y - v2.Y,
+                    v1.Z - v2.Z
+                    )
+                    );
+        }
+        
+        
+        public static double operator *(Vector3D v1, Vector3D v2)
+        {
+            return
+                (
+                    v1.X * v2.X +
+                    v1.Y * v2.Y +
+                    v1.Z * v2.Z
+                    
+                    );
+        }
+        public static Vector3D operator ^(Vector3D  v1, Vector3D  v2)
+        {
+            return
+                (
+                    new Vector3D (v1.Y * v2.Z - v1.Z * v2.Y, v1.Z * v2.X - v1.X * v2.Z, v1.X * v2.Y - v1.Y * v2.X)
+                    );
+        }
+        #endregion Vector to Vector
+
     }
     public class Point3D : Vector3D
     {
@@ -40,6 +114,7 @@ namespace FRepDesigner
         {
         }
     }
+    
 
     //TODO:rorate
    
