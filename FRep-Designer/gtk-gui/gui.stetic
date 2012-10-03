@@ -16,6 +16,12 @@
         <property name="ShortLabel" translatable="yes">About...</property>
         <property name="StockId">gtk-about</property>
       </action>
+      <action id="SpehereAction">
+        <property name="Type">Action</property>
+        <property name="Label" translatable="yes">Spehere</property>
+        <property name="ShortLabel" translatable="yes">Spehere</property>
+        <signal name="Activated" handler="OnSpehereActionActivated" />
+      </action>
     </action-group>
     <action-group name="File">
       <action id="newAction">
@@ -102,6 +108,7 @@
               <node type="Toolitem" action="newAction" />
               <node type="Toolitem" action="openAction" />
               <node type="Toolitem" action="saveAction" />
+              <node type="Toolitem" action="SpehereAction" />
             </node>
           </widget>
           <packing>

@@ -5,6 +5,7 @@ public partial class MainWindow
 {
 	private global::Gtk.UIManager UIManager;
 	private global::Gtk.Action aboutAction;
+	private global::Gtk.Action SpehereAction;
 	private global::Gtk.Action newAction;
 	private global::Gtk.Action openAction;
 	private global::Gtk.Action saveAction;
@@ -26,6 +27,9 @@ public partial class MainWindow
 		this.aboutAction = new global::Gtk.Action ("aboutAction", global::Mono.Unix.Catalog.GetString ("About..."), null, "gtk-about");
 		this.aboutAction.ShortLabel = global::Mono.Unix.Catalog.GetString ("About...");
 		w1.Add (this.aboutAction, null);
+		this.SpehereAction = new global::Gtk.Action ("SpehereAction", global::Mono.Unix.Catalog.GetString ("Spehere"), null, null);
+		this.SpehereAction.ShortLabel = global::Mono.Unix.Catalog.GetString ("Spehere");
+		w1.Add (this.SpehereAction, null);
 		this.UIManager.InsertActionGroup (w1, 0);
 		global::Gtk.ActionGroup w2 = new global::Gtk.ActionGroup ("File");
 		this.newAction = new global::Gtk.Action ("newAction", null, null, "gtk-new");
@@ -71,8 +75,8 @@ public partial class MainWindow
 		// Container child vbox1.Gtk.Box+BoxChild
 		this.UIManager.AddUiFromString ("<ui><toolbar name=\'toolbar1\'><toolitem name=\'newAction\' action=\'newAction\'/><tool" +
 			"item name=\'openAction\' action=\'openAction\'/><toolitem name=\'saveAction\' action=\'" +
-			"saveAction\'/></toolbar></ui>"
-		);
+			"saveAction\'/><toolitem name=\'SpehereAction\' action=\'SpehereAction\'/></toolbar></" +
+			"ui>");
 		this.toolbar1 = ((global::Gtk.Toolbar)(this.UIManager.GetWidget ("/toolbar1")));
 		this.toolbar1.Name = "toolbar1";
 		this.toolbar1.ShowArrow = false;
@@ -97,6 +101,7 @@ public partial class MainWindow
 		}
 		this.Show ();
 		this.DeleteEvent += new global::Gtk.DeleteEventHandler (this.OnDeleteEvent);
+		this.SpehereAction.Activated += new global::System.EventHandler (this.OnSpehereActionActivated);
 		this.openAction.Activated += new global::System.EventHandler (this.OnOpenActionActivated);
 		this.stopAction.Activated += new global::System.EventHandler (this.OnExitActionActivated);
 	}
