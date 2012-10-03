@@ -66,5 +66,8 @@ public partial class MainWindow: Gtk.Window
     msgBox.Run();
     msgBox.Destroy();
   }
+    protected void OnSpehereActionActivated(object sender, System.EventArgs e)
+    {
 
+    }
 }
