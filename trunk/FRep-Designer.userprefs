@@ -1,0 +1,39 @@
+﻿<Properties>
+  <MonoDevelop.Ide.Workspace ActiveConfiguration="Debug|x86" />
+  <MonoDevelop.Ide.Workbench ActiveDocument="FRep-Designer\MainWindow.cs">
+    <Files>
+      <File FileName="FRep-Designer\MainClass.cs" Line="1" Column="1" />
+      <File FileName="FRep-Designer\MainWindow.cs" Line="58" Column="23" />
+      <File FileName="FRep-Designer\Model\Math3D.cs" Line="8" Column="24" />
+      <File FileName="FRep-Designer\Model\Scene.cs" Line="18" Column="2" />
+      <File FileName="FRep-Designer\Model\Evaluator.cs" Line="74" Column="2" />
+      <File FileName="FRep-Designer\Model\FRepSolid.cs" Line="1" Column="1" />
+      <File FileName="FRep-Designer\Model\Solid.cs" Line="1" Column="1" />
+    </Files>
+    <Pads>
+      <Pad Id="ProjectPad">
+        <State expanded="True" selected="True">
+          <Node name="Test" expanded="True" />
+          <Node name="FRep-Designer" expanded="True">
+            <Node name="Model" expanded="True" />
+          </Node>
+        </State>
+      </Pad>
+      <Pad Id="ClassPad">
+        <State expanded="True" selected="True" />
+      </Pad>
+      <Pad Id="MonoDevelop.Debugger.WatchPad">
+        <State />
+      </Pad>
+      <Pad Id="MonoDevelop.NUnit.TestPad">
+        <State expanded="True" selected="True">
+          <Node name="Test" expanded="True" />
+        </State>
+      </Pad>
+    </Pads>
+  </MonoDevelop.Ide.Workbench>
+  <MonoDevelop.Ide.DebuggingService.Breakpoints>
+    <BreakpointStore />
+  </MonoDevelop.Ide.DebuggingService.Breakpoints>
+  <MonoDevelop.Ide.DebuggingService.PinnedWatches />
+</Properties>
