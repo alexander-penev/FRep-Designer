@@ -3,9 +3,9 @@ using Gtk;
 
 namespace FRepDesigner
 {
-    /// <summary>
-    /// Main class.
-    /// </summary>
+  /// <summary>
+  /// Main class.
+  /// </summary>
   class MainClass
   {
     public static void Main(string[] args)
