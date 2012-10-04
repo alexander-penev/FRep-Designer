@@ -8,19 +8,17 @@
     <widget-library name="glade-sharp, Version=2.12.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
     <widget-library name="../bin/Debug/FRep-Designer.exe" internal="true" />
   </import>
-  <widget class="Gtk.Window" id="MainWindow" design-size="706 572">
-    <action-group name="Help">
-      <action id="aboutAction">
+  <widget class="Gtk.Window" id="FRepDesigner.MainWindow" design-size="706 572">
+    <action-group name="Default">
+      <action id="FileAction">
         <property name="Type">Action</property>
-        <property name="Label" translatable="yes">About...</property>
-        <property name="ShortLabel" translatable="yes">About...</property>
-        <property name="StockId">gtk-about</property>
+        <property name="Label" translatable="yes">File</property>
+        <property name="ShortLabel" translatable="yes">File</property>
       </action>
-      <action id="SpehereAction">
+      <action id="HelpAction">
         <property name="Type">Action</property>
-        <property name="Label" translatable="yes">Spehere</property>
-        <property name="ShortLabel" translatable="yes">Spehere</property>
-        <signal name="Activated" handler="OnSpehereActionActivated" />
+        <property name="Label" translatable="yes">Help</property>
+        <property name="ShortLabel" translatable="yes">Help</property>
       </action>
     </action-group>
     <action-group name="File">
@@ -55,16 +53,19 @@
         <signal name="Activated" handler="OnExitActionActivated" />
       </action>
     </action-group>
-    <action-group name="Default">
-      <action id="FileAction">
+    <action-group name="Help">
+      <action id="aboutAction">
         <property name="Type">Action</property>
-        <property name="Label" translatable="yes">File</property>
-        <property name="ShortLabel" translatable="yes">File</property>
+        <property name="Label" translatable="yes">About...</property>
+        <property name="ShortLabel" translatable="yes">About...</property>
+        <property name="StockId">gtk-about</property>
       </action>
-      <action id="HelpAction">
+      <action id="AddSphereAction">
         <property name="Type">Action</property>
-        <property name="Label" translatable="yes">Help</property>
-        <property name="ShortLabel" translatable="yes">Help</property>
+        <property name="Label" translatable="yes">Spehere</property>
+        <property name="ShortLabel" translatable="yes">Spehere</property>
+        <property name="StockId">gtk-yes</property>
+        <signal name="Activated" handler="OnSpehereActionActivated" />
       </action>
     </action-group>
     <property name="MemberName" />
@@ -108,7 +109,7 @@
               <node type="Toolitem" action="newAction" />
               <node type="Toolitem" action="openAction" />
               <node type="Toolitem" action="saveAction" />
-              <node type="Toolitem" action="SpehereAction" />
+              <node type="Toolitem" action="AddSphereAction" />
             </node>
           </widget>
           <packing>
@@ -119,7 +120,13 @@
           </packing>
         </child>
         <child>
-          <placeholder />
+          <widget class="Gtk.Image" id="image1">
+            <property name="MemberName">Image1</property>
+          </widget>
+          <packing>
+            <property name="Position">2</property>
+            <property name="AutoSize">False</property>
+          </packing>
         </child>
         <child>
           <widget class="Gtk.Statusbar" id="statusbar1">

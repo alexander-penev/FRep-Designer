@@ -40,6 +40,10 @@
     <Reference Include="pango-sharp, Version=2.12.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
     <Reference Include="atk-sharp, Version=2.12.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
     <Reference Include="Microsoft.CSharp" />
+    <Reference Include="gtk-dotnet, Version=2.12.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f">
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="System.Drawing" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="gtk-gui\gui.stetic">
@@ -49,7 +53,6 @@
   <ItemGroup>
     <Compile Include="gtk-gui\generated.cs" />
     <Compile Include="MainWindow.cs" />
-    <Compile Include="gtk-gui\MainWindow.cs" />
     <Compile Include="AssemblyInfo.cs" />
     <Compile Include="MainClass.cs" />
     <Compile Include="Model\Solid.cs" />
@@ -57,6 +60,9 @@
     <Compile Include="Model\FRepSolid.cs" />
     <Compile Include="Model\Math3D.cs" />
     <Compile Include="Model\Scene.cs" />
+    <Compile Include="View\RayTracingView.cs" />
+    <Compile Include="View\View.cs" />
+    <Compile Include="gtk-gui\FRepDesigner.MainWindow.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
   <ProjectExtensions>
