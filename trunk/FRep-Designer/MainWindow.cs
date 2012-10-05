@@ -14,6 +14,7 @@ namespace FRepDesigner
     {
       public Scene Model;
       public RayTracingView View;
+      Random rand = new Random();
       
       public MainWindow(): base(Gtk.WindowType.Toplevel)
       {
@@ -25,7 +26,7 @@ namespace FRepDesigner
         Build();
       }
 
-      protected virtual void PreBuild ()
+      protected virtual void PreBuild()
       {
         this.Realized += new global::System.EventHandler(this.OnRealized);
       }
@@ -34,7 +35,7 @@ namespace FRepDesigner
       {
         // Init enviroment
         Model = new Scene();
-        View = new RayTracingView(Model, image1.Pixbuf);
+        View = new RayTracingView();
         Model.Changed += SceneChanged;
       }
 
@@ -48,7 +49,7 @@ namespace FRepDesigner
         Application.Quit();
       }
 
-      protected void OnOpenActionActivated (object sender, System.EventArgs e)
+      protected void OnOpenActionActivated(object sender, System.EventArgs e)
       {
             var fc = new Gtk.FileChooserDialog ("Choose the file to open",
                                             this, Gtk.FileChooserAction.Open,
@@ -79,15 +80,24 @@ namespace FRepDesigner
 
       private void SceneChanged(Scene scene, EventArgs e)
       {
-        QueueDraw();
+        if (image1.Pixmap == null) 
+          image1.Pixmap = new Gdk.Pixmap(image1.ParentWindow, image1.Allocation.Width, image1.Allocation.Height);
+        
+        View.Render(Model, image1.Pixmap);
+        image1.QueueDraw();
       }
       
-      protected void OnSpehereActionActivated(object sender, System.EventArgs e)
+      protected void OnSphereActionActivated(object sender, System.EventArgs e)
       {
-        Model.Solids.Add(new FRepSolid("x*x+y*y+z*z-1"));
-        Model.OnChanged(EventArgs.Empty);
+        
+        float cx = (float)(rand.NextDouble()*50)-25f;
+        float cy = (float)(rand.NextDouble()*50)-25f;
+        float r = (float)(rand.NextDouble()*100)+50f;
+        FRepSolid frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
+        frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
+        Model.AddPrimitive(frs);
+        //Model.AddPrimitive(new FRepSolid("0.866025403784439f*((y*y-z*z*(x*x+y*y+z*z)+z*x*(z*z-x*x)+x*y*(y*y-x*x)))+100"));
       }
-      
     }
 
 }

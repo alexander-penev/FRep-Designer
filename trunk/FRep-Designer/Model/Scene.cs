@@ -23,6 +23,7 @@ namespace FRepDesigner
         public void AddPrimitive(FRepSolid primitive)
         {
             this.Solids.Add(primitive);
+            OnChanged(EventArgs.Empty);
         }
 
     }
