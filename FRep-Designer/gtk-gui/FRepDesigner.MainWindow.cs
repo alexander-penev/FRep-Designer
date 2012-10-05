@@ -7,6 +7,9 @@ namespace FRepDesigner
 		private global::Gtk.UIManager UIManager;
 		private global::Gtk.Action FileAction;
 		private global::Gtk.Action HelpAction;
+		private global::Gtk.Action dialogQuestionAction;
+		private global::Gtk.Action zoomInAction;
+		private global::Gtk.Action zoomOutAction;
 		private global::Gtk.Action newAction;
 		private global::Gtk.Action openAction;
 		private global::Gtk.Action saveAction;
@@ -32,6 +35,15 @@ namespace FRepDesigner
 			this.HelpAction = new global::Gtk.Action ("HelpAction", global::Mono.Unix.Catalog.GetString ("Help"), null, null);
 			this.HelpAction.ShortLabel = global::Mono.Unix.Catalog.GetString ("Help");
 			w1.Add (this.HelpAction, null);
+			this.dialogQuestionAction = new global::Gtk.Action ("dialogQuestionAction", global::Mono.Unix.Catalog.GetString ("Custom Solid"), null, "gtk-dialog-question");
+			this.dialogQuestionAction.ShortLabel = global::Mono.Unix.Catalog.GetString ("Custom Solid");
+			w1.Add (this.dialogQuestionAction, null);
+			this.zoomInAction = new global::Gtk.Action ("zoomInAction", global::Mono.Unix.Catalog.GetString ("Zoom In"), null, "gtk-zoom-in");
+			this.zoomInAction.ShortLabel = global::Mono.Unix.Catalog.GetString ("Zoom In");
+			w1.Add (this.zoomInAction, null);
+			this.zoomOutAction = new global::Gtk.Action ("zoomOutAction", global::Mono.Unix.Catalog.GetString ("Zoom Out"), null, "gtk-zoom-out");
+			this.zoomOutAction.ShortLabel = global::Mono.Unix.Catalog.GetString ("Zoom Out");
+			w1.Add (this.zoomOutAction, null);
 			this.UIManager.InsertActionGroup (w1, 0);
 			global::Gtk.ActionGroup w2 = new global::Gtk.ActionGroup ("File");
 			this.newAction = new global::Gtk.Action ("newAction", null, null, "gtk-new");
@@ -75,7 +87,7 @@ namespace FRepDesigner
 			w4.Expand = false;
 			w4.Fill = false;
 			// Container child vbox1.Gtk.Box+BoxChild
-			this.UIManager.AddUiFromString ("<ui><toolbar name='toolbar1'><toolitem name='newAction' action='newAction'/><toolitem name='openAction' action='openAction'/><toolitem name='saveAction' action='saveAction'/><toolitem name='NewSphereAction' action='NewSphereAction'/></toolbar></ui>");
+			this.UIManager.AddUiFromString ("<ui><toolbar name='toolbar1'><toolitem name='newAction' action='newAction'/><toolitem name='openAction' action='openAction'/><toolitem name='saveAction' action='saveAction'/><toolitem name='NewSphereAction' action='NewSphereAction'/><toolitem name='dialogQuestionAction' action='dialogQuestionAction'/><toolitem name='zoomInAction' action='zoomInAction'/><toolitem name='zoomOutAction' action='zoomOutAction'/></toolbar></ui>");
 			this.toolbar1 = ((global::Gtk.Toolbar)(this.UIManager.GetWidget ("/toolbar1")));
 			this.toolbar1.Name = "toolbar1";
 			this.toolbar1.ShowArrow = false;

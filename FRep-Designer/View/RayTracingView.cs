@@ -7,7 +7,7 @@ namespace FRepDesigner
 {
     public class RayTracingView: View
     {
-        public Point3D LightPos = new Point3D(10,10,10);
+        public Point3D LightPos = new Point3D(10,10,20);
         public float AmbientLightIntensity = 0.1f;
         public float LightIntensity = 0.8f;
 
