@@ -13,7 +13,7 @@ namespace FRepDesigner
 		private global::Gtk.Action saveAsAction;
 		private global::Gtk.Action stopAction;
 		private global::Gtk.Action aboutAction;
-		private global::Gtk.Action AddSphereAction;
+		private global::Gtk.Action NewSphereAction;
 		private global::Gtk.VBox vbox1;
 		private global::Gtk.MenuBar menubar1;
 		private global::Gtk.Toolbar toolbar1;
@@ -52,9 +52,9 @@ namespace FRepDesigner
 			this.aboutAction = new global::Gtk.Action ("aboutAction", global::Mono.Unix.Catalog.GetString ("About..."), null, "gtk-about");
 			this.aboutAction.ShortLabel = global::Mono.Unix.Catalog.GetString ("About...");
 			w3.Add (this.aboutAction, null);
-			this.AddSphereAction = new global::Gtk.Action ("AddSphereAction", global::Mono.Unix.Catalog.GetString ("Spehere"), null, "gtk-yes");
-			this.AddSphereAction.ShortLabel = global::Mono.Unix.Catalog.GetString ("Spehere");
-			w3.Add (this.AddSphereAction, null);
+			this.NewSphereAction = new global::Gtk.Action ("NewSphereAction", global::Mono.Unix.Catalog.GetString ("Sphere"), null, "gtk-yes");
+			this.NewSphereAction.ShortLabel = global::Mono.Unix.Catalog.GetString ("Sphere");
+			w3.Add (this.NewSphereAction, null);
 			this.UIManager.InsertActionGroup (w3, 2);
 			this.AddAccelGroup (this.UIManager.AccelGroup);
 			this.Name = "FRepDesigner.MainWindow";
@@ -75,7 +75,7 @@ namespace FRepDesigner
 			w4.Expand = false;
 			w4.Fill = false;
 			// Container child vbox1.Gtk.Box+BoxChild
-			this.UIManager.AddUiFromString ("<ui><toolbar name='toolbar1'><toolitem name='newAction' action='newAction'/><toolitem name='openAction' action='openAction'/><toolitem name='saveAction' action='saveAction'/><toolitem name='AddSphereAction' action='AddSphereAction'/></toolbar></ui>");
+			this.UIManager.AddUiFromString ("<ui><toolbar name='toolbar1'><toolitem name='newAction' action='newAction'/><toolitem name='openAction' action='openAction'/><toolitem name='saveAction' action='saveAction'/><toolitem name='NewSphereAction' action='NewSphereAction'/></toolbar></ui>");
 			this.toolbar1 = ((global::Gtk.Toolbar)(this.UIManager.GetWidget ("/toolbar1")));
 			this.toolbar1.Name = "toolbar1";
 			this.toolbar1.ShowArrow = false;
@@ -86,6 +86,7 @@ namespace FRepDesigner
 			w5.Fill = false;
 			// Container child vbox1.Gtk.Box+BoxChild
 			this.image1 = new global::Gtk.Image ();
+			this.image1.CanFocus = true;
 			this.image1.Name = "image1";
 			this.vbox1.Add (this.image1);
 			global::Gtk.Box.BoxChild w6 = ((global::Gtk.Box.BoxChild)(this.vbox1 [this.image1]));
@@ -108,7 +109,7 @@ namespace FRepDesigner
 			this.DeleteEvent += new global::Gtk.DeleteEventHandler (this.OnDeleteEvent);
 			this.openAction.Activated += new global::System.EventHandler (this.OnOpenActionActivated);
 			this.stopAction.Activated += new global::System.EventHandler (this.OnExitActionActivated);
-			this.AddSphereAction.Activated += new global::System.EventHandler (this.OnSpehereActionActivated);
+			this.NewSphereAction.Activated += new global::System.EventHandler (this.OnSphereActionActivated);
 		}
 	}
 }

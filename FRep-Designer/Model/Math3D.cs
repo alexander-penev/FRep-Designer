@@ -29,6 +29,12 @@ namespace FRepDesigner
             this.Y = y;
             this.Z = z;
         }
+
+        public float Length()
+        {
+            return (float)Math.Sqrt(this*this);
+        }
+
         #region Vector to Vector
         public static Vector3D operator +(Vector3D v1)
         {
@@ -103,7 +109,22 @@ namespace FRepDesigner
         }
         #endregion Vector to Vector
 
+        public void Normalize()
+        {
+            float len = Length();
+            if (len > 0) {
+                X /= len;
+                Y /= len;
+                Z /= len;
+            }
+        }
+
+        public override string ToString()
+        {
+            return string.Format("({0},{1},{2})", X, Y, Z);
+        }
     }
+
     public class Point3D : Vector3D
     {
         public Point3D(): base () {}
@@ -112,6 +133,11 @@ namespace FRepDesigner
 
         public void Rotate_vector3D()
         {
+        }
+
+        public override string ToString()
+        {
+            return string.Format("<{0},{1},{2}>", X, Y, Z);
         }
     }
     

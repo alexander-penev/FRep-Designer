@@ -36,6 +36,7 @@ namespace FRepDesigner
             "public static float sin(float v) { return (float)Math.Sin(v); }"+
             "public static float sinh(float v) { return (float)Math.Sinh(v); }"+
             "public static float sqrt(float v) { return (float)Math.Sqrt(v); }"+
+            "public static float sqr(float v) { return v*v; }"+
             "public static float tan(float v) { return (float)Math.Tan(v); }"+
             "public static float tanh(float v) { return (float)Math.Tanh(v); }"+
             "public static float truncate(float v) { return (float)Math.Truncate(v); }";
@@ -66,8 +67,39 @@ namespace FRepDesigner
 
                 Type evalType = result.CompiledAssembly.GetType("_Eval");
                 mi = evalType.GetMethod("_M");
+
+                cachedEvaluators.Add(expression, mi);
             }
 
+            return (float)mi.Invoke(null, p);
+        }
+
+        public static float Eval1(string expression, out MethodInfo mi, params object[] p)
+        {
+            //MethodInfo mi;
+            
+            if (!cachedEvaluators.TryGetValue(expression, out mi)) {
+                string[] code = {
+                    string.Format("using System; {0} public static class _Eval {{ {1} public static float _M(float x, float y, float z) {{ return ({2}); }} }}", usingClauses, embededFunctions, expression) 
+                };
+                
+                //CompilerParameters compilerParams = new CompilerParameters(referenceAssemblies, "Test.dll");
+                CompilerParameters compilerParams = new CompilerParameters(referenceAssemblies);
+                compilerParams.GenerateExecutable = false;
+                compilerParams.GenerateInMemory = true;
+                compilerParams.IncludeDebugInformation = false;
+                CSharpCodeProvider compiler = (CSharpCodeProvider)CodeDomProvider.CreateProvider("CSharp");
+                
+                CompilerResults result = compiler.CompileAssemblyFromSource(compilerParams, code);
+                
+                if (result.Errors.HasErrors) throw new Exception(result.Errors[0].ErrorText);
+                
+                Type evalType = result.CompiledAssembly.GetType("_Eval");
+                mi = evalType.GetMethod("_M");
+
+                cachedEvaluators.Add(expression, mi);
+            }
+            
             return (float)mi.Invoke(null, p);
         }
     }

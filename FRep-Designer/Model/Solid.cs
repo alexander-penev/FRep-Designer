@@ -1,9 +1,12 @@
 using System;
+using Cairo;
 
 namespace FRepDesigner
 {
     public abstract class Solid
     {
+        public Cairo.Color Color = new Cairo.Color(1,1,1,1);
+
         public Solid()
         {      
         }
@@ -20,6 +23,12 @@ namespace FRepDesigner
             return null;
         }
 
+        // normal vector in surface point
+        public virtual Vector3D Normal(Point3D p)
+        {
+            return null;
+        }
+        
 
     }
 }
