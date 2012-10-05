@@ -20,6 +20,24 @@
         <property name="Label" translatable="yes">Help</property>
         <property name="ShortLabel" translatable="yes">Help</property>
       </action>
+      <action id="dialogQuestionAction">
+        <property name="Type">Action</property>
+        <property name="Label" translatable="yes">Custom Solid</property>
+        <property name="ShortLabel" translatable="yes">Custom Solid</property>
+        <property name="StockId">gtk-dialog-question</property>
+      </action>
+      <action id="zoomInAction">
+        <property name="Type">Action</property>
+        <property name="Label" translatable="yes">Zoom In</property>
+        <property name="ShortLabel" translatable="yes">Zoom In</property>
+        <property name="StockId">gtk-zoom-in</property>
+      </action>
+      <action id="zoomOutAction">
+        <property name="Type">Action</property>
+        <property name="Label" translatable="yes">Zoom Out</property>
+        <property name="ShortLabel" translatable="yes">Zoom Out</property>
+        <property name="StockId">gtk-zoom-out</property>
+      </action>
     </action-group>
     <action-group name="File">
       <action id="newAction">
@@ -110,6 +128,9 @@
               <node type="Toolitem" action="openAction" />
               <node type="Toolitem" action="saveAction" />
               <node type="Toolitem" action="NewSphereAction" />
+              <node type="Toolitem" action="dialogQuestionAction" />
+              <node type="Toolitem" action="zoomInAction" />
+              <node type="Toolitem" action="zoomOutAction" />
             </node>
           </widget>
           <packing>

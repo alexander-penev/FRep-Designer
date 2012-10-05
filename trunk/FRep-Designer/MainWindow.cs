@@ -14,7 +14,7 @@ namespace FRepDesigner
     {
       public Scene Model;
       public RayTracingView View;
-      Random rand = new Random();
+      Random rand = new Random(5);
       
       public MainWindow(): base(Gtk.WindowType.Toplevel)
       {
@@ -89,15 +89,41 @@ namespace FRepDesigner
       
       protected void OnSphereActionActivated(object sender, System.EventArgs e)
       {
-        
-        float cx = (float)(rand.NextDouble()*50)-25f;
-        float cy = (float)(rand.NextDouble()*50)-25f;
-        float r = (float)(rand.NextDouble()*100)+50f;
-        FRepSolid frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
-        frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
-        Model.AddPrimitive(frs);
-        //Model.AddPrimitive(new FRepSolid("0.866025403784439f*((y*y-z*z*(x*x+y*y+z*z)+z*x*(z*z-x*x)+x*y*(y*y-x*x)))+100"));
-      }
+            FRepSolid frs = new FRepSolid("sqr(x)+sqr(y)+sqr(z)-100");
+            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
+            Model.AddPrimitive(frs);
+
+//            float cx, cy, r;
+//            FRepSolid frs;
+//
+//            cx = 0;
+//            cy = 0;
+//            r = 100;
+//            frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
+//            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
+//            Model.AddPrimitive(frs);
+//            
+//            cx = 24;
+//            cy = 0;
+//            r = 80;
+//            frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
+//            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
+//            Model.AddPrimitive(frs);
+//
+//            cx = -27;
+//            cy = 0;
+//            r = 120;
+//            frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
+//            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
+//            Model.AddPrimitive(frs);
+//
+//            cx = 5;
+//            cy = 20;
+//            r = 100;
+//            frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
+//            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
+//            Model.AddPrimitive(frs);
+        }
     }
 
 }
