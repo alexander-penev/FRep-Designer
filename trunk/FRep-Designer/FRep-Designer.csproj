@@ -64,6 +64,8 @@
     <Compile Include="View\RayTracingView.cs" />
     <Compile Include="View\View.cs" />
     <Compile Include="gtk-gui\FRepDesigner.MainWindow.cs" />
+    <Compile Include="InputCustomFormulaDialog.cs" />
+    <Compile Include="gtk-gui\FRepDesigner.InputCustomFormulaDialog.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
   <ProjectExtensions>
