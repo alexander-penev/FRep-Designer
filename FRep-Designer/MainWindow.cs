@@ -93,36 +93,63 @@ namespace FRepDesigner
             frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
             Model.AddPrimitive(frs);
 
-//            float cx, cy, r;
-//            FRepSolid frs;
-//
-//            cx = 0;
-//            cy = 0;
-//            r = 100;
-//            frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
-//            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
-//            Model.AddPrimitive(frs);
-//            
-//            cx = 24;
-//            cy = 0;
-//            r = 80;
-//            frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
-//            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
-//            Model.AddPrimitive(frs);
-//
-//            cx = -27;
-//            cy = 0;
-//            r = 120;
-//            frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
-//            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
-//            Model.AddPrimitive(frs);
-//
-//            cx = 5;
-//            cy = 20;
-//            r = 100;
-//            frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
-//            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
-//            Model.AddPrimitive(frs);
+            return;
+
+            float cx, cy, r;
+            //FRepSolid frs;
+            float cx1, cy1, r1;
+
+            cx = -10;
+            cy = 5;
+            r = 100;
+            cx1 = 10;
+            cy1 = 5;
+            r1 = 90;
+            //frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
+            frs = new FRepSolid(String.Format("max((sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)),(sqr(x-({3}f))+sqr(y-({4}f))+sqr(z)-({5}f)))", cx, cy, r, cx1, cy1, r1));
+            frs.Color = new Cairo.Color(0,1,0);//rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
+            Model.AddPrimitive(frs);
+            
+            cx = 24;
+            cy = 0;
+            r = 80;
+            frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
+            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
+            Model.AddPrimitive(frs);
+
+            cx = -27;
+            cy = 0;
+            r = 120;
+            frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
+            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
+            Model.AddPrimitive(frs);
+
+            cx = 5;
+            cy = 20;
+            r = 100;
+            frs = new FRepSolid(String.Format("sqr(x-({0}f))+sqr(y-({1}f))+sqr(z)-({2}f)", cx, cy, r));
+            frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
+            Model.AddPrimitive(frs);
+        }
+
+        protected void OnCustomActionActivated (object sender, EventArgs e)
+        {
+            using (var inputDialog = new InputCustomFormulaDialog()) {
+                if ((ResponseType)inputDialog.Run() == ResponseType.Ok) {
+                    FRepSolid frs = new FRepSolid(inputDialog.Entry1);
+                    frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
+                    Model.AddPrimitive(frs);
+                }
+                inputDialog.Destroy();
+            }
+
+
+        }
+
+
+        protected void OnDialogQuestionActionActivated (object sender, EventArgs e)
+        {
+            //
         }
     }
 
