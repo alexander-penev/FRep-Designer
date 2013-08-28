@@ -7,7 +7,7 @@ using System.Runtime.CompilerServices;
 [assembly: AssemblyTitle("FRep Designer")]
 [assembly: AssemblyDescription("FRep based 3D modelling tool")]
 [assembly: AssemblyConfiguration("")]
-[assembly: AssemblyCompany("PU")]
+[assembly: AssemblyCompany("Plovdiv University")]
 [assembly: AssemblyProduct("FRep-Designer")]
 [assembly: AssemblyCopyright("")]
 [assembly: AssemblyTrademark("")]

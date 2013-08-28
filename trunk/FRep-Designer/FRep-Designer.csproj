@@ -50,6 +50,9 @@
     <EmbeddedResource Include="gtk-gui\gui.stetic">
       <LogicalName>gui.stetic</LogicalName>
     </EmbeddedResource>
+    <EmbeddedResource Include="Resources\cursor.png" />
+    <EmbeddedResource Include="Resources\function.png" />
+    <EmbeddedResource Include="Resources\package.png" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="gtk-gui\generated.cs" />
@@ -61,11 +64,14 @@
     <Compile Include="Model\FRepSolid.cs" />
     <Compile Include="Model\Math3D.cs" />
     <Compile Include="Model\Scene.cs" />
-    <Compile Include="View\RayTracingView.cs" />
     <Compile Include="View\View.cs" />
     <Compile Include="gtk-gui\FRepDesigner.MainWindow.cs" />
     <Compile Include="InputCustomFormulaDialog.cs" />
     <Compile Include="gtk-gui\FRepDesigner.InputCustomFormulaDialog.cs" />
+    <Compile Include="View\RayTracing\RayTracingView.cs" />
+    <Compile Include="View\RayTracing\SimpleRayTracing\SimpleRayTracingView.cs" />
+    <Compile Include="View\RayTracing\OpenCLRayTracing\OpenCLRayTracingView.cs" />
+    <Compile Include="View\RayTracing\SimpleRayTracing\SimpleMultithreadRayTracingView.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
   <ProjectExtensions>
@@ -73,10 +79,8 @@
       <Properties>
         <Policies>
           <XmlFormattingPolicy inheritsSet="Mono" inheritsScope="application/xml" scope="application/xml" />
-          <TextStylePolicy FileWidth="120" EolMarker="Windows" inheritsSet="VisualStudio" inheritsScope="text/plain" scope="text/x-csharp" />
           <VersionControlPolicy inheritsSet="Mono" />
           <ChangeLogPolicy UpdateMode="None" inheritsSet="Mono" />
-          <CSharpFormattingPolicy IndentSwitchBody="True" IfElseBraceForcement="AddBraces" ForBraceForcement="AddBraces" WhileBraceForcement="AddBraces" UsingBraceForcement="AddBraces" FixedBraceForcement="AddBraces" BeforeMethodDeclarationParentheses="False" BeforeMethodCallParentheses="False" BeforeConstructorDeclarationParentheses="False" BeforeIndexerDeclarationBracket="False" BeforeDelegateDeclarationParentheses="False" NewParentheses="False" SpacesBeforeBrackets="False" inheritsSet="Mono" inheritsScope="text/x-csharp" scope="text/x-csharp" />
         </Policies>
       </Properties>
     </MonoDevelop>
@@ -85,5 +89,9 @@
     <Folder Include="Model\" />
     <Folder Include="View\" />
     <Folder Include="Cotroller\" />
+    <Folder Include="Resources\" />
+    <Folder Include="View\RayTracing\" />
+    <Folder Include="View\RayTracing\SimpleRayTracing\" />
+    <Folder Include="View\RayTracing\OpenCLRayTracing\" />
   </ItemGroup>
 </Project>

@@ -4,7 +4,7 @@ namespace FRepDesigner
 {
     public partial class InputCustomFormulaDialog : Gtk.Dialog
     {
-        public string Entry1 {
+        public string Text {
             get {
                 return entry1.Text;
             }

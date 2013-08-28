@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 
 using Microsoft.CSharp;
 using System.CodeDom.Compiler;
@@ -9,7 +10,11 @@ namespace FRepDesigner
 {
     public static class Evaluator
     {
-        private static Dictionary<string, MethodInfo> cachedEvaluators = new Dictionary<string, MethodInfo>();
+        //[ThreadStatic]
+        private static ConcurrentDictionary<string, MethodInfo> cachedEvaluators = new ConcurrentDictionary<string, MethodInfo>();
+
+        static object lockObject = new object();
+
         private static string[] referenceAssemblies = {"System.dll"};
         private static string usingClauses = ""; 
         private static string embededFunctions = 
@@ -47,6 +52,65 @@ namespace FRepDesigner
 
         public static float Eval(string expression, params object[] p)
         {
+            MethodInfo mi = cachedEvaluators.GetOrAdd(expression, expr_key => {
+                lock (lockObject) {
+                    string[] code = {
+                        string.Format("using System; {0} public static class _Eval {{ {1} public static float _M(float x, float y, float z) {{ return ({2}); }} }}", usingClauses, embededFunctions, expr_key) 
+                    };
+                    
+                    //CompilerParameters compilerParams = new CompilerParameters(referenceAssemblies, "Test.dll");
+                    CompilerParameters compilerParams = new CompilerParameters(referenceAssemblies);
+                    compilerParams.GenerateExecutable = false;
+                    compilerParams.GenerateInMemory = true;
+                    compilerParams.IncludeDebugInformation = false;
+                    CSharpCodeProvider compiler = (CSharpCodeProvider)CodeDomProvider.CreateProvider("CSharp");
+                    
+                    CompilerResults result = compiler.CompileAssemblyFromSource(compilerParams, code);
+                    
+                    if (result.Errors.HasErrors) {
+                        throw new Exception(result.Errors[0].ErrorText);
+                    }
+                    
+                    Type evalType = result.CompiledAssembly.GetType("_Eval");
+                    return evalType.GetMethod("_M");
+                }
+            });
+            
+            return (float)mi.Invoke(null, p);
+        }
+
+        public static float Eval(string expression, out MethodInfo mi, params object[] p)
+        {
+            mi = cachedEvaluators.GetOrAdd(expression, expr_key => {
+                lock (lockObject) {
+                    string[] code = {
+                        string.Format("using System; {0} public static class _Eval {{ {1} public static float _M(float x, float y, float z) {{ return ({2}); }} }}", usingClauses, embededFunctions, expr_key) 
+                    };
+                    
+                    //CompilerParameters compilerParams = new CompilerParameters(referenceAssemblies, "Test.dll");
+                    CompilerParameters compilerParams = new CompilerParameters(referenceAssemblies);
+                    compilerParams.GenerateExecutable = false;
+                    compilerParams.GenerateInMemory = true;
+                    compilerParams.IncludeDebugInformation = false;
+                    CSharpCodeProvider compiler = (CSharpCodeProvider)CodeDomProvider.CreateProvider("CSharp");
+                    
+                    CompilerResults result = compiler.CompileAssemblyFromSource(compilerParams, code);
+                    
+                    if (result.Errors.HasErrors) {
+                        throw new Exception(result.Errors[0].ErrorText);
+                    }
+                    
+                    Type evalType = result.CompiledAssembly.GetType("_Eval");
+                    return evalType.GetMethod("_M");
+                }
+            });
+            
+            return (float)mi.Invoke(null, p);
+        }
+        
+/*
+        public static float Eval(string expression, params object[] p)
+        {
             MethodInfo mi;
 
             if (!cachedEvaluators.TryGetValue(expression, out mi)) {
@@ -76,8 +140,6 @@ namespace FRepDesigner
 
         public static float Eval1(string expression, out MethodInfo mi, params object[] p)
         {
-            //MethodInfo mi;
-            
             if (!cachedEvaluators.TryGetValue(expression, out mi)) {
                 string[] code = {
                     string.Format("using System; {0} public static class _Eval {{ {1} public static float _M(float x, float y, float z) {{ return ({2}); }} }}", usingClauses, embededFunctions, expression) 
@@ -102,6 +164,7 @@ namespace FRepDesigner
             
             return (float)mi.Invoke(null, p);
         }
+*/
     }
 }
 

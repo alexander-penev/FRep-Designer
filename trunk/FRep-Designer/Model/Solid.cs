@@ -11,19 +11,19 @@ namespace FRepDesigner
         {      
         }
 
-        // prinadlejnist na tochka (sechenie s tochka)
+        // Intersect point with solid
         public virtual bool Intersect(Point3D p)
         {
             return false;
         }
 
-        // ray with silod
+        // Intersect ray with solid
         public virtual Point3D Intersect(Ray3D r)
         {
             return null;
         }
 
-        // normal vector in surface point
+        // Normal vector in surface point
         public virtual Vector3D Normal(Point3D p)
         {
             return null;

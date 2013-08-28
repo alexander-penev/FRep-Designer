@@ -10,6 +10,14 @@ namespace Stetic
 		{
 			if ((Stetic.Gui.initialized == false)) {
 				Stetic.Gui.initialized = true;
+				global::Gtk.IconFactory w1 = new global::Gtk.IconFactory ();
+				global::Gtk.IconSet w2 = new global::Gtk.IconSet (global::Gdk.Pixbuf.LoadFromResource ("FRepDesigner.Resources.package.png"));
+				w1.Add ("package", w2);
+				global::Gtk.IconSet w3 = new global::Gtk.IconSet (global::Gdk.Pixbuf.LoadFromResource ("FRepDesigner.Resources.function.png"));
+				w1.Add ("function", w3);
+				global::Gtk.IconSet w4 = new global::Gtk.IconSet (global::Gdk.Pixbuf.LoadFromResource ("FRepDesigner.Resources.cursor.png"));
+				w1.Add ("cursor", w4);
+				w1.AddDefault ();
 			}
 		}
 	}

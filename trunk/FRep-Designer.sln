@@ -57,6 +57,7 @@ Global
 		$4.BeforeConstructorDeclarationParentheses = False
 		$4.BeforeIndexerDeclarationBracket = False
 		$4.BeforeDelegateDeclarationParentheses = False
+		$4.AfterDelegateDeclarationParameterComma = True
 		$4.NewParentheses = False
 		$4.SpacesBeforeBrackets = False
 		$4.inheritsSet = Mono
