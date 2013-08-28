@@ -8,7 +8,24 @@
     <widget-library name="glade-sharp, Version=2.12.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
     <widget-library name="../bin/Debug/FRep-Designer.exe" internal="true" />
   </import>
-  <widget class="Gtk.Window" id="FRepDesigner.MainWindow" design-size="824 572">
+  <icon-factory>
+    <icon-set id="package">
+      <source>
+        <property name="Image">resource:FRepDesigner.Resources.package.png</property>
+      </source>
+    </icon-set>
+    <icon-set id="function">
+      <source>
+        <property name="Image">resource:FRepDesigner.Resources.function.png</property>
+      </source>
+    </icon-set>
+    <icon-set id="cursor">
+      <source>
+        <property name="Image">resource:FRepDesigner.Resources.cursor.png</property>
+      </source>
+    </icon-set>
+  </icon-factory>
+  <widget class="Gtk.Window" id="FRepDesigner.MainWindow" design-size="887 572">
     <action-group name="Default">
       <action id="FileAction">
         <property name="Type">Action</property>
@@ -20,30 +37,71 @@
         <property name="Label" translatable="yes">Help</property>
         <property name="ShortLabel" translatable="yes">Help</property>
       </action>
-      <action id="jumpToAction">
+    </action-group>
+    <action-group name="Tools">
+      <action id="customFRepAction">
+        <property name="Type">Action</property>
+        <property name="Label" translatable="yes">Custom</property>
+        <property name="ShortLabel" translatable="yes">Custom</property>
+        <property name="StockId">package</property>
+        <signal name="Activated" handler="OnCustomFRepActionActivated" after="yes" />
+      </action>
+      <action id="rFunctionAction">
         <property name="Type">Action</property>
         <property name="Label" translatable="yes">R-Function</property>
         <property name="ShortLabel" translatable="yes">R-Function</property>
-        <property name="StockId">gtk-jump-to</property>
+        <property name="StockId">function</property>
         <property name="Tooltip" translatable="yes">R-Function</property>
+        <signal name="Activated" handler="OnRFunctionActionActivated" />
       </action>
       <action id="zoomInAction">
         <property name="Type">Action</property>
         <property name="Label" translatable="yes">Zoom In</property>
         <property name="ShortLabel" translatable="yes">Zoom In</property>
         <property name="StockId">gtk-zoom-in</property>
+        <signal name="Activated" handler="OnZoomInActionActivated" />
       </action>
       <action id="zoomOutAction">
         <property name="Type">Action</property>
         <property name="Label" translatable="yes">Zoom Out</property>
         <property name="ShortLabel" translatable="yes">Zoom Out</property>
         <property name="StockId">gtk-zoom-out</property>
+        <signal name="Activated" handler="OnZoomOutActionActivated" />
       </action>
-      <action id="indexAction">
+      <action id="selectAction">
         <property name="Type">Action</property>
         <property name="Label" translatable="yes">_Select</property>
         <property name="ShortLabel" translatable="yes">_Select</property>
-        <property name="StockId">gtk-index</property>
+        <property name="StockId">cursor</property>
+        <signal name="Activated" handler="OnSelectActionActivated" />
+      </action>
+      <action id="newSphereAction">
+        <property name="Type">Action</property>
+        <property name="Label" translatable="yes">Sphere</property>
+        <property name="ShortLabel" translatable="yes">Sphere</property>
+        <property name="StockId">gtk-yes</property>
+        <signal name="Activated" handler="OnSphereActionActivated" />
+      </action>
+      <action id="undoAction">
+        <property name="Type">Action</property>
+        <property name="Label" translatable="yes">Undo</property>
+        <property name="ShortLabel" translatable="yes">Undo</property>
+        <property name="StockId">gtk-undo</property>
+        <signal name="Activated" handler="OnUndoActionActivated" />
+      </action>
+      <action id="redoAction">
+        <property name="Type">Action</property>
+        <property name="Label" translatable="yes">Redo</property>
+        <property name="ShortLabel" translatable="yes">Redo</property>
+        <property name="StockId">gtk-redo</property>
+        <signal name="Activated" handler="OnRedoActionActivated" />
+      </action>
+      <action id="preferencesAction">
+        <property name="Type">Action</property>
+        <property name="Label" translatable="yes">Settings</property>
+        <property name="ShortLabel" translatable="yes">Settings</property>
+        <property name="StockId">gtk-preferences</property>
+        <signal name="Activated" handler="OnPreferencesActionActivated" />
       </action>
     </action-group>
     <action-group name="File">
@@ -52,6 +110,7 @@
         <property name="Label" translatable="yes">New</property>
         <property name="ShortLabel" translatable="yes">New</property>
         <property name="StockId">gtk-new</property>
+        <signal name="Activated" handler="OnNewActionActivated" />
       </action>
       <action id="openAction">
         <property name="Type">Action</property>
@@ -65,19 +124,21 @@
         <property name="Label" translatable="yes">Save</property>
         <property name="ShortLabel" translatable="yes">Save</property>
         <property name="StockId">gtk-save</property>
+        <signal name="Activated" handler="OnSaveActionActivated" />
       </action>
       <action id="saveAsAction">
         <property name="Type">Action</property>
         <property name="Label" translatable="yes">Save As...</property>
         <property name="ShortLabel" translatable="yes">Save As...</property>
         <property name="StockId">gtk-save-as</property>
+        <signal name="Activated" handler="OnSaveAsActionActivated" />
       </action>
       <action id="stopAction">
         <property name="Type">Action</property>
         <property name="Label" translatable="yes">Exit</property>
         <property name="ShortLabel" translatable="yes">Exit</property>
         <property name="StockId">gtk-stop</property>
-        <signal name="Activated" handler="OnExitActionActivated" />
+        <signal name="Activated" handler="OnStopActionActivated" />
       </action>
     </action-group>
     <action-group name="Help">
@@ -86,44 +147,7 @@
         <property name="Label" translatable="yes">About...</property>
         <property name="ShortLabel" translatable="yes">About...</property>
         <property name="StockId">gtk-about</property>
-      </action>
-      <action id="NewSphereAction">
-        <property name="Type">Action</property>
-        <property name="Label" translatable="yes">Sphere</property>
-        <property name="ShortLabel" translatable="yes">Sphere</property>
-        <property name="StockId">gtk-yes</property>
-        <signal name="Activated" handler="OnSphereActionActivated" />
-      </action>
-      <action id="undoAction">
-        <property name="Type">Action</property>
-        <property name="Label" translatable="yes">Undo</property>
-        <property name="ShortLabel" translatable="yes">Undo</property>
-        <property name="StockId">gtk-undo</property>
-      </action>
-      <action id="redoAction">
-        <property name="Type">Action</property>
-        <property name="Label" translatable="yes">Redo</property>
-        <property name="ShortLabel" translatable="yes">Redo</property>
-        <property name="StockId">gtk-redo</property>
-      </action>
-      <action id="stopAction">
-        <property name="Type">Action</property>
-        <property name="Label" translatable="yes">_Спиране</property>
-        <property name="ShortLabel" translatable="yes">_Спиране</property>
-        <property name="StockId">gtk-stop</property>
-      </action>
-      <action id="preferencesAction">
-        <property name="Type">Action</property>
-        <property name="Label" translatable="yes">Settings</property>
-        <property name="ShortLabel" translatable="yes">Settings</property>
-        <property name="StockId">gtk-preferences</property>
-      </action>
-      <action id="dialogCustomAction">
-        <property name="Type">Action</property>
-        <property name="Label" translatable="yes">Custom</property>
-        <property name="ShortLabel" translatable="yes">Custom</property>
-        <property name="StockId">gtk-dialog-question</property>
-        <signal name="Activated" handler="OnCustomActionActivated" after="yes" />
+        <signal name="Activated" handler="OnAboutActionActivated" />
       </action>
     </action-group>
     <property name="MemberName" />
@@ -168,17 +192,20 @@
               <node type="Toolitem" action="newAction" />
               <node type="Toolitem" action="openAction" />
               <node type="Toolitem" action="saveAction" />
-              <node type="Toolitem" action="preferencesAction" />
-              <node type="Toolitem" action="zoomInAction" />
-              <node type="Toolitem" action="zoomOutAction" />
+              <node type="Separator" />
               <node type="Toolitem" action="undoAction" />
               <node type="Toolitem" action="redoAction" />
-              <node type="Toolitem" action="stopAction" />
               <node type="Separator" />
-              <node type="Toolitem" action="indexAction" />
-              <node type="Toolitem" action="NewSphereAction" />
-              <node type="Toolitem" action="dialogCustomAction" />
-              <node type="Toolitem" action="jumpToAction" />
+              <node type="Toolitem" action="zoomInAction" />
+              <node type="Toolitem" action="zoomOutAction" />
+              <node type="Separator" />
+              <node type="Toolitem" action="selectAction" />
+              <node type="Toolitem" action="newSphereAction" />
+              <node type="Toolitem" action="rFunctionAction" />
+              <node type="Separator" />
+              <node type="Toolitem" action="preferencesAction" />
+              <node type="Separator" />
+              <node type="Toolitem" action="stopAction" />
             </node>
           </widget>
           <packing>
@@ -192,6 +219,7 @@
           <widget class="Gtk.Image" id="image1">
             <property name="MemberName" />
             <property name="CanFocus">True</property>
+            <signal name="SizeAllocated" handler="OnImage1SizeAllocated" />
           </widget>
           <packing>
             <property name="Position">2</property>
@@ -206,7 +234,18 @@
               <placeholder />
             </child>
             <child>
-              <placeholder />
+              <widget class="Gtk.ComboBox" id="comboboxTracer">
+                <property name="MemberName" />
+                <property name="IsTextCombo">True</property>
+                <property name="Items" translatable="yes" />
+                <signal name="Changed" handler="OnComboboxTracerChanged" />
+              </widget>
+              <packing>
+                <property name="Position">2</property>
+                <property name="AutoSize">True</property>
+                <property name="Expand">False</property>
+                <property name="Fill">False</property>
+              </packing>
             </child>
           </widget>
           <packing>

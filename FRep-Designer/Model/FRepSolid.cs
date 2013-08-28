@@ -59,7 +59,7 @@ namespace FRepDesigner
           float f;
           float ff = 0;
           
-          int sgn = Math.Sign(Evaluator.Eval1(Expression, out mi, p.X, p.Y, p.Z));
+          int sgn = Math.Sign(Evaluator.Eval(Expression, out mi, p.X, p.Y, p.Z));
           
           while (true) {
             f = (float)mi.Invoke(null, new object[3]{p.X, p.Y, p.Z});
@@ -80,7 +80,7 @@ namespace FRepDesigner
         public override Vector3D Normal(Point3D p)
         {
             MethodInfo mi;
-            float f = Evaluator.Eval1(Expression, out mi, p.X, p.Y, p.Z);
+            float f = Evaluator.Eval(Expression, out mi, p.X, p.Y, p.Z);
             float fx = (float)mi.Invoke(null, new object[3]{p.X+eps, p.Y, p.Z});
             float fy = (float)mi.Invoke(null, new object[3]{p.X, p.Y+eps, p.Z});
             float fz = (float)mi.Invoke(null, new object[3]{p.X, p.Y, p.Z+eps});
