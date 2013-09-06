@@ -27,7 +27,7 @@ namespace FRepDesigner
 			IntPtr p = Marshal.UnsafeAddrOfPinnedArrayElement (image, 0);
 			getImage (p, width, height);
 
-			pixmap.DrawRgb32Image (new Gdk.GC(pixmap), 0, 0, width, height, Gdk.RgbDither.None, image,  *4); 
+			pixmap.DrawRgb32Image (new Gdk.GC(pixmap), 0, 0, width, height, Gdk.RgbDither.None, image,  width*4); 
 
 		}
 
