@@ -94,4 +94,9 @@
     <Folder Include="View\RayTracing\SimpleRayTracing\" />
     <Folder Include="View\RayTracing\OpenCLRayTracing\" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="app.config">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
 </Project>

@@ -63,7 +63,7 @@ namespace FRepDesigner
             using (Cairo.Context cr = Gdk.CairoHelper.Create(pixmap)) {
                 Parallel.For(-height/2, height/2, y => {
                     for (int x = -width/2; x <= width/2; x++) {
-                        Ray3D r = new Ray3D(new Vector3D(0, 0, 1), new Point3D((float)x / 10.0, (float)y / 10.0, 5.0));
+                        Ray3D r = new Ray3D(new Vector3D(0, 0, 1), new Point3D((float)x / 10.0f, (float)y / 10.0f, 5.0f));
                         
                         Cairo.Color c = Тrace(model, r);
                         

@@ -1,5 +1,6 @@
 using System;
 using Gtk;
+using GLib;
 
 namespace FRepDesigner
 {
@@ -13,7 +14,21 @@ namespace FRepDesigner
       Application.Init();
       MainWindow win = new MainWindow();
       win.Show();
+      ExceptionManager.UnhandledException += new UnhandledExceptionHandler(OnException);
       Application.Run();
+    }
+    
+    protected static void OnException(UnhandledExceptionArgs args)
+    {
+      ShowErrorDialog(args.ExceptionObject, args.IsTerminating);
+      args.ExitApplication = true;
+    }
+    
+    protected static void ShowErrorDialog(object exceptionObject, bool isTerminating)
+    {
+      var msgBox = new Gtk.MessageDialog(null, Gtk.DialogFlags.Modal, Gtk.MessageType.Error, Gtk.ButtonsType.Ok, exceptionObject.ToString());
+      msgBox.Run();
+      msgBox.Destroy(); 
     }
   }
 }

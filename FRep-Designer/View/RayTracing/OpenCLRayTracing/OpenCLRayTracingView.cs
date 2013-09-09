@@ -8,14 +8,14 @@ namespace FRepDesigner
 {
 	public class OpenCLRayTracingView: RayTracingView
 	{
-		public OpenCLRayTracingView(): base ()
+		public OpenCLRayTracingView(): base()
 		{
 			init();
 		}
 
 		~OpenCLRayTracingView()
 		{
-			destroy();
+			//destroy();
 		}
 
 		public override void Render(Scene model, Gdk.Pixmap pixmap)
@@ -32,15 +32,15 @@ namespace FRepDesigner
 		}
 
 		[DllImport ("frep-cl-tracer")]
-		private static extern byte[] getImage(IntPtr p, int width, int height);
+        private static extern byte[] getImage(IntPtr p, int width, int height);
 
 		[DllImport ("frep-cl-tracer")]
-		private static extern void trace();
+        private static extern void trace();
 
 		[DllImport ("frep-cl-tracer")]
-		private static extern void init();
+        private static extern void init();
 
 		[DllImport ("frep-cl-tracer")]
-		private static extern void destroy();
+        private static extern void destroy();
 	}
 }
