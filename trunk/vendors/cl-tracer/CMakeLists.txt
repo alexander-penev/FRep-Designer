@@ -3,11 +3,15 @@ cmake_minimum_required(VERSION 2.8)
 project(frep-cl-tracer)
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake-modules")
 
-set(GLM_ROOT_DIR "./include/glm")
+# Embedded GLM lib
+set(GLM_ROOT_DIR "./vendors/glm")
 
 find_package(OpenCL REQUIRED)
-find_package(GiNaC REQUIRED)
+#find_package(GiNaC REQUIRED)
 find_package(GLM REQUIRED)
+
+add_subdirectory(vendors)
+
 set( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -pedantic -fPIC" )
 #set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -fPIC -arch i386 -arch x86_64" )
 
@@ -28,4 +32,3 @@ target_link_libraries(${PROJECT_NAME} ${LIBRARY_DEPS})
 
 add_executable("${PROJECT_NAME}.bin" ${SRC_LIST} "${PROJECT_SOURCE_DIR}/main.cpp")
 target_link_libraries("${PROJECT_NAME}.bin" ${LIBRARY_DEPS})
-
