@@ -2,7 +2,11 @@
 #include "functions.h"
 #include "KernelGenerator.h"
 
+#ifdef __APPLE__
+#include <OpenCL/cl.h>
+#else
 #include <CL/cl.h>
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -90,12 +94,14 @@ int init()
 			printf(" %d.%d Software version: %s\n", j+1, 2, value);
 			free(value);
 
+#ifdef CL_DEVICE_OPENCL_C_VERSION
 			// print c version supported by compiler for device
 			cl_check_error(clGetDeviceInfo(availableDevices[j], CL_DEVICE_OPENCL_C_VERSION, 0, NULL, &valueSize));
 			value = (char*) malloc(valueSize);
 			cl_check_error(clGetDeviceInfo(availableDevices[j], CL_DEVICE_OPENCL_C_VERSION, valueSize, value, NULL));
 			printf(" %d.%d OpenCL C version: %s\n", j+1, 3, value);
 			free(value);
+#endif
 
 			// print parallel compute units
 			cl_check_error(clGetDeviceInfo(availableDevices[j], CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(maxComputeUnits), &maxComputeUnits, NULL));
