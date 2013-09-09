@@ -1,6 +1,6 @@
 Instructions for building tracer
 
-Requirements: cmake >= 2.8, ginac, OpenCL implementation
+Requirements: cmake >= 2.8, ginac, OpenCL implementation, glm
 
 Compiling:
 

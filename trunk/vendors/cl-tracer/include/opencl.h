@@ -2,9 +2,15 @@
 #define OPENCL_H
 
 
-
+#ifdef __APPLE__
+#include <OpenCL/cl.h>
+#include <OpenCL/cl_gl.h>
+typedef unsigned int uint;
+#else
 #include <CL/cl.h>
 #include <CL/cl_gl.h>
+#endif
+
 #include <stdio.h>
 #include <string.h>
 #include <cstdlib>

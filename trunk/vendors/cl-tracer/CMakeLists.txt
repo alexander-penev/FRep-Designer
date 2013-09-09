@@ -3,15 +3,19 @@ cmake_minimum_required(VERSION 2.8)
 project(frep-cl-tracer)
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake-modules")
 
+set(GLM_ROOT_DIR "./include/glm")
+
 find_package(OpenCL REQUIRED)
 find_package(GiNaC REQUIRED)
+find_package(GLM REQUIRED)
 set( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -pedantic -fPIC" )
+#set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -fPIC -arch i386 -arch x86_64" )
 
 set(CMAKE_BUILD_TYPE Debug CACHE STRING "default to debug" FORCE)
 
-INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR})
+INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR} ${OPENCL_INCLUDE_DIRS} ${GINAC_INCLUDE_DIRS} ${GLM_INCLUDE_DIRS})
 
-set(LIBRARY_DEPS ${OPENCL_LIBRARIES} ${GINAC_LIBRARIES}) 
+set(LIBRARY_DEPS ${OPENCL_LIBRARIES} ${GINAC_LIBRARIES})
 
 aux_source_directory("${PROJECT_SOURCE_DIR}/src/." SRC_LIST)
 file(GLOB INCLUDE_LIST "${PROJECT_SOURCE_DIR}/include/*.h")
