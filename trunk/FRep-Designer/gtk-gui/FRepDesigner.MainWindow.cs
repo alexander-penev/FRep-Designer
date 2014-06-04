@@ -25,6 +25,7 @@ namespace FRepDesigner
 		private global::Gtk.VBox vbox1;
 		private global::Gtk.MenuBar menubar1;
 		private global::Gtk.Toolbar toolbar1;
+		private global::Gtk.ScrolledWindow GtkScrolledWindow;
 		private global::Gtk.Image image1;
 		private global::Gtk.Statusbar statusbar1;
 		private global::Gtk.ComboBox comboboxTracer;
@@ -94,6 +95,7 @@ namespace FRepDesigner
 			w4.Add (this.aboutAction, null);
 			this.UIManager.InsertActionGroup (w4, 3);
 			this.AddAccelGroup (this.UIManager.AccelGroup);
+			this.Events = ((global::Gdk.EventMask)(256));
 			this.Name = "FRepDesigner.MainWindow";
 			this.Title = global::Mono.Unix.Catalog.GetString ("F-Rep Designer");
 			this.WindowPosition = ((global::Gtk.WindowPosition)(1));
@@ -123,12 +125,22 @@ namespace FRepDesigner
 			w6.Expand = false;
 			w6.Fill = false;
 			// Container child vbox1.Gtk.Box+BoxChild
+			this.GtkScrolledWindow = new global::Gtk.ScrolledWindow ();
+			this.GtkScrolledWindow.Name = "GtkScrolledWindow";
+			this.GtkScrolledWindow.ShadowType = ((global::Gtk.ShadowType)(1));
+			// Container child GtkScrolledWindow.Gtk.Container+ContainerChild
+			global::Gtk.Viewport w7 = new global::Gtk.Viewport ();
+			w7.ShadowType = ((global::Gtk.ShadowType)(0));
+			// Container child GtkViewport.Gtk.Container+ContainerChild
 			this.image1 = new global::Gtk.Image ();
 			this.image1.CanFocus = true;
+			this.image1.Events = ((global::Gdk.EventMask)(256));
 			this.image1.Name = "image1";
-			this.vbox1.Add (this.image1);
-			global::Gtk.Box.BoxChild w7 = ((global::Gtk.Box.BoxChild)(this.vbox1 [this.image1]));
-			w7.Position = 2;
+			w7.Add (this.image1);
+			this.GtkScrolledWindow.Add (w7);
+			this.vbox1.Add (this.GtkScrolledWindow);
+			global::Gtk.Box.BoxChild w10 = ((global::Gtk.Box.BoxChild)(this.vbox1 [this.GtkScrolledWindow]));
+			w10.Position = 2;
 			// Container child vbox1.Gtk.Box+BoxChild
 			this.statusbar1 = new global::Gtk.Statusbar ();
 			this.statusbar1.Name = "statusbar1";
@@ -137,22 +149,23 @@ namespace FRepDesigner
 			this.comboboxTracer = global::Gtk.ComboBox.NewText ();
 			this.comboboxTracer.Name = "comboboxTracer";
 			this.statusbar1.Add (this.comboboxTracer);
-			global::Gtk.Box.BoxChild w8 = ((global::Gtk.Box.BoxChild)(this.statusbar1 [this.comboboxTracer]));
-			w8.Position = 2;
-			w8.Expand = false;
-			w8.Fill = false;
+			global::Gtk.Box.BoxChild w11 = ((global::Gtk.Box.BoxChild)(this.statusbar1 [this.comboboxTracer]));
+			w11.Position = 2;
+			w11.Expand = false;
+			w11.Fill = false;
 			this.vbox1.Add (this.statusbar1);
-			global::Gtk.Box.BoxChild w9 = ((global::Gtk.Box.BoxChild)(this.vbox1 [this.statusbar1]));
-			w9.PackType = ((global::Gtk.PackType)(1));
-			w9.Position = 3;
-			w9.Expand = false;
-			w9.Fill = false;
+			global::Gtk.Box.BoxChild w12 = ((global::Gtk.Box.BoxChild)(this.vbox1 [this.statusbar1]));
+			w12.PackType = ((global::Gtk.PackType)(1));
+			w12.Position = 3;
+			w12.Expand = false;
+			w12.Fill = false;
 			this.Add (this.vbox1);
 			if ((this.Child != null)) {
 				this.Child.ShowAll ();
 			}
 			this.Show ();
 			this.DeleteEvent += new global::Gtk.DeleteEventHandler (this.OnDeleteEvent);
+			this.ButtonPressEvent += new global::Gtk.ButtonPressEventHandler (this.OnButtonPressEvent);
 			this.customFRepAction.Activated += new global::System.EventHandler (this.OnCustomFRepActionActivated);
 			this.rFunctionAction.Activated += new global::System.EventHandler (this.OnRFunctionActionActivated);
 			this.zoomInAction.Activated += new global::System.EventHandler (this.OnZoomInActionActivated);

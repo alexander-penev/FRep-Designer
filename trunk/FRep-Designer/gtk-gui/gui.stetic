@@ -25,7 +25,7 @@
       </source>
     </icon-set>
   </icon-factory>
-  <widget class="Gtk.Window" id="FRepDesigner.MainWindow" design-size="887 572">
+  <widget class="Gtk.Window" id="FRepDesigner.MainWindow" design-size="931 572">
     <action-group name="Default">
       <action id="FileAction">
         <property name="Type">Action</property>
@@ -151,11 +151,13 @@
       </action>
     </action-group>
     <property name="MemberName" />
+    <property name="Events">ButtonPressMask</property>
     <property name="Title" translatable="yes">F-Rep Designer</property>
     <property name="WindowPosition">Center</property>
     <property name="DefaultWidth">640</property>
     <property name="DefaultHeight">480</property>
     <signal name="DeleteEvent" handler="OnDeleteEvent" />
+    <signal name="ButtonPressEvent" handler="OnButtonPressEvent" />
     <child>
       <widget class="Gtk.VBox" id="vbox1">
         <property name="MemberName" />
@@ -216,14 +218,28 @@
           </packing>
         </child>
         <child>
-          <widget class="Gtk.Image" id="image1">
+          <widget class="Gtk.ScrolledWindow" id="GtkScrolledWindow">
             <property name="MemberName" />
-            <property name="CanFocus">True</property>
-            <signal name="SizeAllocated" handler="OnImage1SizeAllocated" />
+            <property name="ShadowType">In</property>
+            <child>
+              <widget class="Gtk.Viewport" id="GtkViewport">
+                <property name="MemberName" />
+                <property name="ShadowType">None</property>
+                <child>
+                  <widget class="Gtk.Image" id="image1">
+                    <property name="MemberName" />
+                    <property name="CanFocus">True</property>
+                    <property name="Events">ButtonPressMask</property>
+                    <property name="ShowScrollbars">True</property>
+                    <signal name="SizeAllocated" handler="OnImage1SizeAllocated" />
+                  </widget>
+                </child>
+              </widget>
+            </child>
           </widget>
           <packing>
             <property name="Position">2</property>
-            <property name="AutoSize">False</property>
+            <property name="AutoSize">True</property>
           </packing>
         </child>
         <child>
