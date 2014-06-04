@@ -6,7 +6,7 @@ namespace FRepDesigner
     public abstract class Solid
     {
         public Cairo.Color Color = new Cairo.Color(1,1,1,1);
-
+        public Boolean selected;
         public Solid()
         {      
         }
@@ -29,7 +29,16 @@ namespace FRepDesigner
             return null;
         }
         
-
+        public virtual bool GetSelected()
+        {
+            return selected;
+        }
+        
+        public virtual void SetSelected(Boolean selected)
+        {
+            this.selected = selected;
+        }
+        
     }
 }
 

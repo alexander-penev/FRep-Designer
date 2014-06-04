@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections;
 using System.Drawing;
 
 using Gtk;
@@ -15,11 +16,14 @@ namespace FRepDesigner
         public string FileName = null; 
         public Scene Model;
         public RayTracingView View;
-
+        public Gdk.Point mouse_point = new Gdk.Point(0,0);
+        float mpoint_x;
+        float mpoint_y;
+        public Stack<Solid> Spheres = new Stack<Solid>();
         private List<RayTracingView> TracersList = new List<RayTracingView>(); 
         
         private Random rand = new Random(5);
-        
+             
         public MainWindow(): base(Gtk.WindowType.Toplevel)
         {
             // That's a hack because of the designer. If one needs to attach an event the designer attaches
@@ -27,7 +31,7 @@ namespace FRepDesigner
             // but not for events like Realize which happen in the initialization. This function is used
             // to attach the event handlers before the initialization part.
             PreBuild();
-            Build();
+            Build();          
         }
 
         protected virtual void PreBuild()
@@ -43,8 +47,8 @@ namespace FRepDesigner
 
             TracersList.Add(new SimpleRayTracingView());
             TracersList.Add(new SimpleMultithreadRayTracingView());
-            TracersList.Add(new OpenCLRayTracingView());
-
+           // TracersList.Add(new OpenCLRayTracingView());
+            
             foreach (var item in TracersList) {
                 comboboxTracer.AppendText(item.GetType().Name);
             }
@@ -151,6 +155,7 @@ namespace FRepDesigner
         
         protected void OnSphereActionActivated(object sender, System.EventArgs e)
         {
+            //FRepSolid frs = new FRepSolid("sqr(x-xc)+sqr(y-yc)+sqr(z-zc)-sqr(r)");
             FRepSolid frs = new FRepSolid("sqr(x)+sqr(y)+sqr(z)-100");
             frs.Color = new Cairo.Color(rand.NextDouble(),rand.NextDouble(),rand.NextDouble(),1);
             Model.AddPrimitive(frs);
@@ -224,7 +229,7 @@ namespace FRepDesigner
         {
             Model = new Scene();
             Model.Changed += SceneChanged;
-            UpdateView();
+            UpdateView(); 
         }        
         protected void OnRFunctionActionActivated(object sender, EventArgs e)
         {
@@ -258,12 +263,19 @@ namespace FRepDesigner
         
         protected void OnSelectActionActivated(object sender, EventArgs e)
         {
+            foreach(FRepSolid solid in Model.Solids)
+            {
+            }
+        }
+        
+        protected void DrawBoundingBox ()
+        {
             throw new NotImplementedException ();
         }
         
         protected void OnAboutActionActivated(object sender, EventArgs e)
         {
-            throw new NotImplementedException ();
+          throw new NotImplementedException ();
         }
         
         protected void OnComboboxTracerChanged(object sender, EventArgs e)
@@ -271,5 +283,41 @@ namespace FRepDesigner
             View = TracersList[comboboxTracer.Active];
             UpdateView();
         }
+        
+        
+        protected void OnButtonPressEvent (object o, Gtk.ButtonPressEventArgs args)
+        {
+            mpoint_x = Convert.ToSingle(args.Event.X);
+            mpoint_y = Convert.ToSingle(args.Event.Y); 
+            Point3D point = trans_point(mpoint_x,mpoint_y);
+            Ray3D ray = new Ray3D(new Vector3D(0,0,1),point);
+            
+            foreach(FRepSolid solid in Model.Solids)
+            { 
+                Point3D p = solid.Intersect(ray);
+                if(p != null)
+                {
+                   solid.SetSelected(true);
+                   solid.Color = new Cairo.Color(0,0,1,0.8);
+                   UpdateView();
+                }
+                else 
+                {
+                    UpdateView();
+                }
+            }
+        }
+        
+        public Point3D trans_point (float screen_px, float screen_py)
+        {
+            int width, height;
+            float p_x, p_y;
+            image1.Pixmap.GetSize(out width, out height);
+            p_x = ((screen_px-(width/2))/10);//the radius is scaled by 10 on the screen
+            p_y = ((screen_py-(height/2))/10);
+            Point3D P = new Point3D(p_x, p_y,5f);
+            return P;
+        }
     }
 }
+        
