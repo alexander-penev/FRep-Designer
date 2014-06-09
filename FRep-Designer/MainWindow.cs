@@ -287,36 +287,27 @@ namespace FRepDesigner
         
         protected void OnButtonPressEvent (object o, Gtk.ButtonPressEventArgs args)
         {
+            int width, height;
             mpoint_x = Convert.ToSingle(args.Event.X);
             mpoint_y = Convert.ToSingle(args.Event.Y); 
-            Point3D point = trans_point(mpoint_x,mpoint_y);
-            Ray3D ray = new Ray3D(new Vector3D(0,0,1),point);
+            image1.Pixmap.GetSize(out width, out height);
+            Ray3D ray = SimpleRayTracingView.ScreenDomainToWorldDomain(mpoint_x-(width/2), mpoint_y-(height/2));//align to the senter of rge WD origin
+            Solid s;
             
-            foreach(FRepSolid solid in Model.Solids)
+            foreach(Solid solid in Model.Solids)
             { 
-                Point3D p = solid.Intersect(ray);
-                if(p != null)
+                View.Тrace(Model, ray, out s);
+                if(s != null)
                 {
                    solid.SetSelected(true);
-                   solid.Color = new Cairo.Color(0,0,1,0.8);
                    UpdateView();
                 }
                 else 
                 {
+                    solid.SetSelected(false);                
                     UpdateView();
                 }
             }
-        }
-        
-        public Point3D trans_point (float screen_px, float screen_py)
-        {
-            int width, height;
-            float p_x, p_y;
-            image1.Pixmap.GetSize(out width, out height);
-            p_x = ((screen_px-(width/2))/10);//the radius is scaled by 10 on the screen
-            p_y = ((screen_py-(height/2))/10);
-            Point3D P = new Point3D(p_x, p_y,5f);
-            return P;
         }
     }
 }

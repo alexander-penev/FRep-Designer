@@ -19,7 +19,7 @@ namespace FRepDesigner
         {
         }
         
-        private static Cairo.Color Тrace(Scene model, Ray3D r)
+        public override Cairo.Color Тrace(Scene model, Ray3D r)
         {
             Point3D p, p1;
             float d1, d2;
