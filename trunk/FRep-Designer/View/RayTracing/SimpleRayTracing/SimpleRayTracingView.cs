@@ -16,11 +16,16 @@ namespace FRepDesigner
         {
         }
         
-        private static Cairo.Color Тrace(Scene model, Ray3D r)
+        public override Cairo.Color Тrace(Scene model, Ray3D r)
+        {
+            Solid sld;
+            return this.Тrace(model, r,out sld);
+        }
+        
+        public override Cairo.Color Тrace(Scene model, Ray3D r, out Solid sld)
         {
             Point3D p, p1;
             float d1, d2;
-            Solid sld;
             
             sld = null;
             p1 = new Point3D(r.Start);
@@ -42,8 +47,18 @@ namespace FRepDesigner
                 Vector3D N = sld.Normal(p1);
                 float k = (float)(L * N);
                 if (k > 0)
+                {
+                    if(sld.selected==true)
+                    {
+                        return new Cairo.Color(((AmbientLightIntensity + sld.Color.R * k * LightIntensity)+0.15), 
+                                               ((AmbientLightIntensity + sld.Color.G * k * LightIntensity)+0.15), 
+                                               ((AmbientLightIntensity + sld.Color.B * k * LightIntensity)+0.15), sld.Color.A*0.3);
+                    }
+                    else
                     return new Cairo.Color(AmbientLightIntensity + sld.Color.R * k * LightIntensity, AmbientLightIntensity + sld.Color.G * k * LightIntensity, AmbientLightIntensity + sld.Color.B * k * LightIntensity, sld.Color.A);
-                else
+                }
+                    else
+                    
                     return new Cairo.Color(0, 0, 0, 1);
             }
             else {
@@ -51,6 +66,13 @@ namespace FRepDesigner
             }
             
         }
+
+        
+        public static Ray3D ScreenDomainToWorldDomain (float x,float y)
+        {
+            return new Ray3D(new Vector3D(0, 0, 1), new Point3D((float)x / 10, (float)y / 10, 5f));;
+        }
+        
         
         public override void Render(Scene model, Gdk.Pixmap pixmap)
         {
@@ -60,7 +82,7 @@ namespace FRepDesigner
             using (Cairo.Context cr = Gdk.CairoHelper.Create(pixmap)) {
                 for (int y = -height/2; y <= height/2; y++) {
                     for (int x = -width/2; x <= width/2; x++) {
-                        Ray3D r = new Ray3D(new Vector3D(0, 0, 1), new Point3D((float)x / 10, (float)y / 10, 5f));
+                        Ray3D r = ScreenDomainToWorldDomain (x,y);
                         
                         Cairo.Color c = Тrace(model, r);
 

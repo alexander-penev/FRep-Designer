@@ -5,13 +5,9 @@ using Cairo;
 
 namespace FRepDesigner
 {
-	public class RayTracingView
+	public class RayTracingView : View
 	{
         public RayTracingView(): base ()
-        {
-        }
-        
-        public virtual void Render(Scene model, Gdk.Pixmap pixmap)
         {
         }
 	}
