@@ -53,6 +53,9 @@
     <EmbeddedResource Include="Resources\cursor.png" />
     <EmbeddedResource Include="Resources\function.png" />
     <EmbeddedResource Include="Resources\package.png" />
+    <EmbeddedResource Include="EmptyResourcefile.resx">
+      <Generator>ResXFileCodeGenerator</Generator>
+    </EmbeddedResource>
   </ItemGroup>
   <ItemGroup>
     <Compile Include="gtk-gui\generated.cs" />
