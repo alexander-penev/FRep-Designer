@@ -174,6 +174,113 @@ llvm::Value* CustomExprCompiler::gen_vec(const expr::Node& n) {
     return out;
 }
 
+// ── Interval twin ────────────────────────────────────────────────────────────
+// {lo,hi} arithmetic on the same AST for octree region pruning.
+
+std::pair<llvm::Value*,llvm::Value*>
+CustomExprCompiler::gen_ival(const expr::Node& n) {
+    using Kind = expr::Node::Kind;
+    if (auto it = imemo_.find(&n); it != imemo_.end()) return it->second;
+    auto& b = *b_;
+    auto k = [&](float v){ return fc(v); };
+    auto mn = [&](llvm::Value* a, llvm::Value* c){
+        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::minnum,{b.getFloatTy()}),{a,c}); };
+    auto mx = [&](llvm::Value* a, llvm::Value* c){
+        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::maxnum,{b.getFloatTy()}),{a,c}); };
+    std::pair<llvm::Value*,llvm::Value*> out{nullptr,nullptr};
+    switch (n.kind) {
+        case Kind::Number: out = {k(n.num), k(n.num)}; break;
+        case Kind::Const:  { float v = n.ident=="pi"?std::numbers::pi_v<float>:std::numbers::e_v<float>;
+                             out = {k(v),k(v)}; break; }
+        case Kind::Var:
+            if (n.ident=="x") out={xlo_,xhi_};
+            else if (n.ident=="y") out={ylo_,yhi_};
+            else if (n.ident=="z") out={zlo_,zhi_};
+            else { fail("unknown var '"+n.ident+"'"); return {}; }
+            break;
+        case Kind::UnaryNeg: {
+            auto [l,h]=gen_ival(*n.children[0]); if(!l) return {};
+            out={b.CreateFNeg(h), b.CreateFNeg(l)}; break;
+        }
+        case Kind::BinOp: {
+            auto [al,ah]=gen_ival(*n.children[0]);
+            auto [cl,ch]=gen_ival(*n.children[1]); if(!al||!cl) return {};
+            switch (n.bop) {
+                case expr::Op::Add: out={b.CreateFAdd(al,cl), b.CreateFAdd(ah,ch)}; break;
+                case expr::Op::Sub: out={b.CreateFSub(al,ch), b.CreateFSub(ah,cl)}; break;
+                case expr::Op::Mul: { auto p1=b.CreateFMul(al,cl),p2=b.CreateFMul(al,ch),
+                                           p3=b.CreateFMul(ah,cl),p4=b.CreateFMul(ah,ch);
+                                      out={mn(mn(p1,p2),mn(p3,p4)), mx(mx(p1,p2),mx(p3,p4))}; break; }
+                case expr::Op::Div: { // assumes divisor interval excludes 0 (scenes hold constants)
+                                      auto q1=b.CreateFDiv(al,cl),q2=b.CreateFDiv(al,ch),
+                                           q3=b.CreateFDiv(ah,cl),q4=b.CreateFDiv(ah,ch);
+                                      out={mn(mn(q1,q2),mn(q3,q4)), mx(mx(q1,q2),mx(q3,q4))}; break; }
+            }
+            break;
+        }
+        case Kind::Call: out = gen_call_ival(n); break;
+    }
+    if (out.first) imemo_[&n]=out;
+    return out;
+}
+
+std::pair<llvm::Value*,llvm::Value*>
+CustomExprCompiler::gen_call_ival(const expr::Node& n) {
+    auto& b = *b_;
+    const auto& nm = n.ident;
+    auto I=[&](llvm::Intrinsic::ID id,llvm::Value* v){
+        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,id,{b.getFloatTy()}),{v}); };
+    auto mn=[&](llvm::Value* a,llvm::Value* c){
+        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::minnum,{b.getFloatTy()}),{a,c}); };
+    auto mx=[&](llvm::Value* a,llvm::Value* c){
+        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::maxnum,{b.getFloatTy()}),{a,c}); };
+    std::vector<std::pair<llvm::Value*,llvm::Value*>> a;
+    for (auto& c:n.children){ auto p=gen_ival(*c); if(!p.first) return {}; a.push_back(p); }
+    if (nm=="sqrt"){ auto lo=mx(a[0].first, fc(0.0f));
+                     return {I(llvm::Intrinsic::sqrt,lo), I(llvm::Intrinsic::sqrt,mx(a[0].second,fc(0.0f)))}; }
+    if (nm=="abs"){ auto&[l,h]=a[0];
+        auto al=I(llvm::Intrinsic::fabs,l), ah=I(llvm::Intrinsic::fabs,h);
+        auto spans0=b.CreateAnd(b.CreateFCmpOLE(l,fc(0.0f)), b.CreateFCmpOGE(h,fc(0.0f)));
+        return {b.CreateSelect(spans0, fc(0.0f), mn(al,ah)), mx(al,ah)}; }
+    if (nm=="min") return {mn(a[0].first,a[1].first), mn(a[0].second,a[1].second)};
+    if (nm=="max") return {mx(a[0].first,a[1].first), mx(a[0].second,a[1].second)};
+    if (nm=="pow"){ // constant exponent, non-negative base (holds for the blend h^k)
+        auto*P=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::pow,{b.getFloatTy()});
+        auto lo=mx(a[0].first,fc(0.0f)), hi=mx(a[0].second,fc(0.0f));
+        return {b.CreateCall(P,{lo,a[1].first}), b.CreateCall(P,{hi,a[1].second})}; }
+    // trig etc.: not yet interval-supported
+    fail("interval unsupported fn '"+nm+"'"); return {};
+}
+
+llvm::Function* CustomExprCompiler::compile_interval(llvm::Module&        mod,
+                                                     llvm::LLVMContext&   ctx,
+                                                     const std::string&   fn_name,
+                                                     const expr::NodePtr& ast) {
+    error_.clear();
+    if (!ast){ fail("null AST"); return nullptr; }
+    if (mod.getFunction(fn_name)){ fail("fn exists"); return nullptr; }
+    ctx_=&ctx; mod_=&mod; imemo_.clear();
+    auto* pf=llvm::PointerType::getUnqual(ctx);
+    auto* fty=llvm::FunctionType::get(llvm::Type::getVoidTy(ctx),{pf,pf},false);
+    auto* fn=llvm::Function::Create(fty,llvm::Function::ExternalLinkage,fn_name,mod);
+    fn->addFnAttr(llvm::Attribute::NoUnwind);
+    auto it=fn->arg_begin(); llvm::Value* B=&*it++; llvm::Value* O=&*it++;
+    auto* bb=llvm::BasicBlock::Create(ctx,"entry",fn);
+    llvm::IRBuilder<> b(bb); b_=&b;
+    auto* f32=b.getFloatTy();
+    auto ld=[&](int i){ return b.CreateAlignedLoad(f32,
+        b.CreateConstInBoundsGEP1_32(f32,B,i), llvm::MaybeAlign(4)); };
+    xlo_=ld(0); xhi_=ld(1); ylo_=ld(2); yhi_=ld(3); zlo_=ld(4); zhi_=ld(5);
+    auto [lo,hi]=gen_ival(*ast);
+    if(!lo||!error_.empty()){ fn->eraseFromParent(); return nullptr; }
+    b.CreateAlignedStore(lo, b.CreateConstInBoundsGEP1_32(f32,O,0), llvm::MaybeAlign(4));
+    b.CreateAlignedStore(hi, b.CreateConstInBoundsGEP1_32(f32,O,1), llvm::MaybeAlign(4));
+    b.CreateRetVoid();
+    std::string vfy; llvm::raw_string_ostream es(vfy);
+    if(llvm::verifyFunction(*fn,&es)){ fail("verify: "+vfy); fn->eraseFromParent(); return nullptr; }
+    return fn;
+}
+
 // ── Vectorizable polynomial approximations ──────────────────────────────────
 // Range-reduced minimax; f32 accuracy ~1e-6 (sin/cos), ~2e-6 (asin/atan).
 // All ops are lane-parallel (no libm, no per-lane extract), so they lower to
