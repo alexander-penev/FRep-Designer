@@ -28,6 +28,8 @@ llvm::Value* CustomExprCompiler::fc(float v) {
 
 llvm::Value* CustomExprCompiler::gen(const expr::Node& n) {
     using Kind = expr::Node::Kind;
+    if (auto it = memo_.find(&n); it != memo_.end()) return it->second;  // shared subtree
+    llvm::Value* out = nullptr;
     switch (n.kind) {
         case Kind::Number: return fc(n.num);
 
@@ -47,7 +49,8 @@ llvm::Value* CustomExprCompiler::gen(const expr::Node& n) {
         case Kind::UnaryNeg: {
             auto v = gen(*n.children[0]);
             if (!v) return nullptr;
-            return b_->CreateFNeg(v);
+            out = b_->CreateFNeg(v);
+            break;
         }
 
         case Kind::BinOp: {
@@ -55,19 +58,18 @@ llvm::Value* CustomExprCompiler::gen(const expr::Node& n) {
             auto r = gen(*n.children[1]);
             if (!l || !r) return nullptr;
             switch (n.bop) {
-                case expr::Op::Add: return b_->CreateFAdd(l, r);
-                case expr::Op::Sub: return b_->CreateFSub(l, r);
-                case expr::Op::Mul: return b_->CreateFMul(l, r);
-                case expr::Op::Div: return b_->CreateFDiv(l, r);
+                case expr::Op::Add: out = b_->CreateFAdd(l, r); break;
+                case expr::Op::Sub: out = b_->CreateFSub(l, r); break;
+                case expr::Op::Mul: out = b_->CreateFMul(l, r); break;
+                case expr::Op::Div: out = b_->CreateFDiv(l, r); break;
             }
-            fail("unhandled BinOp");
-            return nullptr;
+            break;
         }
 
-        case Kind::Call: return gen_call(n);
+        case Kind::Call: out = gen_call(n); break;
     }
-    fail("unhandled AST kind");
-    return nullptr;
+    if (out) memo_[&n] = out;   // cache shared subtrees (BinOp/Neg/Call)
+    return out;
 }
 
 llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {

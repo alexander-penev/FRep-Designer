@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <string>
 
+#include <map>
 namespace frep::expr {
 
 namespace {
@@ -26,6 +27,7 @@ enum class Tok {
     Num, Ident,
     Plus, Minus, Star, Slash,
     LParen, RParen, Comma,
+    Semi, Assign,
     End,
 };
 struct Token {
@@ -80,6 +82,8 @@ std::vector<Token> tokenize(const std::string& src) {
             case '(': out.push_back({Tok::LParen, {}, 0, col}); ++i; break;
             case ')': out.push_back({Tok::RParen, {}, 0, col}); ++i; break;
             case ',': out.push_back({Tok::Comma,  {}, 0, col}); ++i; break;
+            case ';': out.push_back({Tok::Semi,   {}, 0, col}); ++i; break;
+            case '=': out.push_back({Tok::Assign, {}, 0, col}); ++i; break;
             default:
                 throw ParseError(
                     std::string("unexpected character '") + c +
@@ -93,6 +97,7 @@ std::vector<Token> tokenize(const std::string& src) {
 // ── Parser (mutable cursor) ─────────────────────────────────────────────────
 struct Parser {
     std::vector<Token> toks;
+    std::map<std::string, NodePtr> env;   // let-bound names -> shared AST
     std::size_t        pos = 0;
 
     Token& peek() { return toks[pos]; }
@@ -166,6 +171,9 @@ struct Parser {
                         std::to_string(args.size()), ident_col);
                 return Node::call(std::move(name), std::move(args));
             }
+            // Let-bound name -> shared subtree (preserves DAG).
+            if (auto it = env.find(name); it != env.end())
+                return it->second;
             // Variable.
             if (name == "x" || name == "y" || name == "z")
                 return Node::var(name);
@@ -179,10 +187,26 @@ struct Parser {
 
 } // anon
 
+// Let-prelude: zero or more "IDENT = expr ;" bindings, then the result expr.
+// Each binding shares its AST via env, so repeated names reuse one subtree.
+static NodePtr parse_with_lets(Parser& p) {
+    while (p.peek().k == Tok::Ident && p.toks[p.pos + 1].k == Tok::Assign) {
+        int col = p.peek().col;
+        std::string name = p.consume().s;
+        if (name == "x" || name == "y" || name == "z" || name == "pi" || name == "e")
+            throw ParseError("cannot bind reserved name '" + name + "'", col);
+        p.consume(); // '='
+        auto val = p.parse_expr();
+        if (!p.match(Tok::Semi))
+            throw ParseError("expected ';' after binding '" + name + "'", col);
+        p.env[name] = val;
+    }
+    return p.parse_expr();
+}
 NodePtr parse(const std::string& src) {
     Parser p;
     p.toks = tokenize(src);
-    auto root = p.parse_expr();
+    auto root = parse_with_lets(p);
     if (p.peek().k != Tok::End)
         throw ParseError("trailing tokens at end of expression", p.peek().col);
     return root;
@@ -222,8 +246,16 @@ bool is_number(const NodePtr& n) {
 
 } // anon
 
+static NodePtr fold_impl(const NodePtr& n,
+                        std::map<const Node*, NodePtr>& memo);
 NodePtr fold(const NodePtr& n) {
+    std::map<const Node*, NodePtr> memo;
+    return fold_impl(n, memo);
+}
+static NodePtr fold_impl(const NodePtr& n,
+                         std::map<const Node*, NodePtr>& memo) {
     if (!n) return n;
+    if (auto it = memo.find(n.get()); it != memo.end()) return it->second;
     using Kind = Node::Kind;
     switch (n->kind) {
         case Kind::Number:
@@ -236,13 +268,13 @@ NodePtr fold(const NodePtr& n) {
             // know about it.
             return Node::number(const_value(n->ident));
         case Kind::UnaryNeg: {
-            auto c = fold(n->children[0]);
+            auto c = fold_impl(n->children[0], memo);
             if (is_number(c)) return Node::number(-c->num);
-            return Node::neg(c);
+            return memo[n.get()] = Node::neg(c);
         }
         case Kind::BinOp: {
-            auto l = fold(n->children[0]);
-            auto r = fold(n->children[1]);
+            auto l = fold_impl(n->children[0], memo);
+            auto r = fold_impl(n->children[1], memo);
             if (is_number(l) && is_number(r)) {
                 float v = 0;
                 switch (n->bop) {
@@ -272,7 +304,7 @@ NodePtr fold(const NodePtr& n) {
             } else if (n->bop == Op::Div) {
                 if (is_number(r) && r->num == 1.0f) return l;
             }
-            return Node::binop(n->bop, l, r);
+            return memo[n.get()] = Node::binop(n->bop, l, r);
         }
         case Kind::Call: {
             std::vector<NodePtr> folded;
@@ -281,7 +313,7 @@ NodePtr fold(const NodePtr& n) {
             nums.reserve(n->children.size());
             bool all_const = true;
             for (const auto& c : n->children) {
-                auto fc = fold(c);
+                auto fc = fold_impl(c, memo);
                 folded.push_back(fc);
                 if (is_number(fc)) nums.push_back(fc->num);
                 else               all_const = false;
@@ -290,7 +322,7 @@ NodePtr fold(const NodePtr& n) {
                 float v = apply_func(n->ident, nums);
                 return Node::number(v);
             }
-            return Node::call(n->ident, std::move(folded));
+            return memo[n.get()] = Node::call(n->ident, std::move(folded));
         }
     }
     return n;

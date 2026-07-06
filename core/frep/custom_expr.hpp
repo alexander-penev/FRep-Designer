@@ -26,6 +26,7 @@
 #include <llvm/IR/Module.h>
 
 #include <memory>
+#include <unordered_map>
 #include <ostream>
 #include <string>
 
@@ -60,6 +61,7 @@ private:
     llvm::Value*       vx_  = nullptr;
     llvm::Value*       vy_  = nullptr;
     llvm::Value*       vz_  = nullptr;
+    std::unordered_map<const expr::Node*, llvm::Value*> memo_;  // DAG: emit shared subtrees once
 
     llvm::Value* gen(const expr::Node& n);
     llvm::Value* gen_call(const expr::Node& n);

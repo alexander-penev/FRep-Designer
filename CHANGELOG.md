@@ -1,5 +1,8 @@
 # Changelog
 
+## [4.32.5]
+- CustomExpr: let-bindings ("name = expr; ... result") with shared-subtree (DAG) evaluation; fold and LLVM codegen memoize by node identity, so structured imports keep common subexpressions (fewer JIT ops).
+
 ## [4.32.4]
 - CustomExpr: add atan, asin, acos, atan2, mod to all expression back-ends (LLVM lowers them to libm calls — CPU paths only; the NVPTX path keeps its self-contained-transcendentals constraint).
 - core/compiler/compile_sdf.hpp: JIT the whole-scene SDF to a plain function pointer (used by frep-designer-bench).
