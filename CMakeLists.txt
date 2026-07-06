@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(frep VERSION 4.32.4 LANGUAGES C CXX)
+project(frep VERSION 4.32.5 LANGUAGES C CXX)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # C++26
