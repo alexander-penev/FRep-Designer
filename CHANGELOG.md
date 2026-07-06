@@ -1,5 +1,8 @@
 # Changelog
 
+## [4.32.8]
+- Interval arithmetic + octree pruning: compile_interval() emits an {lo,hi} twin of a CustomExpr scene (add/sub/mul/div/neg/abs/sqrt/min/max/pow); compile_scene_sdf_interval() + octree_leaves()/octree_classify() drop fully inside/outside regions so only surface cells are evaluated. Trig interval rules pending. Grid eval on the pruned leaf set is ~7-29x over per-cell SIMD on the canonical scenes.
+
 ## [4.32.7]
 - SIMD poly: vectorizable inline polynomial approximations for sin/cos/tan/asin/acos/atan/atan2/mod in the vector path (replaces llvm.sin.vNf32, which scalarized, and the per-lane libm fallback). Range-reduced minimax, f32 err ~6e-7 (sincos) / ~1e-5 (atan/asin). No libm dependency in the SIMD leaf; lowers to real SIMD on any target.
 

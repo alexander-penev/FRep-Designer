@@ -61,6 +61,14 @@ public:
                                 const expr::NodePtr& ast,
                                 unsigned             width = 8);
 
+    // Interval variant: `void <fn>(const float* B, float* O)` where
+    // B=[xlo,xhi,ylo,yhi,zlo,zhi], O=[flo,fhi]. Used for octree pruning.
+    // Arithmetic + abs/sqrt/min/max only (no trig yet -> returns error).
+    llvm::Function* compile_interval(llvm::Module&        mod,
+                                     llvm::LLVMContext&   ctx,
+                                     const std::string&   fn_name,
+                                     const expr::NodePtr& ast);
+
     const std::string& last_error() const { return error_; }
 
 private:
@@ -75,6 +83,13 @@ private:
 
     llvm::Value* gen(const expr::Node& n);
     llvm::Value* gen_call(const expr::Node& n);
+
+    // Interval twin: same AST -> {lo,hi} arithmetic. lo_/hi_ hold the x/y/z
+    // interval endpoints while an interval function is built.
+    llvm::Value *xlo_=nullptr,*xhi_=nullptr,*ylo_=nullptr,*yhi_=nullptr,*zlo_=nullptr,*zhi_=nullptr;
+    std::unordered_map<const expr::Node*, std::pair<llvm::Value*,llvm::Value*>> imemo_;
+    std::pair<llvm::Value*,llvm::Value*> gen_ival(const expr::Node& n);
+    std::pair<llvm::Value*,llvm::Value*> gen_call_ival(const expr::Node& n);
 
     // SIMD twin: same AST, <W x float> lanes. vx_/vy_/vz_ hold the vector args
     // while a vector function is built.
@@ -138,6 +153,7 @@ private:
 public:
     // Parsed+folded AST (parses on first use). Used by the SIMD compile path.
     const expr::NodePtr& ast() const { ensure_parsed(); return ast_; }
+    const void* custom_expr_ast() const override { return &ast(); }
 private:
     mutable expr::NodePtr ast_;
 

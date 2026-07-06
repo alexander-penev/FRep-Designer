@@ -179,6 +179,10 @@ public:
     // Default: not implemented — primitives, ops, and transforms override
     // this. CustomExprNode does not override and will throw at runtime; users
     // wanting to mesh a CustomExprNode should JIT it first.
+    // RTTI-free downcast for the JIT interval/SIMD paths (core is -fno-rtti).
+    // CustomExprNode overrides to return its expr AST; all others return null.
+    virtual const void* custom_expr_ast() const { return nullptr; }
+
     virtual float eval(float x, float y, float z) const {
         throw std::runtime_error(
             std::string("FRepNode::eval not implemented for type '") +
