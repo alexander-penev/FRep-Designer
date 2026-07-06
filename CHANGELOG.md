@@ -1,5 +1,11 @@
 # Changelog
 
+## [4.32.7]
+- SIMD poly: vectorizable inline polynomial approximations for sin/cos/tan/asin/acos/atan/atan2/mod in the vector path (replaces llvm.sin.vNf32, which scalarized, and the per-lane libm fallback). Range-reduced minimax, f32 err ~6e-7 (sincos) / ~1e-5 (atan/asin). No libm dependency in the SIMD leaf; lowers to real SIMD on any target.
+
+## [4.32.6]
+- CustomExpr SIMD: compile_vec() emits a W-lane (<8 x float>) vector twin of the scalar fn from the same DAG; vector intrinsics for sqrt/sin/cos/min/max/etc., per-lane scalar libm for asin/acos/atan/atan2/mod. compile_scene_sdf_simd() JITs scene_sdf_simd for single-CustomExprNode scenes.
+
 ## [4.32.5]
 - CustomExpr: let-bindings ("name = expr; ... result") with shared-subtree (DAG) evaluation; fold and LLVM codegen memoize by node identity, so structured imports keep common subexpressions (fewer JIT ops).
 

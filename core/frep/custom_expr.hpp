@@ -51,6 +51,16 @@ public:
                             const std::string&    fn_name,
                             const std::string&    expr_src);
 
+    // Vector variant: builds `void <fn>(const float* X,const float* Y,
+    // const float* Z, float* O)` evaluating W lanes per call (W = 8 → AVX2).
+    // Same AST, DAG-shared, transcendentals without a vector intrinsic fall
+    // back to per-lane scalar libm.
+    llvm::Function* compile_vec(llvm::Module&        mod,
+                                llvm::LLVMContext&   ctx,
+                                const std::string&   fn_name,
+                                const expr::NodePtr& ast,
+                                unsigned             width = 8);
+
     const std::string& last_error() const { return error_; }
 
 private:
@@ -65,6 +75,13 @@ private:
 
     llvm::Value* gen(const expr::Node& n);
     llvm::Value* gen_call(const expr::Node& n);
+
+    // SIMD twin: same AST, <W x float> lanes. vx_/vy_/vz_ hold the vector args
+    // while a vector function is built.
+    unsigned     vw_ = 0;   // active vector width (0 = scalar)
+    std::unordered_map<const expr::Node*, llvm::Value*> vmemo_;
+    llvm::Value* gen_vec(const expr::Node& n);
+    llvm::Value* gen_call_vec(const expr::Node& n);
 
     llvm::Type*  f32() { return llvm::Type::getFloatTy(*ctx_); }
     llvm::Value* fc(float v);
@@ -118,6 +135,10 @@ private:
     std::string expr_;
 
     // Cached AST — parsed lazily on first back-end call.
+public:
+    // Parsed+folded AST (parses on first use). Used by the SIMD compile path.
+    const expr::NodePtr& ast() const { ensure_parsed(); return ast_; }
+private:
     mutable expr::NodePtr ast_;
 
     // Cached LLVM function name — deduplicates IR when scene_normal

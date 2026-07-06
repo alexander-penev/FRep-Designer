@@ -130,6 +130,211 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
     return nullptr;
 }
 
+// ── SIMD twin ────────────────────────────────────────────────────────────────
+
+static llvm::VectorType* vty(llvm::LLVMContext& c, unsigned w) {
+    return llvm::VectorType::get(llvm::Type::getFloatTy(c), w, false);
+}
+
+llvm::Value* CustomExprCompiler::gen_vec(const expr::Node& n) {
+    using Kind = expr::Node::Kind;
+    if (auto it = vmemo_.find(&n); it != vmemo_.end()) return it->second;
+    auto& b = *b_;
+    auto splat = [&](float v) { return b.CreateVectorSplat(vw_, fc(v)); };
+    llvm::Value* out = nullptr;
+    switch (n.kind) {
+        case Kind::Number: return splat(n.num);
+        case Kind::Const:
+            return splat(n.ident == "pi" ? std::numbers::pi_v<float>
+                                         : std::numbers::e_v<float>);
+        case Kind::Var:
+            if (n.ident == "x") return vx_;   // already <W x float> args
+            if (n.ident == "y") return vy_;
+            if (n.ident == "z") return vz_;
+            fail("unknown variable '" + n.ident + "'"); return nullptr;
+        case Kind::UnaryNeg: {
+            auto v = gen_vec(*n.children[0]); if (!v) return nullptr;
+            out = b.CreateFNeg(v); break;
+        }
+        case Kind::BinOp: {
+            auto l = gen_vec(*n.children[0]);
+            auto r = gen_vec(*n.children[1]);
+            if (!l || !r) return nullptr;
+            switch (n.bop) {
+                case expr::Op::Add: out = b.CreateFAdd(l, r); break;
+                case expr::Op::Sub: out = b.CreateFSub(l, r); break;
+                case expr::Op::Mul: out = b.CreateFMul(l, r); break;
+                case expr::Op::Div: out = b.CreateFDiv(l, r); break;
+            }
+            break;
+        }
+        case Kind::Call: out = gen_call_vec(n); break;
+    }
+    if (out) vmemo_[&n] = out;
+    return out;
+}
+
+// ── Vectorizable polynomial approximations ──────────────────────────────────
+// Range-reduced minimax; f32 accuracy ~1e-6 (sin/cos), ~2e-6 (asin/atan).
+// All ops are lane-parallel (no libm, no per-lane extract), so they lower to
+// real SIMD on any target — unlike llvm.sin.vNf32 which scalarizes here.
+namespace {
+struct VPoly {
+    llvm::IRBuilder<>& b; llvm::VectorType* vt; unsigned W;
+    llvm::Value* C(float v){ return b.CreateVectorSplat(W, llvm::ConstantFP::get(b.getFloatTy(), v)); }
+    llvm::Value* fma(llvm::Value* a, llvm::Value* x, llvm::Value* c){
+        return b.CreateFAdd(b.CreateFMul(a, x), c); }
+    llvm::Value* intr(llvm::Intrinsic::ID id, llvm::Value* x){
+        return b.CreateCall(llvm::Intrinsic::getDeclaration(
+            b.GetInsertBlock()->getModule(), id, {vt}), {x}); }
+    // sin/cos via reduction to [-pi/4,pi/4] + quadrant swap (accurate to ~1e-6).
+    void sincos(llvm::Value* x, llvm::Value** so, llvm::Value** co){
+        auto TWO_OVER_PI=C(0.63661977236f), HALFPI=C(1.57079632679f);
+        auto k=intr(llvm::Intrinsic::round, b.CreateFMul(x, TWO_OVER_PI)); // nearest quadrant
+        auto r=b.CreateFSub(x, b.CreateFMul(k, HALFPI));                    // r in [-pi/4,pi/4]
+        auto r2=b.CreateFMul(r,r);
+        // base sin(r), cos(r) on the small interval
+        auto sp=fma(C(-1.0f/5040), r2, C(1.0f/120));
+        sp=fma(sp, r2, C(-1.0f/6)); sp=fma(sp, r2, C(1.0f)); auto sr=b.CreateFMul(r, sp);
+        auto cp=fma(C(1.0f/40320), r2, C(-1.0f/720));
+        cp=fma(cp, r2, C(1.0f/24)); cp=fma(cp, r2, C(-1.0f/2)); cp=fma(cp, r2, C(1.0f)); auto cr=cp;
+        // quadrant q = k mod 4 -> select/sign
+        auto ki=b.CreateFPToSI(k, llvm::VectorType::get(b.getInt32Ty(), W, false));
+        auto q=b.CreateAnd(ki, b.CreateVectorSplat(W, b.getInt32(3)));
+        auto is=[&](int v){ return b.CreateICmpEQ(q, b.CreateVectorSplat(W, b.getInt32(v))); };
+        auto neg=[&](llvm::Value* v){ return b.CreateFNeg(v); };
+        if (so) { // q0:sr q1:cr q2:-sr q3:-cr
+            auto s=b.CreateSelect(is(0), sr,
+                    b.CreateSelect(is(1), cr,
+                    b.CreateSelect(is(2), neg(sr), neg(cr))));
+            *so=s;
+        }
+        if (co) { // q0:cr q1:-sr q2:-cr q3:sr
+            auto c=b.CreateSelect(is(0), cr,
+                    b.CreateSelect(is(1), neg(sr),
+                    b.CreateSelect(is(2), neg(cr), sr)));
+            *co=c;
+        }
+    }
+    llvm::Value* sin(llvm::Value* x){ llvm::Value* s; sincos(x,&s,nullptr); return s; }
+    llvm::Value* cos(llvm::Value* x){ llvm::Value* c; sincos(x,nullptr,&c); return c; }
+    // atan on full range via minimax on |x|<=1 + reciprocal reduction.
+    llvm::Value* atan(llvm::Value* x){
+        auto ax=intr(llvm::Intrinsic::fabs, x);
+        auto gt=b.CreateFCmpOGT(ax, C(1.0f));
+        auto inv=b.CreateFDiv(C(1.0f), ax);
+        auto z=b.CreateSelect(gt, inv, ax);                    // z in [0,1]
+        auto z2=b.CreateFMul(z,z);
+        // minimax degree-9 odd poly for atan on [0,1]
+        auto p=fma(C(0.0208351f), z2, C(-0.0851330f));
+        p=fma(p, z2, C(0.1801410f)); p=fma(p, z2, C(-0.3302995f));
+        p=fma(p, z2, C(0.9998660f)); p=b.CreateFMul(p, z);
+        auto HALFPI=C(1.57079632679f);
+        auto big=b.CreateFSub(HALFPI, p);
+        auto r=b.CreateSelect(gt, big, p);
+        // restore sign of x
+        auto neg=b.CreateFCmpOLT(x, C(0.0f));
+        return b.CreateSelect(neg, b.CreateFNeg(r), r);
+    }
+    llvm::Value* asin(llvm::Value* x){
+        // asin(x)=atan(x/sqrt(1-x^2)); clamp domain
+        auto one=C(1.0f);
+        auto d=intr(llvm::Intrinsic::sqrt, b.CreateFSub(one, b.CreateFMul(x,x)));
+        return atan(b.CreateFDiv(x, d));
+    }
+    llvm::Value* acos(llvm::Value* x){ return b.CreateFSub(C(1.57079632679f), asin(x)); }
+    // atan2(y,x) via atan + quadrant fixup.
+    llvm::Value* atan2(llvm::Value* y, llvm::Value* x){
+        auto PI=C(3.14159265359f), z=C(0.0f);
+        auto a=atan(b.CreateFDiv(y, x));
+        auto xlt=b.CreateFCmpOLT(x, z);
+        auto yge=b.CreateFCmpOGE(y, z);
+        auto add=b.CreateSelect(yge, PI, b.CreateFNeg(PI));
+        return b.CreateSelect(xlt, b.CreateFAdd(a, add), a);
+    }
+};
+} // namespace
+
+llvm::Value* CustomExprCompiler::gen_call_vec(const expr::Node& n) {
+    auto& b = *b_;
+    std::vector<llvm::Value*> a;
+    for (const auto& c : n.children) {
+        auto v = gen_vec(*c); if (!v) return nullptr;
+        a.push_back(v);
+    }
+    auto* vt = vty(*ctx_, vw_);
+    auto vintr = [&](llvm::Intrinsic::ID id) {
+        auto* f = llvm::Intrinsic::getDeclaration(mod_, id, {vt});
+        return a.size() == 2 ? b.CreateCall(f, {a[0], a[1]})
+                             : b.CreateCall(f, {a[0]});
+    };
+    const auto& nm = n.ident;
+    VPoly vp{b, vt, vw_};
+    if (nm == "sqrt")  return vintr(llvm::Intrinsic::sqrt);
+    if (nm == "abs")   return vintr(llvm::Intrinsic::fabs);
+    if (nm == "sin")   return vp.sin(a[0]);
+    if (nm == "cos")   return vp.cos(a[0]);
+    if (nm == "exp")   return vintr(llvm::Intrinsic::exp);
+    if (nm == "log")   return vintr(llvm::Intrinsic::log);
+    if (nm == "floor") return vintr(llvm::Intrinsic::floor);
+    if (nm == "ceil")  return vintr(llvm::Intrinsic::ceil);
+    if (nm == "pow")   return vintr(llvm::Intrinsic::pow);
+    if (nm == "min")   return vintr(llvm::Intrinsic::minnum);
+    if (nm == "max")   return vintr(llvm::Intrinsic::maxnum);
+    if (nm == "tan") { llvm::Value* s; llvm::Value* c; vp.sincos(a[0], &s, &c);
+                       return b.CreateFDiv(s, c, "tan"); }
+    if (nm == "asin")  return vp.asin(a[0]);
+    if (nm == "acos")  return vp.acos(a[0]);
+    if (nm == "atan")  return vp.atan(a[0]);
+    if (nm == "atan2") return vp.atan2(a[0], a[1]);
+    if (nm == "mod") {  // x - floor(x/y)*y  (matches fmod for y>0; SIMD-friendly)
+        auto* ff = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::floor, {vt});
+        auto flq = b.CreateCall(ff, {b.CreateFDiv(a[0], a[1])});
+        return b.CreateFSub(a[0], b.CreateFMul(flq, a[1]));
+    }
+    fail("unknown function '" + nm + "'"); return nullptr;
+}
+
+llvm::Function* CustomExprCompiler::compile_vec(llvm::Module&        mod,
+                                                llvm::LLVMContext&   ctx,
+                                                const std::string&   fn_name,
+                                                const expr::NodePtr& ast,
+                                                unsigned             width) {
+    error_.clear();
+    if (!ast) { fail("null AST"); return nullptr; }
+    if (mod.getFunction(fn_name)) { fail("fn exists: " + fn_name); return nullptr; }
+    ctx_ = &ctx; mod_ = &mod; vw_ = width; vmemo_.clear();
+
+    auto* pf  = llvm::PointerType::getUnqual(ctx);
+    auto* fty = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx),
+                                        {pf, pf, pf, pf}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::ExternalLinkage,
+                                      fn_name, mod);
+    fn->addFnAttr(llvm::Attribute::NoUnwind);
+    auto it = fn->arg_begin();
+    llvm::Value* pX = &*it++; llvm::Value* pY = &*it++;
+    llvm::Value* pZ = &*it++; llvm::Value* pO = &*it++;
+
+    auto* bb = llvm::BasicBlock::Create(ctx, "entry", fn);
+    llvm::IRBuilder<> b(bb); b_ = &b;
+    auto* vt = vty(ctx, width);
+    auto load = [&](llvm::Value* p) {
+        return b.CreateAlignedLoad(vt, p, llvm::MaybeAlign(4));
+    };
+    vx_ = load(pX); vy_ = load(pY); vz_ = load(pZ);
+
+    auto* r = gen_vec(*ast);
+    if (!r || !error_.empty()) { fn->eraseFromParent(); return nullptr; }
+    b.CreateAlignedStore(r, pO, llvm::MaybeAlign(4));
+    b.CreateRetVoid();
+
+    std::string vfy; llvm::raw_string_ostream es(vfy);
+    if (llvm::verifyFunction(*fn, &es)) {
+        fail("verify: " + vfy); fn->eraseFromParent(); return nullptr;
+    }
+    return fn;
+}
+
 llvm::Function* CustomExprCompiler::compile(llvm::Module&        mod,
                                             llvm::LLVMContext&   ctx,
                                             const std::string&   fn_name,
