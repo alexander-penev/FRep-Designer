@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(frep VERSION 4.32.8 LANGUAGES C CXX)
+project(frep VERSION 4.36.0 LANGUAGES C CXX)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # C++26
@@ -722,3 +722,21 @@ if(Python3_Interpreter_FOUND AND TARGET frep_bench)
 else()
     message(STATUS "Python3 not found — `perf-check` target will be unavailable")
 endif()
+
+# CPU sphere-tracer benchmark (scalar vs SIMD packet vs Lipschitz step).
+add_executable(bench_trace tools/bench_trace.cpp)
+target_include_directories(bench_trace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bench_trace PRIVATE frep_core)
+set_property(TARGET bench_trace PROPERTY CXX_STANDARD 26)
+
+# Standalone randomized soundness test for the interval twin.
+add_executable(test_interval_enclosure tests/test_interval_enclosure.cpp)
+target_include_directories(test_interval_enclosure PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_interval_enclosure PRIVATE frep_core)
+set_property(TARGET test_interval_enclosure PROPERTY CXX_STANDARD 26)
+
+# Interval tile-cull: emits the GLSL compute shader and measures its cull rate.
+add_executable(bench_tile_cull tools/bench_tile_cull.cpp)
+target_include_directories(bench_tile_cull PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bench_tile_cull PRIVATE frep_core)
+set_property(TARGET bench_tile_cull PROPERTY CXX_STANDARD 26)

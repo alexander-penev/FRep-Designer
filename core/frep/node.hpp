@@ -42,10 +42,18 @@ struct CgCtx {
     llvm::Module&      mod;
     llvm::IRBuilder<>& b;
 
+    unsigned     width = 1;   // >1 emits <width x float> (SIMD broadcast path)
+    llvm::Value* vsplat(llvm::Value* s) const {
+        return width > 1 ? b.CreateVectorSplat(width, s) : s;
+    }
+
     llvm::Type*  f32()  const { return llvm::Type::getFloatTy(lc); }
     llvm::Type*  i32()  const { return llvm::Type::getInt32Ty(lc); }
     llvm::Type*  vd()   const { return llvm::Type::getVoidTy(lc); }
-    llvm::Value* fc(float v)  const { return llvm::ConstantFP::get(llvm::Type::getFloatTy(lc), v); }
+    llvm::Value* fc(float v)  const {
+        auto* s = llvm::ConstantFP::get(llvm::Type::getFloatTy(lc), v);
+        return width > 1 ? b.CreateVectorSplat(width, s) : s;
+    }
     llvm::Value* ic(int v)    const { return llvm::ConstantInt::get(llvm::Type::getInt32Ty(lc), v, true); }
 
     // ── Incremental parameter mode ──────────────────────────────────────────
@@ -83,8 +91,9 @@ struct CgCtx {
                 auto* idx = ic(slot);
                 auto* gep = b.CreateGEP(f32(), params_buffer, idx,
                                         node_id + "." + param_name + "_addr");
-                return b.CreateLoad(f32(), gep,
+                auto* ld = b.CreateLoad(f32(), gep,
                                     node_id + "." + param_name);
+                return vsplat(ld);
             }
         }
         return fc(default_value);

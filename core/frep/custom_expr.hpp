@@ -69,6 +69,12 @@ public:
                                      const std::string&   fn_name,
                                      const expr::NodePtr& ast);
 
+    // Inline the vector AST into an existing builder (SIMD broadcast codegen).
+    llvm::Value* gen_vec_inline(llvm::Module& mod, llvm::LLVMContext& ctx,
+                                llvm::IRBuilder<>& b, const expr::NodePtr& ast,
+                                llvm::Value* x, llvm::Value* y, llvm::Value* z,
+                                unsigned width);
+
     const std::string& last_error() const { return error_; }
 
 private:

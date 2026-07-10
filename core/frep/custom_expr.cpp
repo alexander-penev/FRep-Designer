@@ -208,9 +208,19 @@ CustomExprCompiler::gen_ival(const expr::Node& n) {
             switch (n.bop) {
                 case expr::Op::Add: out={b.CreateFAdd(al,cl), b.CreateFAdd(ah,ch)}; break;
                 case expr::Op::Sub: out={b.CreateFSub(al,ch), b.CreateFSub(ah,cl)}; break;
-                case expr::Op::Mul: { auto p1=b.CreateFMul(al,cl),p2=b.CreateFMul(al,ch),
-                                           p3=b.CreateFMul(ah,cl),p4=b.CreateFMul(ah,ch);
-                                      out={mn(mn(p1,p2),mn(p3,p4)), mx(mx(p1,p2),mx(p3,p4))}; break; }
+                case expr::Op::Mul: {
+                    auto& c0=*n.children[0]; auto& c1=*n.children[1];
+                    bool sq = (&c0==&c1) ||
+                              (c0.kind==expr::Node::Kind::Var &&
+                               c1.kind==expr::Node::Kind::Var && c0.ident==c1.ident);
+                    if (sq) { // x*x: true square, min is 0 when interval spans 0
+                        auto l2=b.CreateFMul(al,al), h2=b.CreateFMul(ah,ah);
+                        auto spans0=b.CreateAnd(b.CreateFCmpOLE(al,fc(0.0f)),b.CreateFCmpOGE(ah,fc(0.0f)));
+                        out={b.CreateSelect(spans0,fc(0.0f),mn(l2,h2)), mx(l2,h2)}; break;
+                    }
+                    auto p1=b.CreateFMul(al,cl),p2=b.CreateFMul(al,ch),
+                         p3=b.CreateFMul(ah,cl),p4=b.CreateFMul(ah,ch);
+                    out={mn(mn(p1,p2),mn(p3,p4)), mx(mx(p1,p2),mx(p3,p4))}; break; }
                 case expr::Op::Div: { // assumes divisor interval excludes 0 (scenes hold constants)
                                       auto q1=b.CreateFDiv(al,cl),q2=b.CreateFDiv(al,ch),
                                            q3=b.CreateFDiv(ah,cl),q4=b.CreateFDiv(ah,ch);
@@ -249,6 +259,75 @@ CustomExprCompiler::gen_call_ival(const expr::Node& n) {
         auto lo=mx(a[0].first,fc(0.0f)), hi=mx(a[0].second,fc(0.0f));
         return {b.CreateCall(P,{lo,a[1].first}), b.CreateCall(P,{hi,a[1].second})}; }
     // trig etc.: not yet interval-supported
+    auto Fc=[&](float v){ return fc(v); };
+    auto Sin=[&](llvm::Value* v){ return I(llvm::Intrinsic::sin,v); };
+    auto Cos=[&](llvm::Value* v){ return I(llvm::Intrinsic::cos,v); };
+    // sin/cos over [lo,hi]: start from endpoint values, then pull the interval to
+    // [-1,1] toward any extremum the range crosses. Extremum of sin at pi/2+k*pi
+    // (cos there = -+1); of cos at k*pi. We test inclusion via floor counting and
+    // widen with select (branchless, scalar interval fn).
+    // exists k with lo <= phase + k*pi <= hi, i.e. floor((hi-phase)/pi) >= ceil((lo-phase)/pi)
+    auto crosses_pi=[&](llvm::Value* lo, llvm::Value* hi, llvm::Value* phase){
+        auto PI=Fc(3.14159265359f);
+        auto a1=b.CreateFDiv(b.CreateFSub(hi,phase),PI);
+        auto c1=b.CreateFDiv(b.CreateFSub(lo,phase),PI);
+        auto fa=I(llvm::Intrinsic::floor,a1);
+        auto cc=b.CreateFNeg(I(llvm::Intrinsic::floor,b.CreateFNeg(c1)));  // ceil
+        return b.CreateFCmpOGE(fa,cc);
+    };
+    auto trig=[&](llvm::Value* lo, llvm::Value* hi, bool isSin)
+        -> std::pair<llvm::Value*,llvm::Value*> {
+        auto el=isSin?Sin(lo):Cos(lo), eh=isSin?Sin(hi):Cos(hi);
+        llvm::Value* rlo=mn(el,eh); llvm::Value* rhi=mx(el,eh);
+        auto PI=Fc(3.14159265359f), HALF=Fc(1.57079632679f);
+        auto crosses=[&](llvm::Value* phase){ return crosses_pi(lo,hi,phase); };
+        // max at phase where fn=+1, min where fn=-1
+        auto maxPhase=isSin?HALF:Fc(0.0f);
+        auto minPhase=isSin?Fc(-1.57079632679f):PI;
+        rhi=b.CreateSelect(crosses(maxPhase), Fc(1.0f), rhi);
+        rlo=b.CreateSelect(crosses(minPhase), Fc(-1.0f), rlo);
+        return {rlo,rhi};
+    };
+    if (nm=="sin") return trig(a[0].first,a[0].second,true);
+    if (nm=="cos") return trig(a[0].first,a[0].second,false);
+    if (nm=="tan"){
+        // tan has a pole at pi/2 + k*pi. If the argument range crosses one, the
+        // true range is all of R; only otherwise is tan monotone on [lo,hi] and
+        // bounded by its endpoints.
+        auto lo=a[0].first, hi=a[0].second;
+        auto t0=b.CreateFDiv(Sin(lo),Cos(lo));
+        auto t1=b.CreateFDiv(Sin(hi),Cos(hi));
+        auto pole=crosses_pi(lo,hi,Fc(1.57079632679f));
+        const float BIG=3.4e38f;
+        return {b.CreateSelect(pole,Fc(-BIG),mn(t0,t1)),
+                b.CreateSelect(pole,Fc( BIG),mx(t0,t1))};
+    }
+    // no LLVM asin/acos/atan intrinsics -> reuse scalar libm at interval endpoints
+    auto libm=[&](const char* fn, llvm::Value* v){
+        auto*t=llvm::FunctionType::get(b.getFloatTy(),{b.getFloatTy()},false);
+        return b.CreateCall(mod_->getOrInsertFunction(fn,t),{v}); };
+    if (nm=="asin") return {libm("asinf",a[0].first), libm("asinf",a[0].second)};
+    if (nm=="acos") return {libm("acosf",a[0].second), libm("acosf",a[0].first)}; // decreasing
+    if (nm=="atan") return {libm("atanf",a[0].first), libm("atanf",a[0].second)};
+    if (nm=="atan2"){
+        // atan2 is the polar angle: its level sets are rays from the origin, so
+        // over a box that contains neither the origin nor the branch cut (the
+        // negative x-axis) the extremes sit at box corners. The cut/origin is
+        // inside exactly when xlo <= 0 and the y-range straddles 0; then the
+        // range is the full circle.
+        auto ylo=a[0].first, yhi=a[0].second, xlo=a[1].first, xhi=a[1].second;
+        auto lm2=[&](llvm::Value* y, llvm::Value* x){
+            auto*t=llvm::FunctionType::get(b.getFloatTy(),{b.getFloatTy(),b.getFloatTy()},false);
+            return b.CreateCall(mod_->getOrInsertFunction("atan2f",t),{y,x}); };
+        auto c00=lm2(ylo,xlo), c01=lm2(ylo,xhi), c10=lm2(yhi,xlo), c11=lm2(yhi,xhi);
+        auto cmin=mn(mn(c00,c01),mn(c10,c11));
+        auto cmax=mx(mx(c00,c01),mx(c10,c11));
+        auto cut=b.CreateAnd(b.CreateFCmpOLE(xlo,Fc(0.0f)),
+                 b.CreateAnd(b.CreateFCmpOLE(ylo,Fc(0.0f)),
+                             b.CreateFCmpOGE(yhi,Fc(0.0f))));
+        return {b.CreateSelect(cut,Fc(-3.14159265359f),cmin),
+                b.CreateSelect(cut,Fc( 3.14159265359f),cmax)};
+    }
     fail("interval unsupported fn '"+nm+"'"); return {};
 }
 
@@ -400,6 +479,16 @@ llvm::Value* CustomExprCompiler::gen_call_vec(const expr::Node& n) {
         return b.CreateFSub(a[0], b.CreateFMul(flq, a[1]));
     }
     fail("unknown function '" + nm + "'"); return nullptr;
+}
+
+llvm::Value* CustomExprCompiler::gen_vec_inline(
+        llvm::Module& mod, llvm::LLVMContext& ctx, llvm::IRBuilder<>& b,
+        const expr::NodePtr& ast, llvm::Value* x, llvm::Value* y, llvm::Value* z,
+        unsigned width) {
+    ctx_=&ctx; mod_=&mod; b_=&b; vw_=width; vmemo_.clear();
+    vx_=x; vy_=y; vz_=z;
+    auto r = gen_vec(*ast);
+    return r ? r : llvm::ConstantFP::get(vty(ctx,width), 0.0);
 }
 
 llvm::Function* CustomExprCompiler::compile_vec(llvm::Module&        mod,
@@ -643,6 +732,11 @@ void CustomExprNode::emit_glsl_ast(std::ostream& out, const expr::Node& n) {
 llvm::Value* CustomExprNode::codegen(CgCtx& c, llvm::Value* x,
                                      llvm::Value* y, llvm::Value* z) const {
     ensure_parsed();
+
+    if (c.width > 1) {  // SIMD broadcast: inline the vector AST (no scalar helper)
+        CustomExprCompiler comp;
+        return comp.gen_vec_inline(c.mod, c.lc, c.b, ast_, x, y, z, c.width);
+    }
 
     if (cached_fn_name_.empty())
         cached_fn_name_ = "frep_expr_" + std::to_string(structural_hash());
