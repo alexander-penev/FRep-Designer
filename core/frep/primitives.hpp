@@ -64,7 +64,7 @@ public:
         auto mx = [&](llvm::Value* a, llvm::Value* bv) {
             return frep::llvm_compat::max_num(b, a, bv);
         };
-        auto* f0 = llvm::ConstantFP::get(b.getFloatTy(), 0.0f);
+        auto* f0 = c.fc(0.0f);  // width-aware (splats in SIMD mode)
         auto dx = b.CreateFSub(fabs_v(x), c.param_value(id, "hx", params.at("hx")), "dx");
         auto dy = b.CreateFSub(fabs_v(y), c.param_value(id, "hy", params.at("hy")), "dy");
         auto dz = b.CreateFSub(fabs_v(z), c.param_value(id, "hz", params.at("hz")), "dz");

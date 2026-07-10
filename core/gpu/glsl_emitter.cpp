@@ -893,6 +893,9 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
         << "  textures=" << res.texture_count << "\n"
         << "\n"
         << "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n"
+        << ((cfg.cull_slabs > 0)
+            ? "shared float sh_cull_t0;\nshared float sh_cull_t1;\n"
+            : "")
         << "layout(set = 0, binding = 0, rgba8) uniform image2D out_image;\n";
 
     // If we have MeshSDF nodes, declare the storage buffer.
@@ -1510,6 +1513,57 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
         << "    // Local invocation indexes the tile; absolute pixel adds the origin.\n"
         << "    ivec2 local = ivec2(gl_GlobalInvocationID.xy);\n"
         << "    ivec2 px = local + ivec2(pc.tile_x0, pc.tile_y0);\n"
+        ;
+
+    // Workgroup tile cull, emitted BEFORE the bounds-check early-returns so the
+    // barrier sits in uniform control flow (a barrier after a divergent return
+    // is undefined and hangs some drivers). One invocation bounds the
+    // workgroup's frustum slabs with the Lipschitz box rule
+    //     f(box) subset [f(c) - L*r, f(c) + L*r],  r = circumradius,
+    // and publishes the surviving depth span. A fully culled workgroup ends up
+    // with t > t_far, so the march body never runs and the existing miss path
+    // shades the background.
+    if (cfg.cull_slabs > 0) {
+        src << "    if (gl_LocalInvocationIndex == 0u) {\n"
+            << "        ivec2 wg0 = ivec2(gl_WorkGroupID.xy) * ivec2(8) + ivec2(pc.tile_x0, pc.tile_y0);\n"
+            << "        float st = (" << flit(cfg.max_dist) << " - 0.001) / float("
+            <<          cfg.cull_slabs << ");\n"
+            << "        float b0 = 1e30, b1 = -1e30;\n"
+            << "        for (int s = 0; s < " << cfg.cull_slabs << "; ++s) {\n"
+            << "            float ta = 0.001 + st * float(s);\n"
+            << "            float tb = ta + st;\n"
+            << "            vec3 clo = vec3(1e30), chi = vec3(-1e30);\n"
+            << "            for (int c = 0; c < 4; ++c) {\n"
+            << "                ivec2 q = wg0 + ivec2((c & 1) * 8, ((c >> 1) & 1) * 8);\n"
+            << "                float cu = (2.0 * float(q.x) / float(pc.width) - 1.0)\n"
+            << "                         * (float(pc.width) / float(pc.height));\n"
+            << "                float cv = 1.0 - 2.0 * float(q.y) / float(pc.height);\n"
+            << "                vec3 co, cd;\n"
+            << "                if (pc.projection_mode > 0.5) {\n"
+            << "                    co = pc.cam_pos + pc.cam_right * (cu * pc.ortho_size)\n"
+            << "                                    + pc.cam_up    * (cv * pc.ortho_size);\n"
+            << "                    cd = normalize(pc.cam_fwd);\n"
+            << "                } else {\n"
+            << "                    co = pc.cam_pos;\n"
+            << "                    cd = normalize(pc.cam_fwd + pc.cam_right * (cu * pc.fov_scale)\n"
+            << "                                             + pc.cam_up    * (cv * pc.fov_scale));\n"
+            << "                }\n"
+            << "                clo = min(clo, min(co + cd * ta, co + cd * tb));\n"
+            << "                chi = max(chi, max(co + cd * ta, co + cd * tb));\n"
+            << "            }\n"
+            << "            vec3 cc = 0.5 * (clo + chi);\n"
+            << "            float r = " << flit(cfg.cull_lipschitz)
+            <<              " * length(0.5 * (chi - clo));\n"
+            << "            float fc = scene_sdf_v(cc);\n"
+            << "            if (fc - r > 0.0 || fc + r < 0.0) continue;   // slab holds no surface\n"
+            << "            b0 = min(b0, ta); b1 = max(b1, tb);\n"
+            << "        }\n"
+            << "        sh_cull_t0 = b0; sh_cull_t1 = b1;\n"
+            << "    }\n"
+            << "    barrier();\n"
+            << "    memoryBarrierShared();\n";
+    }
+    src
         << "    if (px.x >= tx1 || px.y >= ty1) return;\n"
         << "    if (px.x >= pc.width || px.y >= pc.height) return;\n"
         << "    // Ray is computed from the FULL frame so the tile matches the\n"
@@ -1540,7 +1594,15 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
         << "    float t = 0.001;\n"
         << "    bool  hit = false;\n"
         << "    vec3  p   = ray_origin;\n"
-        << "    float last_d = 1e30;\n"
+        << "    float last_d = 1e30;\n";
+
+    if (cfg.cull_slabs > 0) {
+        src << "    float t_far = min(" << flit(cfg.max_dist) << ", sh_cull_t1);\n"
+            << "    t = max(t, sh_cull_t0);\n";
+    } else {
+        src << "    float t_far = " << flit(cfg.max_dist) << ";\n";
+    }
+    src
         << "    // Tracer parameters baked from TracerConfig: max_steps,\n"
         << "    // max_dist, epsilon. Matches the CPU JIT path's tracer\n"
         << "    // for visual parity — including the loop structure: t starts\n"
@@ -1556,7 +1618,7 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
         << "    float step_len = 0.0;\n"
         << "    float omega = " << flit(cfg.over_relax) << ";\n"
         << "    for (int i = 0; i < " << cfg.max_steps << "; ++i) {\n"
-        << "        if (t > " << flit(cfg.max_dist) << ") break;\n"
+        << "        if (t > t_far) break;\n"
         << "        p = ray_origin + ray_dir * t;\n"
         << "        float d = scene_sdf_v(p);\n"
         << "        float radius = d * " << flit(cfg.safety_factor) << ";\n"

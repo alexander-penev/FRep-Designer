@@ -1,5 +1,35 @@
 # Changelog
 
+## [4.36.0]
+- GPU tile cull wired into the emitted render shader (TracerConfig::cull_slabs, cull_lipschitz; 0 slabs = off, unchanged output). Each 8x8 workgroup bounds its own frustum depth slabs with the Lipschitz box rule f(box) subset [f(c)-L*r, f(c)+L*r] using the scalar scene_sdf, publishes the surviving depth span in shared memory, and the whole workgroup marches only that span; a fully culled workgroup falls through to the existing miss path. No second pipeline, buffer, or host-side barrier.
+- The barrier is emitted before the bounds-check early-returns, so it sits in uniform control flow (a barrier reached by only part of a workgroup is undefined and hangs some drivers).
+- tools/bench_tile_cull.cpp gained a lipschitz mode that runs the shader's exact rule on the CPU, so the cull rate can be measured without a GPU.
+- Measured (256x256, 8px workgroups, 32 slabs): skipped (tile x slab) volume 95.8% s1_sphere, 93.1% s2_csg, 96.7% s3_blend, 97.4% s5_twist at L=1, with zero wrongly culled tiles. The gyroid implicit is not 1-Lipschitz (|grad f| ~ 6): at L=1 it wrongly culls 8 tiles and puts 33 hits outside the kept span; at L=6.5 it is sound again but only skips 56%. For such raw implicits the interval shader in glsl_interval.hpp is the better cull (87% skipped, sound), while node trees are better served by the in-shader Lipschitz pass.
+- GPU wall-clock still unmeasured here: shaders are generated and validated to SPIR-V (glslangValidator), including a node-tree CSG scene, but no CUDA/Vulkan device is available in this environment.
+
+## [4.35.0]
+- core/gpu/glsl_interval.hpp: GLSL interval arithmetic (the same rules as the LLVM interval twin, DAG-shared via vec2 temporaries) plus a generated tile-cull compute shader. Per screen tile it walks depth slabs and writes the active span vec2(t0,t1); a fully rejected tile gets an empty span and the render kernel skips it. A single slab per tile bounds the whole view ray and never culls, so the depth subdivision is what makes the pass work.
+- tools/bench_tile_cull.cpp: emits the shader (--dump) and runs the identical slab logic on the CPU against the JIT'd interval SDF, reporting skipped volume, empty tiles, kept span, and a correctness check against a scalar march.
+- Measured (256x256, 8px tiles, 32 slabs, 1 core): rejected (tile x slab) volume 96.5% s1_sphere, 95.5% s2_csg, 97.1% s3_blend, 87.0% s4_gyroid, 91.5% s5_twist; mean kept depth span 0.09-0.17 of [near,far]; zero wrongly culled tiles and zero hits outside the kept span on every scene.
+- All five shaders compile to SPIR-V (glslangValidator). GPU wall-clock numbers still need a CUDA/Vulkan host: the shader is generated and validated here, not dispatched.
+
+## [4.34.1]
+- Interval tan: detect a pole (pi/2 + k*pi) inside the argument range and widen to the full range instead of returning the endpoint values, which were wrong across a pole.
+- Interval atan2: replaced the blanket [-pi,pi] for x<=0 with the box-corner extremes, widening to the full circle only when the box actually contains the origin or the negative-x branch cut. Mean bound width on random boxes drops from 2*pi to ~1.3.
+- tests/test_interval_enclosure.cpp: randomized enclosure check (random boxes, dense sampling) for sin/cos/tan/atan2/asin and x*x-y*y. All sound.
+
+## [4.34.0]
+- core/render/cpu_trace.hpp: host-side CPU sphere tracer with three march strategies — scalar, SIMD-8 packet (over the general-tree scene_sdf_simd of 4.33.0), and SIMD-8 with a per-region step taken from a coarse Lipschitz grid instead of the global safety_factor. LipGrid::worth_using() reports whether a scene's field actually needs it.
+- tools/bench_trace.cpp: measures all three (wall time, SDF evaluations, hit parity).
+- Measured, 192x192, 1 core: SIMD packet is 2.6x (CSG), 2.4x (blend), 3.6x (gyroid) over scalar with identical hits. The Lipschitz step is a correctness feature, not a speed one: on a true SDF (max_L~1.15) it only adds lookup cost, while on the gyroid implicit (max_L~6.0) the global 0.85 step overshoots and loses 498 of 19092 reference hits, which the per-region step recovers all but 59 of, at ~10x less time than marching the whole image at the conservative step.
+
+## [4.33.0]
+- General-tree SIMD: CgCtx gains `width`; fc()/param_value() splat in vector mode, so every FRepNode's existing scalar codegen emits <W x float> unchanged. compile_scene_sdf_simd() now vectorizes arbitrary node trees (union of visible objects), not just single-CustomExpr scenes. CustomExprNode inlines its vector AST (gen_vec_inline) instead of calling the scalar helper. Verified bit-exact against the scalar path for Sphere/Box/CSG/SmoothUnion/Translate/Scale/RotateY/TwistY/Negate; CustomExpr differs only by the poly-approx error (~5e-7).
+- Lipschitz octree pruning (octree_leaves_lipschitz): prunes any node tree using only the scalar SDF and the L=1 SDF invariant, with an optional L for non-distance implicits plus estimate_lipschitz() (heuristic). Interval arithmetic stays the tighter option for CustomExpr scenes.
+
+## [4.32.9]
+- Interval trig (sin/cos/tan/asin/acos/atan/atan2) + x*x square rule; octree children overlap by one grid index so no sign-crossing cell falls in the inter-sample gap (soundness verified: 0 uncovered surface cells on all canonical scenes). Pruned grid eval 2-8x over per-cell SIMD, 2-6x over libfive.
+
 ## [4.32.8]
 - Interval arithmetic + octree pruning: compile_interval() emits an {lo,hi} twin of a CustomExpr scene (add/sub/mul/div/neg/abs/sqrt/min/max/pow); compile_scene_sdf_interval() + octree_leaves()/octree_classify() drop fully inside/outside regions so only surface cells are evaluated. Trig interval rules pending. Grid eval on the pruned leaf set is ~7-29x over per-cell SIMD on the canonical scenes.
 

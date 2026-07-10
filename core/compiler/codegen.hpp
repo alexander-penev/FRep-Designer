@@ -35,6 +35,20 @@ struct TracerConfig {
     float epsilon       = 0.0005f;
     float fd_eps        = 0.001f;   // finite-diff epsilon for the normal
     float safety_factor = 0.85f;    // reduced step for non-true SDF (CSG)
+
+    // ── GPU workgroup tile cull ─────────────────────────────────────────────
+    // Before marching, each 8x8 workgroup bounds its own frustum slab stack and
+    // discards the depth slabs that provably hold no surface, using the SDF's
+    // 1-Lipschitz invariant: over a box of circumradius r around c, f lies in
+    // [f(c) - L*r, f(c) + L*r]. The march then runs only over the surviving
+    // depth span (or the pixel takes the miss path outright).
+    //
+    // Costs `cull_slabs` scalar SDF evaluations per workgroup, amortised over
+    // its 64 pixels. 0 disables the pass. `cull_lipschitz` must upper-bound
+    // |grad f|: 1.0 is guaranteed by the node contract, but a CustomExpr that
+    // is a raw implicit rather than a distance field needs its own value.
+    int   cull_slabs     = 0;
+    float cull_lipschitz = 1.0f;
     // Over-relaxation factor for enhanced sphere tracing. DISABLED (1.0 =
     // classic sphere tracing): empirically, omega>1 over-steps the floor plane
     // seen at grazing angle (the horizon), so the overshoot guard backtracks and
