@@ -1,10 +1,12 @@
 // core/io/scene_io.cpp
+#include <unordered_set>
 
 #include "core/io/scene_io.hpp"
 
 #include "core/frep/custom_expr.hpp"
 #include "core/frep/deformations.hpp"
 #include "core/frep/operations.hpp"
+#include "core/frep/instance.hpp"
 #include "core/frep/primitives.hpp"
 #include "core/frep/transforms.hpp"
 #include "core/io/json.hpp"
@@ -123,6 +125,15 @@ static Value node_to_json(const FRepNode& node) {
     for (const auto& [k, v] : node.params)
         params[k] = static_cast<double>(v);
     o["params"] = std::move(params);
+
+    // An Instance references another object's geometry by id — it must NOT
+    // serialize its (shared) child inline, or the file would carry a full copy
+    // and load would break the sharing. Store only the target id; the child is
+    // rebound from the scene after load (resolve_instances).
+    if (node.kind == NodeKind::Instance) {
+        o["target_id"] = static_cast<const InstanceNode&>(node).target_id();
+        return Value(std::move(o));
+    }
 
     // children (recursive)
     if (!node.children.empty()) {
@@ -356,6 +367,15 @@ struct NodeDeserializer {
                 param_or(params, "h", 2.0f), id);
         }
 
+        // ── Instance ──────────────────────────────────────────────────────────
+        // References another object's geometry by id. Created unresolved (null
+        // target) here because the target object may not be parsed yet; the
+        // caller runs resolve_instances(scene) once all objects exist.
+        if (type == "Instance") {
+            std::string tgt = jv.has("target_id") ? jv["target_id"].as_string() : "";
+            return std::make_shared<InstanceNode>(nullptr, tgt, id);
+        }
+
         // ── CustomExpr ────────────────────────────────────────────────────────
         if (type == "CustomExpr") {
             std::string expr = jv.has("expr") ? jv["expr"].as_string() : "0.0";
@@ -389,6 +409,74 @@ struct NodeDeserializer {
 };
 
 } // namespace
+
+// Rebind every InstanceNode's shared target pointer from the scene, by its
+// target_id. Instances may be nested inside transforms, so we walk each object's
+// whole tree. A target may itself contain instances, which is fine as long as
+// the reference graph is acyclic; a cycle (A instances B, B instances A, or a
+// self-reference) would make codegen recurse forever, so we detect it and leave
+// the offending instance unresolved (renders empty) rather than hang.
+//
+// Two passes: first collect object roots by id, then walk and rebind. Cycle
+// detection runs a DFS over the *instance reference* graph (id -> ids it
+// instances) and refuses to bind any instance that participates in a cycle.
+static void collect_instances(FRepNode* n, std::vector<InstanceNode*>& out) {
+    if (!n) return;
+    if (n->kind == NodeKind::Instance)
+        out.push_back(static_cast<InstanceNode*>(n));
+    for (auto& c : n->children)
+        if (c) collect_instances(c.get(), out);
+}
+
+// Does binding `inst` (in object `owner_id`) to its target create a cycle?
+// Walks target -> its instances -> ... looking for a path back to owner_id.
+static bool creates_cycle(const SceneGraph& scene, const std::string& owner_id,
+                          const std::string& target_id) {
+    if (target_id == owner_id) return true;
+    std::vector<std::string> stack{target_id};
+    std::unordered_set<std::string> seen;
+    while (!stack.empty()) {
+        std::string cur = stack.back(); stack.pop_back();
+        if (cur == owner_id) return true;
+        if (!seen.insert(cur).second) continue;
+        const SceneObject* o = scene.find_object(cur);
+        if (!o || !o->geometry) continue;
+        std::vector<InstanceNode*> insts;
+        collect_instances(o->geometry.get(), insts);
+        for (auto* in : insts) stack.push_back(in->target_id());
+    }
+    return false;
+}
+
+void resolve_instances(SceneGraph& scene, const plugin::PluginRegistry*) {
+    for (auto& [oid, obj] : scene.objects_mutable()) {
+        if (!obj.geometry) continue;
+        std::vector<InstanceNode*> insts;
+        collect_instances(obj.geometry.get(), insts);
+        for (auto* in : insts) {
+            const std::string& tgt = in->target_id();
+            if (tgt.empty() || creates_cycle(scene, oid, tgt)) {
+                in->rebind(nullptr);            // dangling / cyclic -> empty
+                continue;
+            }
+            const SceneObject* t = scene.find_object(tgt);
+            in->rebind(t ? t->geometry : nullptr);
+        }
+    }
+}
+
+std::vector<std::string>
+find_dependent_instances(const SceneGraph& scene, const std::string& target_id) {
+    std::vector<std::string> deps;
+    for (const auto& [oid, obj] : scene.objects()) {
+        if (oid == target_id || !obj.geometry) continue;
+        std::vector<InstanceNode*> insts;
+        collect_instances(obj.geometry.get(), insts);
+        for (auto* in : insts)
+            if (in->target_id() == target_id) { deps.push_back(oid); break; }
+    }
+    return deps;
+}
 
 SceneGraph deserialize_scene(const std::string& json_text,
                              const plugin::PluginRegistry* registry,
@@ -562,6 +650,7 @@ SceneGraph deserialize_scene(const std::string& json_text,
         }
     }
 
+    resolve_instances(scene, registry);
     return scene;
 }
 

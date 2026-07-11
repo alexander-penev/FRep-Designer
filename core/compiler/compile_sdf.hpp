@@ -8,6 +8,7 @@
 #include "core/frep/operations.hpp"
 #include "core/frep/custom_expr.hpp"
 #include "core/frep/expr_ast.hpp"
+#include "core/compiler/node_interval.hpp"
 #include <llvm/IR/Verifier.h>
 #include <expected>
 #include <memory>
@@ -240,6 +241,131 @@ inline float estimate_lipschitz(SceneSdfFn fn, long N, float lo, float hi,
         if (m>g) g=m;
     }
     return g * safety;
+}
+
+// Resolve TracerConfig::CullMethod::Auto to a concrete Lipschitz/Interval/Off
+// choice for `scene`, so the GLSL emitter itself stays JIT-free. Explicit
+// methods pass through unchanged (only Interval-when-unavailable falls back).
+//
+// Auto policy:
+//   * metric node tree (unit-Lipschitz)      -> Lipschitz, L = 1        (exact, cheapest)
+//   * single CustomExpr / non-metric single  -> probe both on a coarse grid,
+//     object with an interval path available     pick whichever prunes more;
+//                                                Lipschitz uses an estimated L
+//   * anything else                          -> Lipschitz, L from estimate_lipschitz
+//
+// Returns a cfg copy with cull_method set to Lipschitz or Interval (never Auto)
+// and cull_lipschitz filled in when Lipschitz is chosen.
+// ── Cull-rate probe (future work — currently unused by Auto) ────────────────
+// These estimate how many grid cells each cull bound leaves to march. They were
+// built for an adaptive Auto but are NOT wired in: cell count ignores per-box
+// cull cost and mis-selects (see resolve_cull_method). They remain as the raw
+// material for a *timed* selector — the correct-but-heavier approach — which
+// would render a few frames under each method and keep the faster:
+//
+//   enum CullMethod best_by_timing(scene, cfg, GpuGlslExecutor&):
+//     for m in {Lipschitz(L=1 or est), Interval}:
+//       cfg.cull_method = m; render K warmup + K timed frames; record median
+//     return argmin(median)   // ties -> cheaper (Lipschitz)
+//
+// That belongs in the executor (it needs a live device) and should be gated
+// behind an explicit opt-in, cached per scene like the current resolution, and
+// enabled once scene data shows the per-scene wall-clock spread justifies the
+// probe's own cost. Until then Auto is topology-based (see resolve_cull_method).
+//
+// Octree leaf boxes under the CPU node-interval bound (node_interval.hpp),
+// combining visible objects with min() — the probe twin of the GLSL node-tree
+// interval cull.
+inline std::vector<LeafBox>
+octree_leaves_node_interval(const SceneGraph& scene, long N, float lo, float hi, int leaf = 4) {
+    std::vector<const FRepNode*> geoms;
+    for (auto& [id, obj] : scene.objects())
+        if (obj.visible && obj.geometry) geoms.push_back(obj.geometry.get());
+    const float span = hi - lo;
+    auto cell = [&](long i){ return lo + span * i / (N - 1); };
+    auto bound = [&](float x0,float x1,float y0,float y1,float z0,float z1){
+        Iv best{1e30f,1e30f};
+        for (auto* g : geoms) {
+            Iv v = node_interval(*g, {x0,x1},{y0,y1},{z0,z1});
+            best = {std::min(best.lo,v.lo), std::min(best.hi,v.hi)};
+        }
+        return best;
+    };
+    std::vector<LeafBox> out, st{{0,N-1,0,N-1,0,N-1}};
+    while (!st.empty()) {
+        auto b = st.back(); st.pop_back();
+        Iv f = bound(cell(b.x0),cell(b.x1),cell(b.y0),cell(b.y1),cell(b.z0),cell(b.z1));
+        if (f.lo > 0 || f.hi < 0) continue;
+        long nx=b.x1-b.x0+1, ny=b.y1-b.y0+1, nz=b.z1-b.z0+1;
+        if (nx<=leaf && ny<=leaf && nz<=leaf) { out.push_back(b); continue; }
+        long mx=(b.x0+b.x1)/2,my=(b.y0+b.y1)/2,mz=(b.z0+b.z1)/2;
+        for (int ix=0;ix<2;++ix)for(int iy=0;iy<2;++iy)for(int iz=0;iz<2;++iz){
+            long xa=ix?mx:b.x0, xb=ix?b.x1:mx, ya=iy?my:b.y0, yb=iy?b.y1:my, za=iz?mz:b.z0, zb=iz?b.z1:mz;
+            if (xa>xb||ya>yb||za>zb) continue;
+            if (ix&&mx==b.x0) continue; if (iy&&my==b.y0) continue; if (iz&&mz==b.z0) continue;
+            st.push_back({xa,xb,ya,yb,za,zb});
+        }
+    }
+    return out;
+}
+
+inline TracerConfig resolve_cull_method(const SceneGraph& scene,
+                                        const TracerConfig& in) {
+    TracerConfig cfg = in;
+    using CM = TracerConfig::CullMethod;
+    if (cfg.cull_slabs <= 0 || cfg.cull_method == CM::Off) {
+        cfg.cull_method = CM::Lipschitz;      // moot; cull disabled by slabs
+        return cfg;
+    }
+
+    int visible = 0; bool all_unit = true; const FRepNode* only = nullptr;
+    for (auto& [id, obj] : scene.objects()) {
+        if (!obj.visible || !obj.geometry) continue;
+        ++visible; only = obj.geometry.get();
+        if (!node_is_unit_lipschitz(*obj.geometry)) all_unit = false;
+    }
+    // Interval cull is now available for any node tree (per-node interval
+    // emitter), not only a single CustomExpr, so it is always an option.
+    const bool interval_ok = visible >= 1;
+
+    if (cfg.cull_method == CM::Interval) {
+        cfg.cull_method = interval_ok ? CM::Interval : CM::Lipschitz;
+        if (cfg.cull_method == CM::Lipschitz && all_unit) cfg.cull_lipschitz = 1.0f;
+        return cfg;
+    }
+    if (cfg.cull_method == CM::Lipschitz) return cfg;
+
+    // ── Auto: topology-based ─────────────────────────────────────────────────
+    // A metric tree is sound + tightest under Lipschitz L=1, which is also the
+    // cheapest per-box test; a non-metric tree has no valid constant L, so it
+    // takes Interval (sound without an L). This assumes scenes tend toward clean
+    // SDFs — the intended usage — where "metric -> Lipschitz" is both correct and
+    // optimal (measured: on the metric CSG scene Lipschitz's cheaper per-box test
+    // beats Interval end-to-end even though Interval prunes a few more cells).
+    //
+    // A cull-rate probe was tried (octree_leaves_node_interval vs _lipschitz) but
+    // rejected: cell count is the wrong proxy — it ignores the ~2x per-box cost
+    // of the interval test, so it wrongly preferred Interval on the CSG scene
+    // where Lipschitz is actually faster. The genuinely correct selector is a
+    // *timed* probe (render a few frames each way, keep the faster), which needs
+    // the GPU in this path and is heavier; the probe helpers below are retained
+    // for that future refinement, to be enabled once scene data shows it earns
+    // its cost. For now topology gives the right call on clean-SDF scenes.
+    if (all_unit) { cfg.cull_method = CM::Lipschitz; cfg.cull_lipschitz = 1.0f; return cfg; }
+
+    // Non-metric field. Interval is sound by construction (no L needed), so when
+    // it is available it is the safe Auto choice — even if a Lipschitz bound
+    // with an *estimated* L happened to prune more, that estimate is not a
+    // guaranteed upper bound on |grad f| and can silently cull real surface
+    // (observed on the gyroid at fine slab counts). Only when no interval path
+    // exists does Auto fall back to Lipschitz with an estimated L, which is then
+    // the sole option and still better than no cull.
+    if (interval_ok) { cfg.cull_method = CM::Interval; return cfg; }
+
+    auto sc = compile_scene_sdf(scene);
+    cfg.cull_method = CM::Lipschitz;
+    if (sc) cfg.cull_lipschitz = estimate_lipschitz(sc->fn, 33, -1.8f, 1.8f);
+    return cfg;
 }
 
 } // namespace frep::jit

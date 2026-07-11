@@ -215,6 +215,7 @@ private:
     // shadows on, AO on) so a freshly-launched application picks up
     // the same look on both paths.
     TracerConfig             render_config_;
+    bool                     show_metrics_overlay_ = false;
 
     // Universal viewport handle: works for both offscreen and
     // real-time paths. Signal connections (render_completed,

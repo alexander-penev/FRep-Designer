@@ -82,6 +82,10 @@ public:
     // no-op so other backends can ignore it.
     virtual void set_spatial_guards_enabled(bool) {}
 
+    // Toggle an on-viewport metrics HUD (ms/frame, cull method, cull rate).
+    // Default no-op; the real-time viewport overrides it (task 2).
+    virtual void set_metrics_overlay(bool) {}
+
     // Capture the current rendered frame as a CPU-side QImage for export.
     // Default returns a null image (caller treats that as "nothing to
     // export"). The offscreen backend returns its last readback image;

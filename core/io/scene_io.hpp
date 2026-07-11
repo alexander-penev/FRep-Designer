@@ -80,6 +80,23 @@ FRepNode::Ptr clone_node(const FRepNode& node,
                          const std::string& new_id,
                          const plugin::PluginRegistry* registry = nullptr);
 
+// Rebind every InstanceNode in the scene to its target object's geometry
+// (by target_id), sharing the pointer — not copying. Call after any structural
+// change that may have created, retargeted, or invalidated an instance, or that
+// replaced a target's geometry root (e.g. SetGeometryCommand): instances then
+// point at the new root and stay live. Cyclic or dangling references are left
+// unresolved (they render empty) rather than causing infinite codegen recursion.
+// deserialize_scene() calls this automatically after loading.
+void resolve_instances(SceneGraph& scene,
+                       const plugin::PluginRegistry* registry = nullptr);
+
+// Return the ids of all objects that contain an InstanceNode targeting
+// `target_id` (i.e. objects that would dangle if `target_id` were deleted).
+// The GUI uses this to warn before deleting a target and to cascade-delete its
+// instances. Does not include target_id itself.
+std::vector<std::string>
+find_dependent_instances(const SceneGraph& scene, const std::string& target_id);
+
 // Convenience file wrappers. These derive `base_dir` from `path`
 // automatically — `save_scene("/foo/bar/scene.frep", ...)` uses
 // `/foo/bar` as the base directory, and `load_scene` does the same.
