@@ -203,6 +203,17 @@ public:
 
     // ── Accessors ─────────────────────────────────────────────────────────────
     const auto& objects()  const { return objects_; }
+
+    // Mutable object map — used by instance resolution to rebind InstanceNode
+    // target pointers in place. Prefer the const objects() elsewhere.
+    auto& objects_mutable() { return objects_; }
+
+    // Look up a single object by id, or nullptr if absent. Convenience for the
+    // GUI (instancing, deformation) which works with the primary selection id.
+    const SceneObject* find_object(const std::string& id) const {
+        auto it = objects_.find(id);
+        return it == objects_.end() ? nullptr : &it->second;
+    }
     Camera&       camera()       { return cam_; }
     const Camera& camera() const { return cam_; }
     std::vector<PointLight>&       lights()       { return lights_; }

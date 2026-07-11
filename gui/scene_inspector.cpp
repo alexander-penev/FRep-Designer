@@ -4,9 +4,12 @@
 
 #include "core/frep/scene.hpp"
 #include "core/undo/undo_stack.hpp"
+#include "core/io/scene_io.hpp"
 
 #include <QAbstractItemView>
 #include <QColorDialog>
+#include <QMessageBox>
+#include <QSet>
 #include <QCheckBox>
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -424,10 +427,33 @@ void SceneInspector::on_scale_changed() {
 void SceneInspector::on_remove_selected() {
     QStringList ids = selected_ids();
     if (ids.isEmpty()) return;
-    // Iterate in reverse so the indexing inside scene_->objects()
-    // doesn't shift under us as we remove.
-    for (int i = ids.size() - 1; i >= 0; --i) {
-        std::string id = ids[i].toStdString();
+
+    // Deleting a target must also remove every instance that references it,
+    // otherwise those instances would dangle. Gather dependents across the whole
+    // selection, warn once, and on confirmation delete instances + targets
+    // together. (Deleting an instance itself has no dependents and skips this.)
+    QStringList to_delete = ids;
+    QSet<QString> dep_set;
+    for (const QString& sid : ids) {
+        for (const auto& dep : io::find_dependent_instances(*scene_, sid.toStdString())) {
+            QString q = QString::fromStdString(dep);
+            if (!ids.contains(q)) dep_set.insert(q);
+        }
+    }
+    if (!dep_set.isEmpty()) {
+        QStringList deps = dep_set.values();
+        auto reply = QMessageBox::question(this, "Delete object and its instances",
+            QString("%1 instance(s) reference the object(s) you're deleting:\n  %2\n\n"
+                    "Deleting will also remove those instances. Continue?")
+                .arg(deps.size()).arg(deps.join(", ")),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (reply != QMessageBox::Yes) return;
+        to_delete += deps;
+    }
+
+    // Remove in reverse so indexing inside scene_->objects() doesn't shift.
+    for (int i = to_delete.size() - 1; i >= 0; --i) {
+        std::string id = to_delete[i].toStdString();
         if (undo_) {
             undo_->push_apply(
                 std::make_unique<undo::RemoveObjectCommand>(*scene_, id));

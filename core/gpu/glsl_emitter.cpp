@@ -1,6 +1,8 @@
 // core/gpu/glsl_emitter.cpp
 
 #include "core/gpu/glsl_emitter.hpp"
+#include "core/gpu/glsl_interval.hpp"
+#include "core/gpu/glsl_node_interval.hpp"
 #include "core/frep/scene.hpp"
 #include "core/frep/mesh_sdf.hpp"
 
@@ -317,6 +319,13 @@ GlslEmitter::emit_node(Ctx& c, const FRepNode& n,
         case K::BendXY:    return emit_bend_xy(c, n, x, y, z);
         case K::TaperY:    return emit_taper_y(c, n, x, y, z);
 
+        case K::Instance:  // Level 1: inline the shared target subtree. (Level 2
+                           // will emit the target once as a function and call it;
+                           // the shared child pointer is the dedup key for that.)
+            if (n.children.empty() || !n.children[0])
+                return std::string("1e30");        // dangling -> empty
+            return emit_node(c, *n.children[0], x, y, z);
+
         case K::Union:
         case K::Intersection:
         case K::Difference:
@@ -586,6 +595,11 @@ GlslEmitter::emit_node_dual(Ctx& c, const FRepNode& n,
             g << "    Dual " << v << " = d_neg(" << *child << ");\n";
             return v;
         }
+        case K::Instance: {
+            if (n.children.empty() || !n.children[0])
+                return std::unexpected(std::string("Instance is dangling (dual)"));
+            return emit_node_dual(c, *n.children[0], x, y, z);   // delegate to target
+        }
         default:
             // BendXY and plugin/mesh/custom nodes: no dual emitter yet.
             // Signal the caller to fall back to finite-difference normals
@@ -625,6 +639,42 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
         }
         if (visible <= 1 && !needs_safety)
             cfg.safety_factor = 1.0f;
+    }
+
+    // ── Resolve which tile-cull method to emit ──────────────────────────────
+    // Both paths are in the tree; this only selects between them. Interval is
+    // currently available only when the scene is a single CustomExprNode (the
+    // interval SDF is emitted from its expression AST); Lipschitz works for any
+    // node tree. Auto prefers a metric tree's exact L=1 Lipschitz, and reaches
+    // for Interval on a non-metric CustomExpr scene where a coarse probe shows
+    // it prunes more; otherwise Lipschitz with the caller's / an estimated L.
+    bool use_interval_cull = false;
+    const expr::NodePtr* single_ce = nullptr;
+    if (cfg.cull_method == TracerConfig::CullMethod::Off) cfg.cull_slabs = 0;
+    if (cfg.cull_slabs > 0) {
+        int visible = 0; bool all_unit_lip = true;
+        const FRepNode* only = nullptr;
+        for (const auto& [id, obj] : scene.objects()) {
+            if (!obj.visible || !obj.geometry) continue;
+            ++visible; only = obj.geometry.get();
+            if (!node_is_unit_lipschitz(*obj.geometry)) all_unit_lip = false;
+        }
+        if (visible == 1 && only)
+            single_ce = static_cast<const expr::NodePtr*>(only->custom_expr_ast());
+
+        using CM = TracerConfig::CullMethod;
+        if (cfg.cull_method == CM::Interval) {
+            use_interval_cull = true;               // node-tree interval now available for any scene
+        } else if (cfg.cull_method == CM::Lipschitz) {
+            use_interval_cull = false;
+        } else if (cfg.cull_method == CM::Auto) {
+            if (all_unit_lip) {
+                use_interval_cull = false;          // metric tree: L=1 exact + cheapest
+                cfg.cull_lipschitz = 1.0f;
+            } else {
+                use_interval_cull = true;           // non-metric: interval, sound without L
+            }
+        }
     }
 
     // We build sdf_body and albedo_body separately. Each object's SDF
@@ -894,7 +944,7 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
         << "\n"
         << "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n"
         << ((cfg.cull_slabs > 0)
-            ? "shared float sh_cull_t0;\nshared float sh_cull_t1;\n"
+            ? "shared float sh_cull_t0;\nshared float sh_cull_t1;\nshared uint sh_occ[" + std::to_string(cfg.cull_slabs) + "];\n"
             : "")
         << "layout(set = 0, binding = 0, rgba8) uniform image2D out_image;\n";
 
@@ -1062,8 +1112,33 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
         << sdf_body.str()
         << "}\n"
         << "\n"
-        << "float scene_sdf_v(vec3 p) { return scene_sdf(p.x, p.y, p.z); }\n"
-        << "\n"
+        << "float scene_sdf_v(vec3 p) { return scene_sdf(p.x, p.y, p.z); }\n";
+    if (use_interval_cull) {
+        // Interval SDF for the tile cull: vec2(lo,hi) bound of the field over a
+        // box. A single CustomExpr uses the expression interval emitter directly;
+        // any other node tree uses the per-node interval emitter, combining the
+        // visible objects with min() exactly as scene_sdf does.
+        src << gpu::glsl_interval_prelude()
+            << "vec2 sdf_ival(vec3 lo, vec3 hi) {\n";
+        if (single_ce) {
+            gpu::GlslIntervalEmitter ie;
+            std::string ivres, ivbody = ie.emit(**single_ce, ivres);
+            src << ivbody << "    return " << ivres << ";\n";
+        } else {
+            src << "    vec2 best = vec2(1e30, 1e30);\n";
+            for (const auto& [id, obj] : scene.objects()) {
+                if (!obj.visible || !obj.geometry) continue;
+                gpu::NodeIntervalEmitter ne;
+                std::string res, body = ne.emit(*obj.geometry, res);
+                src << "    {\n" << body
+                    << "        best = min(best, " << res << ");\n"
+                    << "    }\n";
+            }
+            src << "    return best;\n";
+        }
+        src << "}\n";
+    }
+    src << "\n"
         << "vec3 scene_albedo(float x, float y, float z) {\n"
         << albedo_body.str()
         << "}\n"
@@ -1524,12 +1599,16 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
     // with t > t_far, so the march body never runs and the existing miss path
     // shades the background.
     if (cfg.cull_slabs > 0) {
-        src << "    if (gl_LocalInvocationIndex == 0u) {\n"
+        src << "    // Spread the " << cfg.cull_slabs << " box tests across the 64 lanes\n"
+            << "    // (lane s handles slabs s, s+64, ...); lane 0 then reduces the\n"
+            << "    // per-slab occupancy to a [t0,t1] span. Avoids serialising every\n"
+            << "    // slab on one invocation while the rest wait at the barrier.\n"
+            << "    {\n"
+            << "        uint lid = gl_LocalInvocationIndex;\n"
             << "        ivec2 wg0 = ivec2(gl_WorkGroupID.xy) * ivec2(8) + ivec2(pc.tile_x0, pc.tile_y0);\n"
             << "        float st = (" << flit(cfg.max_dist) << " - 0.001) / float("
             <<          cfg.cull_slabs << ");\n"
-            << "        float b0 = 1e30, b1 = -1e30;\n"
-            << "        for (int s = 0; s < " << cfg.cull_slabs << "; ++s) {\n"
+            << "        for (uint s = lid; s < " << cfg.cull_slabs << "u; s += 64u) {\n"
             << "            float ta = 0.001 + st * float(s);\n"
             << "            float tb = ta + st;\n"
             << "            vec3 clo = vec3(1e30), chi = vec3(-1e30);\n"
@@ -1551,14 +1630,31 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
             << "                clo = min(clo, min(co + cd * ta, co + cd * tb));\n"
             << "                chi = max(chi, max(co + cd * ta, co + cd * tb));\n"
             << "            }\n"
-            << "            vec3 cc = 0.5 * (clo + chi);\n"
-            << "            float r = " << flit(cfg.cull_lipschitz)
-            <<              " * length(0.5 * (chi - clo));\n"
-            << "            float fc = scene_sdf_v(cc);\n"
-            << "            if (fc - r > 0.0 || fc + r < 0.0) continue;   // slab holds no surface\n"
-            << "            b0 = min(b0, ta); b1 = max(b1, tb);\n"
+            << (use_interval_cull
+                ? std::string(
+                  "            vec2 fi = sdf_ival(clo, chi);\n"
+                  "            sh_occ[s] = (fi.x > 0.0 || fi.y < 0.0) ? 0u : 1u;\n")
+                : std::string(
+                  "            vec3 cc = 0.5 * (clo + chi);\n"
+                  "            float r = ") + flit(cfg.cull_lipschitz) +
+                  " * length(0.5 * (chi - clo));\n"
+                  "            float fc = scene_sdf_v(cc);\n"
+                  "            sh_occ[s] = (fc - r > 0.0 || fc + r < 0.0) ? 0u : 1u;\n")
             << "        }\n"
-            << "        sh_cull_t0 = b0; sh_cull_t1 = b1;\n"
+            << "    }\n"
+            << "    barrier();\n"
+            << "    memoryBarrierShared();\n"
+            << "    if (gl_LocalInvocationIndex == 0u) {\n"
+            << "        float st = (" << flit(cfg.max_dist) << " - 0.001) / float("
+            <<          cfg.cull_slabs << ");\n"
+            << "        float b0 = 1e30, b1 = -1e30;\n"
+            << "        for (int s = 0; s < " << cfg.cull_slabs << "; ++s) {\n"
+            << "            if (sh_occ[s] == 0u) continue;\n"
+            << "            float ta = 0.001 + st * float(s);\n"
+            << "            b0 = min(b0, ta); b1 = max(b1, ta + st);\n"
+            << "        }\n"
+            << "        float mrg = 4.0 * (" << flit(cfg.max_dist) << " - 0.001) / 32.0;\n"
+            << "        sh_cull_t0 = b0 - mrg; sh_cull_t1 = b1 + mrg;\n"
             << "    }\n"
             << "    barrier();\n"
             << "    memoryBarrierShared();\n";
@@ -1617,7 +1713,9 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
         << "    // march exactly for parity; cuts step-exhausting silhouette rays.\n"
         << "    float step_len = 0.0;\n"
         << "    float omega = " << flit(cfg.over_relax) << ";\n"
+        << "    int dbg_steps = 0;\n"
         << "    for (int i = 0; i < " << cfg.max_steps << "; ++i) {\n"
+        << "        dbg_steps = i;\n"
         << "        if (t > t_far) break;\n"
         << "        p = ray_origin + ray_dir * t;\n"
         << "        float d = scene_sdf_v(p);\n"
@@ -1706,8 +1804,28 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
         << "    // belt-and-braces fix for the white-pixel artefacts\n"
         << "    // that occasionally appeared at silhouette edges.\n"
         << "    color = clamp(color, 0.0, 1.0);\n"
-        << "    if (any(isnan(color))) color = vec3(0.0);\n"
-        << "    // Temporal denoise accumulation. When accum_blend < 1 the\n"
+        << "    if (any(isnan(color))) color = vec3(0.0);\n";
+    if (cfg.debug_view == TracerConfig::DebugView::StepHeatmap) {
+        // Colour by march-iteration count: blue (few) -> green -> red (many),
+        // normalised to max_steps. Reveals where the march is expensive.
+        src << "    {\n"
+            << "        float frac = clamp(float(dbg_steps) / float(" << cfg.max_steps << "), 0.0, 1.0);\n"
+            << "        vec3 cool = vec3(0.0, 0.1, 0.6);\n"
+            << "        vec3 mid  = vec3(0.0, 0.8, 0.2);\n"
+            << "        vec3 hot  = vec3(0.9, 0.1, 0.0);\n"
+            << "        color = frac < 0.5 ? mix(cool, mid, frac * 2.0)\n"
+            << "                           : mix(mid, hot, (frac - 0.5) * 2.0);\n"
+            << "    }\n";
+    } else if (cfg.debug_view == TracerConfig::DebugView::CullSpan) {
+        // Colour by the fraction of [0,max_dist] the ray actually had to march
+        // (t_far / max_dist): green = most of the ray was culled away, red =
+        // little culled. Shows where the tile cull is effective.
+        src << "    {\n"
+            << "        float kept = clamp(t_far / " << flit(cfg.max_dist) << ", 0.0, 1.0);\n"
+            << "        color = mix(vec3(0.0, 0.7, 0.1), vec3(0.9, 0.2, 0.0), kept);\n"
+            << "    }\n";
+    }
+    src << "    // Temporal denoise accumulation. When accum_blend < 1 the\n"
         << "    // camera/scene is static and we blend this frame into the\n"
         << "    // running average already sitting in the storage image:\n"
         << "    //   out = mix(previous, new, accum_blend),  accum_blend = 1/n.\n"

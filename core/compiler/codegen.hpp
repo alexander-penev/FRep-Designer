@@ -49,6 +49,37 @@ struct TracerConfig {
     // is a raw implicit rather than a distance field needs its own value.
     int   cull_slabs     = 0;
     float cull_lipschitz = 1.0f;
+
+    // Which box bound the cull uses. Both live in the codebase; this only
+    // selects between them (soundness is each method's own responsibility):
+    //   Lipschitz — f(box) in [f(c)-L*r, f(c)+L*r]; cheap, needs L >= |grad f|.
+    //               L=1 is exact for a true SDF (metric primitives + affine/CSG);
+    //               a raw implicit needs its real L or it culls real surface.
+    //   Interval  — interval arithmetic on the field; sound by construction with
+    //               no L, and tighter on periodic/implicit fields (gyroid, gears),
+    //               but currently only available for a single-CustomExpr scene.
+    //   Auto      — pick per scene: a true-SDF node tree -> Lipschitz(L=1);
+    //               otherwise, if an interval path exists and prunes more on a
+    //               coarse probe, Interval; else Lipschitz with an estimated L.
+    //   Off       — no cull (identical to cull_slabs = 0).
+    enum class CullMethod { Auto, Lipschitz, Interval, Off };
+    CullMethod cull_method = CullMethod::Auto;
+
+    // Debug visualisation (task 3). Off = normal shaded render. StepHeatmap
+    // colours each pixel by how many march iterations it took (blue = few,
+    // red = many) so expensive regions are visible. CullSpan colours by the
+    // fraction of the ray the tile cull kept (green = most culled, red = little),
+    // showing where the cull is effective. Both replace the shaded output.
+    enum class DebugView { Off, StepHeatmap, CullSpan };
+    DebugView debug_view = DebugView::Off;
+
+    // Future work: when true and cull_method is Auto, the GPU executor selects
+    // between Lipschitz and Interval by *timing* a few frames of each rather than
+    // by topology (see the probe note in compile_sdf.hpp). Off by default — the
+    // timed probe costs real frames and only pays off on scenes whose wall-clock
+    // spread between methods is large. Left as a wired opt-in for when scene data
+    // justifies enabling it; today Auto is topology-based and this is ignored.
+    bool cull_auto_timed_probe = false;
     // Over-relaxation factor for enhanced sphere tracing. DISABLED (1.0 =
     // classic sphere tracing): empirically, omega>1 over-steps the floor plane
     // seen at grazing angle (the horizon), so the overshoot guard backtracks and

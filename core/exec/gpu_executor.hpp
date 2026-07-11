@@ -20,6 +20,7 @@
 #include "core/frep/scene.hpp"
 #include "core/gpu/glsl_emitter.hpp"
 #include "core/compiler/scene_bindings.hpp"
+#include "core/compiler/compile_sdf.hpp"
 #include "core/gpu/glsl_compile.hpp"
 #include "core/gpu/vulkan_ctx.hpp"
 #include "core/gpu/shader_push_builder.hpp"
@@ -66,7 +67,30 @@ public:
         const frep::ParamBindingTable* btp = bt.empty() ? nullptr : &bt;
         auto pbuf = bt.seed_buffer();   // current runtime values, slot order
 
-        auto emit = gpu::GlslEmitter::emit(scene, cfg_, btp);
+        // Resolve an Auto cull choice with a coarse probe (needs the JIT SDF,
+        // hence here rather than in the emitter). The choice depends on scene
+        // topology, not on edited parameters, so it is cached and only recomputed
+        // when the scene pointer changes — the per-frame path then skips both the
+        // probe and, via the source cache below, the shader rebuild.
+        TracerConfig cfg = cfg_;
+        if (cfg_.cull_slabs > 0 && cfg_.cull_method == TracerConfig::CullMethod::Auto) {
+            if (&scene != cull_resolved_scene_) {
+                if (cfg_.cull_auto_timed_probe) {
+                    // Future work: pick Lipschitz vs Interval by timing a few
+                    // frames of each on this device and keeping the faster, then
+                    // cache. Correct where cell-count probing is not (it ignores
+                    // per-box cull cost), but costs real frames — enabled only via
+                    // this opt-in. Not yet implemented; fall back to topology so
+                    // the flag is inert rather than wrong.
+                    cull_resolved_cfg_ = jit::resolve_cull_method(scene, cfg_);
+                } else {
+                    cull_resolved_cfg_ = jit::resolve_cull_method(scene, cfg_);
+                }
+                cull_resolved_scene_ = &scene;
+            }
+            cfg = cull_resolved_cfg_;
+        }
+        auto emit = gpu::GlslEmitter::emit(scene, cfg, btp);
         if (!emit) { r.error = "glsl emit: " + emit.error(); return r; }
 
         // Rebuild context when the shader source changes (new scene/placement).
@@ -125,6 +149,8 @@ public:
 private:
     std::unique_ptr<gpu::VulkanCtx> ctx_;
     std::string cached_glsl_;
+    const SceneGraph*   cull_resolved_scene_ = nullptr;
+    TracerConfig        cull_resolved_cfg_{};
     TracerConfig cfg_;
     const CompilePolicy* policy_ = nullptr;
 };

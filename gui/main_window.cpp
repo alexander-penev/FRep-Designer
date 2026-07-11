@@ -11,6 +11,8 @@
 #include "core/frep/scene.hpp"
 #include "core/frep/transforms.hpp"
 #include "core/io/scene_io.hpp"
+#include "core/frep/deformations.hpp"
+#include "core/frep/instance.hpp"
 #include "core/frep/mesh_sdf.hpp"
 #include "core/mesh/marching_cubes.hpp"
 #include "core/plugin/plugin_api.hpp"
@@ -980,6 +982,94 @@ void MainWindow::build_toolbar() {
         QString name = cb_plugin->currentText();
         on_add_primitive(name);
     });
+
+    toolbar->addSeparator();
+
+    // ── Instance the selected object (task 4, true instancing) ───────────────
+    // Creates an InstanceNode referencing the selected object's geometry by id
+    // and *sharing* its pointer (not a copy): editing the target later shows
+    // live in every instance, and the emitted code will (Level 2) reuse one
+    // subprogram. The instance gets its own Translate placement so it is visible;
+    // its transform is independent of the original's.
+    auto* act_instance = toolbar->addAction("Instance");
+    act_instance->setToolTip("Reference the selected object as a live instance "
+                             "(shares geometry; edits to the original propagate)");
+    connect(act_instance, &QAction::triggered, this, [this]() {
+        if (!inspector_) return;
+        const QStringList sel = inspector_->selected_ids();
+        if (sel.isEmpty()) {
+            QMessageBox::information(this, "Instance",
+                "Select an object in the Scene list to instance.");
+            return;
+        }
+        static int inst_counter = 0;
+        for (const QString& sid : sel) {
+            const std::string src = sid.toStdString();
+            const SceneObject* obj = scene_->find_object(src);
+            if (!obj || !obj->geometry) continue;
+            std::string nid = src + "_inst" + std::to_string(inst_counter++);
+            // Reference the target's *bare* geometry (semantics ii): the instance
+            // node shares the target root pointer; its own Translate places it.
+            auto inst = std::make_shared<InstanceNode>(obj->geometry, src, nid);
+            auto placed = std::make_shared<TranslateNode>(inst, 0.6f, 0.0f, 0.0f, nid + "_t");
+            undo_stack_->push_apply(std::make_unique<undo::AddObjectCommand>(
+                *scene_, nid, placed, obj->material));
+        }
+        io::resolve_instances(*scene_, registry_);
+        inspector_->refresh();
+        on_scene_changed();
+    });
+
+    toolbar->addSeparator();
+    toolbar->addWidget(new QLabel(" Deform:"));
+
+    // ── Apply a deformation to the selected object(s) (task 7) ───────────────
+    // Deformations wrap existing geometry (unlike primitives, which add new
+    // objects). Each button replaces the primary selection's geometry with the
+    // deformation node wrapping the current root, via SetGeometryCommand so it
+    // is undoable. Twist/Bend around Y, Taper along Y — the node kinds already
+    // exist; this is the only place they can be applied from the GUI.
+    auto apply_deform = [this](auto make_node, const char* label) {
+        if (!inspector_) return;
+        const QStringList sel = inspector_->selected_ids();
+        if (sel.isEmpty()) {
+            QMessageBox::information(this, "Deform",
+                QString("Select an object first, then apply %1.").arg(label));
+            return;
+        }
+        for (const QString& sid : sel) {
+            const std::string id = sid.toStdString();
+            const SceneObject* obj = scene_->find_object(id);
+            if (!obj || !obj->geometry) continue;
+            FRepNode::Ptr wrapped = make_node(obj->geometry, id);
+            undo_stack_->push_apply(
+                std::make_unique<undo::SetGeometryCommand>(*scene_, id, wrapped));
+        }
+        inspector_->refresh();
+        on_scene_changed();
+    };
+
+    auto* act_twist = toolbar->addAction("Twist");
+    act_twist->setToolTip("Wrap the selected object in a TwistY deformation");
+    connect(act_twist, &QAction::triggered, this, [this, apply_deform]() {
+        apply_deform([](FRepNode::Ptr g, std::string id) -> FRepNode::Ptr {
+            return std::make_shared<TwistYNode>(g, 1.5f, id + "_tw");
+        }, "Twist");
+    });
+    auto* act_bend = toolbar->addAction("Bend");
+    act_bend->setToolTip("Wrap the selected object in a BendXY deformation");
+    connect(act_bend, &QAction::triggered, this, [this, apply_deform]() {
+        apply_deform([](FRepNode::Ptr g, std::string id) -> FRepNode::Ptr {
+            return std::make_shared<BendXYNode>(g, 0.9f, id + "_bend");
+        }, "Bend");
+    });
+    auto* act_taper = toolbar->addAction("Taper");
+    act_taper->setToolTip("Wrap the selected object in a TaperY deformation");
+    connect(act_taper, &QAction::triggered, this, [this, apply_deform]() {
+        apply_deform([](FRepNode::Ptr g, std::string id) -> FRepNode::Ptr {
+            return std::make_shared<TaperYNode>(g, 0.4f, 2.0f, id + "_tp");
+        }, "Taper");
+    });
 }
 
 QWidget* MainWindow::build_side_panel() {
@@ -1296,6 +1386,77 @@ QWidget* MainWindow::build_side_panel() {
     v->addWidget(cam_box);
 
     // ── Registered plugins ───────────────────────────────────────────────────
+    // ── GPU tile cull (task 1) ───────────────────────────────────────────────
+    // Live control of the depth-slab tile cull used by the real-time GPU path:
+    // method (Auto/Lipschitz/Interval/Off), slab count and the Lipschitz L. All
+    // feed render_config_ and apply_render_config() like the other settings, so
+    // the effect is visible immediately while orbiting the scene.
+    auto* cull_box = new QGroupBox("GPU tile cull");
+    auto* cull_form = new QFormLayout(cull_box);
+
+    auto* cb_cull_method = new QComboBox;
+    cb_cull_method->addItem("Auto",      static_cast<int>(TracerConfig::CullMethod::Auto));
+    cb_cull_method->addItem("Lipschitz", static_cast<int>(TracerConfig::CullMethod::Lipschitz));
+    cb_cull_method->addItem("Interval",  static_cast<int>(TracerConfig::CullMethod::Interval));
+    cb_cull_method->addItem("Off",       static_cast<int>(TracerConfig::CullMethod::Off));
+    cb_cull_method->setCurrentIndex(0);
+    connect(cb_cull_method, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this, cb_cull_method](int) {
+        render_config_.cull_method =
+            static_cast<TracerConfig::CullMethod>(cb_cull_method->currentData().toInt());
+        apply_render_config();
+    });
+    cull_form->addRow("Method:", cb_cull_method);
+
+    auto* sp_slabs = new QSpinBox;
+    sp_slabs->setRange(0, 128);
+    sp_slabs->setSingleStep(8);
+    sp_slabs->setValue(render_config_.cull_slabs);
+    sp_slabs->setToolTip("Depth slabs per tile; 0 disables the cull");
+    connect(sp_slabs, qOverload<int>(&QSpinBox::valueChanged),
+            this, [this](int v) { render_config_.cull_slabs = v; apply_render_config(); });
+    cull_form->addRow("Slabs:", sp_slabs);
+
+    auto* sp_lip = new QDoubleSpinBox;
+    sp_lip->setRange(0.1, 32.0);
+    sp_lip->setDecimals(2);
+    sp_lip->setSingleStep(0.5);
+    sp_lip->setValue(render_config_.cull_lipschitz);
+    sp_lip->setToolTip("Lipschitz constant L for the Lipschitz method "
+                       "(1.0 for a true SDF; a raw implicit needs its max |grad f|)");
+    connect(sp_lip, qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this, [this](double v) {
+        render_config_.cull_lipschitz = static_cast<float>(v); apply_render_config();
+    });
+    cull_form->addRow("Lipschitz L:", sp_lip);
+
+    // Metrics overlay toggle (task 2). Drives an on-viewport HUD (ms/frame,
+    // cull method in use, cull rate); wired to the viewport below.
+    auto* cb_metrics = new QCheckBox;
+    cb_metrics->setChecked(false);
+    connect(cb_metrics, &QCheckBox::toggled, this, [this](bool on) {
+        show_metrics_overlay_ = on;
+        if (viewport_iv_) viewport_iv_->set_metrics_overlay(on);
+    });
+    cull_form->addRow("Show metrics:", cb_metrics);
+
+    // Debug view (task 3): step-count heatmap instead of shaded output, to see
+    // where marching is expensive and where the cull skips work.
+    auto* cb_debug = new QComboBox;
+    cb_debug->addItem("Shaded",          static_cast<int>(TracerConfig::DebugView::Off));
+    cb_debug->addItem("Step heatmap",    static_cast<int>(TracerConfig::DebugView::StepHeatmap));
+    cb_debug->addItem("Cull span",       static_cast<int>(TracerConfig::DebugView::CullSpan));
+    cb_debug->setCurrentIndex(0);
+    connect(cb_debug, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this, cb_debug](int) {
+        render_config_.debug_view =
+            static_cast<TracerConfig::DebugView>(cb_debug->currentData().toInt());
+        apply_render_config();
+    });
+    cull_form->addRow("Debug view:", cb_debug);
+
+    v->addWidget(cull_box);
+
     auto* plugins_box = new QGroupBox("Registered plugins");
     auto* pv = new QVBoxLayout(plugins_box);
     auto* lst = new QListWidget;
@@ -1367,6 +1528,12 @@ void MainWindow::on_render_completed(double render_ms, double total_ms,
 }
 
 void MainWindow::on_scene_changed() {
+    // Rebind instances first: an edit may have replaced a target's geometry root
+    // (SetGeometryCommand swaps the pointer rather than mutating it), added a new
+    // instance, or removed a target. Re-resolving here keeps every instance
+    // pointing at the current geometry so the live-edit link holds. Cyclic or
+    // dangling references are left empty by resolve_instances (no recursion).
+    io::resolve_instances(*scene_, registry_);
     force_recompile_if_offscreen();
     // Propagate scene changes back into the node graph view. The
     // syncing_ guard prevents this from triggering a graph_changed →

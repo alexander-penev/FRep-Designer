@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(frep VERSION 4.36.0 LANGUAGES C CXX)
+project(frep VERSION 4.41.0 LANGUAGES C CXX)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # C++26
@@ -312,6 +312,11 @@ if(FREP_BUILD_GPU)
     # MeshSDF, patterns, textures, CPU vs GPU comparison).
     add_executable(frep_gallery tools/gallery.cpp)
     target_link_libraries(frep_gallery PRIVATE frep_core)
+
+    # GPU tile-cull benchmark: renders with cull off vs on, reports ms/frame.
+    add_executable(gpu_cull_bench tools/gpu_cull_bench.cpp)
+    target_link_libraries(gpu_cull_bench PRIVATE frep_core)
+    set_property(TARGET gpu_cull_bench PROPERTY CXX_STANDARD 26)
     target_compile_options(frep_gallery PRIVATE -fno-rtti)
 
     # Benchmarks tool — prints a markdown table of timings.
@@ -508,6 +513,7 @@ if(FREP_BUILD_GUI)
             # plugin loading fails with "undefined symbol".
             -Wl,--whole-archive frep_core -Wl,--no-whole-archive
             Qt6::Core Qt6::Widgets Qt6::Concurrent
+            Vulkan::Vulkan
         )
         message(STATUS "Qt6 GUI: enabled (frep_designer)")
 

@@ -30,6 +30,7 @@ enum class NodeKind {
     Translate, Scale, RotateY,
     TwistY, BendXY, TaperY,
     Scene,
+    Instance,
     // Plugin-defined nodes — emit goes through the FRepNode::emit_glsl
     // virtual fallback rather than the built-in switch table. Plugin
     // authors should set `kind = NodeKind::Plugin` in their node ctor.
@@ -293,6 +294,41 @@ inline bool node_requires_safety_step(const FRepNode& n) {
     for (const auto& c : n.children)
         if (c && node_requires_safety_step(*c)) return true;
     return false;
+}
+
+// Whether the field is provably 1-Lipschitz, so the tile cull's Lipschitz box
+// rule is sound at L=1. Metric primitives (Sphere/Box/Plane), boolean/blend
+// composition (min/max of 1-Lipschitz stays 1-Lipschitz), and rigid transforms
+// (Translate/RotateY) all preserve |grad f| = 1. What breaks it: CustomExpr /
+// Plugin / Mesh (arbitrary implicit, unknown gradient) and a Scale by s < 1,
+// which multiplies the gradient by 1/s > 1. A scene that returns true can be
+// culled with L=1; anything else needs an estimated L or the interval method.
+inline bool node_is_unit_lipschitz(const FRepNode& n) {
+    switch (n.kind) {
+        case NodeKind::Sphere:
+        case NodeKind::Box:
+        case NodeKind::Plane:
+        case NodeKind::Union:
+        case NodeKind::Intersection:
+        case NodeKind::Difference:
+        case NodeKind::SmoothUnion:
+        case NodeKind::Negate:
+        case NodeKind::Translate:
+        case NodeKind::RotateY:
+        case NodeKind::Scene:
+        case NodeKind::Instance:      // metric-ness follows the shared target
+            break;                       // gradient-preserving
+        case NodeKind::Scale: {          // sound only for |s| >= 1 (never amplifies)
+            auto it = n.params.find("s");
+            if (it == n.params.end() || it->second < 1.0f) return false;
+            break;
+        }
+        default:                         // TwistY/BendXY/TaperY/Plugin/CustomExpr/...
+            return false;
+    }
+    for (const auto& c : n.children)
+        if (c && !node_is_unit_lipschitz(*c)) return false;
+    return true;
 }
 
 // Number of nodes in a subtree (this node + all descendants). A cheap
