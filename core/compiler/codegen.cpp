@@ -6,6 +6,7 @@
 
 #include "codegen.hpp"
 #include "core/compiler/llvm_compat.hpp"
+#include "core/compiler/node_interval_ir.hpp"
 
 #include "core/compiler/bvh.hpp"
 #include "core/frep/operations.hpp"
@@ -1318,9 +1319,18 @@ llvm::Function* SceneCodegen::emit_tracer(const SceneGraph& scene,
             if (!obj.visible || !obj.geometry) continue;
             if (!node_is_unit_lipschitz(*obj.geometry)) { metric = false; break; }
         }
-        bool want_lip = cfg_.cull_slabs > 0 &&
-            (cfg_.cull_method == CM::Lipschitz ||
-             (cfg_.cull_method == CM::Auto && metric));
+        // Decide the occupancy test: Lipschitz (L*halfdiag) for metric trees, or
+        // interval (sound for any tree, via the IR interval emitter). Auto picks
+        // Lipschitz on metric trees (cheapest, exact at L=1) and interval
+        // otherwise. Interval/Lipschitz explicit are honoured.
+        bool use_cull = cfg_.cull_slabs > 0 && cfg_.cull_method != CM::Off;
+        bool use_interval = false;
+        if (use_cull) {
+            if (cfg_.cull_method == CM::Interval)      use_interval = true;
+            else if (cfg_.cull_method == CM::Lipschitz) use_interval = false;
+            else /* Auto */                             use_interval = !metric;
+        }
+        bool want_lip = use_cull;
         if (want_lip) {
             const int   S    = cfg_.cull_slabs;
             const float near = 0.001f;
@@ -1331,6 +1341,39 @@ llvm::Function* SceneCodegen::emit_tracer(const SceneGraph& scene,
             b.SetInsertPoint(term);   // emit before the branch to py_cond
             // Local float-constant helper (the member fc() takes a builder arg).
             auto fc = [&](float v){ return llvm::ConstantFP::get(f32(), v); };
+
+            // For interval culling, emit a scene_ival(lo3,hi3)->{lo,hi} function
+            // (union of visible objects, min of their interval bounds) once, so
+            // each slab is one call rather than an inlined interval tree.
+            llvm::Function* ival_fn = nullptr;
+            if (use_interval) {
+                auto* pairty = llvm::StructType::get(ctx_, {f32(), f32()});
+                auto* ivty = llvm::FunctionType::get(pairty,
+                    {f32(), f32(), f32(), f32(), f32(), f32()}, false);
+                ival_fn = llvm::Function::Create(ivty,
+                    llvm::Function::InternalLinkage, "scene_ival", mod_.get());
+                ival_fn->addFnAttr(llvm::Attribute::NoUnwind);
+                ival_fn->addFnAttr(llvm::Attribute::WillReturn);
+                auto* ivbb = llvm::BasicBlock::Create(ctx_, "entry", ival_fn);
+                llvm::IRBuilder<> ib(ivbb);
+                auto ia = ival_fn->arg_begin();
+                auto* Xlo=&*ia++; auto* Ylo=&*ia++; auto* Zlo=&*ia++;
+                auto* Xhi=&*ia++; auto* Yhi=&*ia++; auto* Zhi=&*ia++;
+                frep::jit::NodeIntervalIR em(ctx_, ib);
+                llvm::Value* blo = fc(1e30f); llvm::Value* bhi = fc(1e30f);
+                for (auto& [id, obj] : scene.objects()) {
+                    if (!obj.visible || !obj.geometry) continue;
+                    frep::jit::IvV r = em.emit(*obj.geometry,
+                        {Xlo, Xhi}, {Ylo, Yhi}, {Zlo, Zhi});
+                    blo = frep::llvm_compat::binary_intrinsic(ib, llvm::Intrinsic::minnum, blo, r.lo);
+                    bhi = frep::llvm_compat::binary_intrinsic(ib, llvm::Intrinsic::minnum, bhi, r.hi);
+                }
+                llvm::Value* agg = llvm::UndefValue::get(pairty);
+                agg = ib.CreateInsertValue(agg, blo, {0});
+                agg = ib.CreateInsertValue(agg, bhi, {1});
+                ib.CreateRet(agg);
+                verify_fn(ival_fn);
+            }
 
             auto sfp = [&](llvm::Value* v){ return b.CreateSIToFP(v, f32()); };
             auto* iwf = sfp(IW); auto* ihf = sfp(IH);
@@ -1406,17 +1449,30 @@ llvm::Function* SceneCodegen::emit_tracer(const SceneGraph& scene,
                 auto* ccx = b.CreateFMul(fc(0.5f), b.CreateFAdd(lo_x, hi_x));
                 auto* ccy = b.CreateFMul(fc(0.5f), b.CreateFAdd(lo_y, hi_y));
                 auto* ccz = b.CreateFMul(fc(0.5f), b.CreateFAdd(lo_z, hi_z));
-                auto* ex = b.CreateFMul(fc(0.5f), b.CreateFSub(hi_x, lo_x));
-                auto* ey = b.CreateFMul(fc(0.5f), b.CreateFSub(hi_y, lo_y));
-                auto* ez = b.CreateFMul(fc(0.5f), b.CreateFSub(hi_z, lo_z));
-                auto* hd = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sqrt,
-                    b.CreateFAdd(b.CreateFMul(ex,ex),
-                    b.CreateFAdd(b.CreateFMul(ey,ey), b.CreateFMul(ez,ez))));
-                auto* r = b.CreateFMul(fc(L), hd);
-                auto* fcv = b.CreateCall(sdf_fn, {ccx, ccy, ccz, PARAMS});
-                auto* occ = b.CreateAnd(
-                    b.CreateFCmpOLE(b.CreateFSub(fcv, r), fc(0.0f)),
-                    b.CreateFCmpOGE(b.CreateFAdd(fcv, r), fc(0.0f)));
+                llvm::Value* occ = nullptr;
+                if (use_interval) {
+                    // occupied if the field interval over the slab AABB spans 0.
+                    auto* iv = b.CreateCall(ival_fn,
+                        {lo_x, lo_y, lo_z, hi_x, hi_y, hi_z});
+                    auto* ivlo = b.CreateExtractValue(iv, {0});
+                    auto* ivhi = b.CreateExtractValue(iv, {1});
+                    occ = b.CreateAnd(
+                        b.CreateFCmpOLE(ivlo, fc(0.0f)),
+                        b.CreateFCmpOGE(ivhi, fc(0.0f)));
+                } else {
+                    // Lipschitz: |scene_sdf(center)| <= L * halfdiag.
+                    auto* ex = b.CreateFMul(fc(0.5f), b.CreateFSub(hi_x, lo_x));
+                    auto* ey = b.CreateFMul(fc(0.5f), b.CreateFSub(hi_y, lo_y));
+                    auto* ez = b.CreateFMul(fc(0.5f), b.CreateFSub(hi_z, lo_z));
+                    auto* hd = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sqrt,
+                        b.CreateFAdd(b.CreateFMul(ex,ex),
+                        b.CreateFAdd(b.CreateFMul(ey,ey), b.CreateFMul(ez,ez))));
+                    auto* r = b.CreateFMul(fc(L), hd);
+                    auto* fcv = b.CreateCall(sdf_fn, {ccx, ccy, ccz, PARAMS});
+                    occ = b.CreateAnd(
+                        b.CreateFCmpOLE(b.CreateFSub(fcv, r), fc(0.0f)),
+                        b.CreateFCmpOGE(b.CreateFAdd(fcv, r), fc(0.0f)));
+                }
                 acc0 = b.CreateSelect(occ, mn(acc0, fc(ta)), acc0);
                 acc1 = b.CreateSelect(occ, mx(acc1, fc(tb)), acc1);
             }
