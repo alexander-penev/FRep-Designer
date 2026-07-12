@@ -339,6 +339,7 @@ void MainWindow::build_ui() {
     tabs->addTab(material_editor_, "Material");
 
     tabs->addTab(build_lights_panel(), "Lights");
+    tabs->addTab(build_plugins_panel(), "Plugins");
     tabs->addTab(build_lan_panel(), "LAN");
 
     // Graph tab — wrapper widget with a top toolbar (object picker +
@@ -1437,6 +1438,37 @@ QWidget* MainWindow::build_side_panel() {
     connect(cb_metrics, &QCheckBox::toggled, this, [this](bool on) {
         show_metrics_overlay_ = on;
         if (viewport_iv_) viewport_iv_->set_metrics_overlay(on);
+        // On-viewport HUD: a small translucent label pinned to the top-left of
+        // the viewport container, refreshed a few times a second from the
+        // active viewport's metrics_text(). Created lazily on first enable.
+        if (on) {
+            if (!metrics_label_ && viewport_container_) {
+                metrics_label_ = new QLabel(viewport_container_);
+                metrics_label_->setStyleSheet(
+                    "QLabel { color: #e0e0e0; background: rgba(0,0,0,140);"
+                    " padding: 4px 8px; border-radius: 4px;"
+                    " font-family: monospace; font-size: 11px; }");
+                metrics_label_->setAttribute(Qt::WA_TransparentForMouseEvents);
+                metrics_label_->move(10, 10);
+            }
+            if (!metrics_timer_) {
+                metrics_timer_ = new QTimer(this);
+                metrics_timer_->setInterval(250);
+                connect(metrics_timer_, &QTimer::timeout, this, [this] {
+                    if (!metrics_label_ || !viewport_iv_) return;
+                    QString t = viewport_iv_->metrics_text();
+                    if (t.isEmpty()) { metrics_label_->hide(); return; }
+                    metrics_label_->setText(t);
+                    metrics_label_->adjustSize();
+                    metrics_label_->show();
+                    metrics_label_->raise();
+                });
+            }
+            metrics_timer_->start();
+        } else {
+            if (metrics_timer_) metrics_timer_->stop();
+            if (metrics_label_) metrics_label_->hide();
+        }
     });
     cull_form->addRow("Show metrics:", cb_metrics);
 
@@ -1455,7 +1487,43 @@ QWidget* MainWindow::build_side_panel() {
     });
     cull_form->addRow("Debug view:", cb_debug);
 
+    // Instancing: shared subprograms (Level 2). On = emit each instanced shape
+    // once as a GLSL function; Off = inline a copy at each instance.
+    auto* cb_inst = new QCheckBox;
+    cb_inst->setChecked(render_config_.instance_shared_subprograms);
+    cb_inst->setToolTip("Emit instanced geometry once as a shared function "
+                        "(smaller shader for repeated shapes) vs inlining copies");
+    connect(cb_inst, &QCheckBox::toggled, this, [this](bool on) {
+        render_config_.instance_shared_subprograms = on;
+        apply_render_config();
+    });
+    cull_form->addRow("Share instances:", cb_inst);
+
+    // Ray-box clip for the IR paths (CpuIr/GpuIr) — the analog of the GLSL tile
+    // cull. Clips camera rays to the scene bounding box so empty space isn't
+    // marched. On by default; auto-disabled for unbounded scenes (planes).
+    auto* cb_bbox = new QCheckBox;
+    cb_bbox->setChecked(render_config_.bbox_clip);
+    cb_bbox->setToolTip("Clip IR-path rays to the scene bounding box "
+                        "(skips empty space; CpuIr/GpuIr only)");
+    connect(cb_bbox, &QCheckBox::toggled, this, [this](bool on) {
+        render_config_.bbox_clip = on;
+        apply_render_config();
+    });
+    cull_form->addRow("BBox clip (IR):", cb_bbox);
+
     v->addWidget(cull_box);
+
+    v->addStretch(1);
+
+    return panel;
+}
+
+// Plugins tab — lists the registered plugin primitives (moved out of the
+// Render tab into its own tab).
+QWidget* MainWindow::build_plugins_panel() {
+    auto* panel = new QWidget;
+    auto* v = new QVBoxLayout(panel);
 
     auto* plugins_box = new QGroupBox("Registered plugins");
     auto* pv = new QVBoxLayout(plugins_box);
@@ -1469,15 +1537,6 @@ QWidget* MainWindow::build_side_panel() {
     }
     pv->addWidget(lst);
     v->addWidget(plugins_box, 1);
-
-    auto* help = new QLabel(
-        "<b>Controls:</b><br>"
-        "- Drag = orbit camera<br>"
-        "- Wheel = zoom<br>"
-        "- Toolbar buttons = add primitive"
-    );
-    help->setWordWrap(true);
-    v->addWidget(help);
 
     return panel;
 }

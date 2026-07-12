@@ -421,6 +421,7 @@ void ExecutorViewport::render_worker(int W_out, int H_out) {
     std::vector<QRect>  regions(np);
     std::vector<double> px_count(np, 0.0);
     std::vector<bool>   ok_flags(np, false);
+    if (path_error_.size() != np) path_error_.assign(np, std::string());
 
     // Render each path on its own thread. In the sequential version a fast path
     // (e.g. gpu_glsl) was blitted only after a slower path ahead of it in path
@@ -454,7 +455,17 @@ void ExecutorViewport::render_worker(int W_out, int H_out) {
                 double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 if (timings[p] < 0) timings[p] = 0;
                 timings[p] += ms;
-                if (!r.ok) continue;
+                if (!r.ok) {
+                    // Surface the first failure per path instead of silently
+                    // keeping the previous frame (which looks like "the toggle
+                    // did nothing"): record it so the overlay/log can report a
+                    // path that is failing to render, e.g. an unavailable GPU_IR
+                    // backend, rather than showing stale pixels as if current.
+                    std::lock_guard<std::mutex> lk(image_mu_);
+                    if (path_error_[p].empty()) path_error_[p] = r.error;
+                    continue;
+                }
+                { std::lock_guard<std::mutex> lk(image_mu_); path_error_[p].clear(); }
                 {
                     std::lock_guard<std::mutex> lk(image_mu_);
                     blit_tile(frame, r);
@@ -521,15 +532,45 @@ void ExecutorViewport::on_region_done() {
     }, Qt::QueuedConnection);
 }
 
+QString ExecutorViewport::metrics_text() const {
+    std::lock_guard<std::mutex> lk(image_mu_);
+    QString s;
+    for (std::size_t i = 0; i < paths_.size(); ++i) {
+        double t = i < timings_ms_.size() ? timings_ms_[i] : -1;
+        QString line;
+        if (i < path_error_.size() && !path_error_[i].empty()) {
+            line = QString("%1  ERROR").arg(exec::path_kind_name(paths_[i]));
+        } else {
+            double fps = (t > 0) ? 1000.0 / t : 0.0;
+            line = QString("%1  %2 ms  (%3 fps)")
+                       .arg(exec::path_kind_name(paths_[i]))
+                       .arg(t >= 0 ? QString::number(t, 'f', 1) : "—")
+                       .arg(fps > 0 ? QString::number(fps, 'f', 0) : "—");
+        }
+        s += line;
+        if (i + 1 < paths_.size()) s += "\n";
+    }
+    return s;
+}
+
 QString ExecutorViewport::status_text() const {
     std::lock_guard<std::mutex> lk(image_mu_);
     QString s;
     for (std::size_t i = 0; i < paths_.size(); ++i) {
         if (i) s += "  ";
         double t = i < timings_ms_.size() ? timings_ms_[i] : -1;
-        s += QString("%1: %2")
-                 .arg(exec::path_kind_name(paths_[i]))
-                 .arg(t >= 0 ? QString("%1ms").arg(t, 0, 'f', 1) : "—");
+        // A path that errored shows the reason instead of a timing, so a
+        // silently-failing backend (e.g. GPU_IR without CUDA) is visible rather
+        // than looking like a working render that ignores settings.
+        if (i < path_error_.size() && !path_error_[i].empty()) {
+            s += QString("%1: ERROR (%2)")
+                     .arg(exec::path_kind_name(paths_[i]))
+                     .arg(QString::fromStdString(path_error_[i]).left(60));
+        } else {
+            s += QString("%1: %2")
+                     .arg(exec::path_kind_name(paths_[i]))
+                     .arg(t >= 0 ? QString("%1ms").arg(t, 0, 'f', 1) : "—");
+        }
     }
     return s;
 }

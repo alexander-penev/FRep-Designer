@@ -86,6 +86,11 @@ public:
     // Default no-op; the real-time viewport overrides it (task 2).
     virtual void set_metrics_overlay(bool) {}
 
+    // Current metrics as a short multi-line string for the HUD overlay
+    // (ms/frame, and — where the backend has it — cull method and cull rate).
+    // Empty string means "no metrics available"; the HUD hides itself then.
+    virtual QString metrics_text() const { return {}; }
+
     // Capture the current rendered frame as a CPU-side QImage for export.
     // Default returns a null image (caller treats that as "nothing to
     // export"). The offscreen backend returns its last readback image;

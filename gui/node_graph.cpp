@@ -6,6 +6,8 @@
 #include "core/frep/operations.hpp"
 #include "core/frep/primitives.hpp"
 #include "core/frep/transforms.hpp"
+#include "core/frep/deformations.hpp"
+#include "core/frep/instance.hpp"
 #include "core/plugin/plugin_api.hpp"
 
 #include <QContextMenuEvent>
@@ -116,11 +118,22 @@ void NodeItem::paint(QPainter* p, const QStyleOptionGraphicsItem*, QWidget*) {
     p->drawText(header.adjusted(8, 0, -8, 0),
                 Qt::AlignVCenter | Qt::AlignLeft, info_.display);
 
+    // Optional subtitle (e.g. an Instance's "→ target_id"), just below the header.
+    qreal params_top = kHeaderH + 4;
+    if (!subtitle_.isEmpty()) {
+        f.setBold(false);
+        p->setFont(f);
+        p->setPen(QColor(0xff, 0xd0, 0xe8));
+        p->drawText(QRectF(8, kHeaderH + 2, kWidth - 16, kRowH),
+                    Qt::AlignVCenter | Qt::AlignLeft, subtitle_);
+        params_top += kRowH;
+    }
+
     // Parameters
     f.setBold(false);
     p->setFont(f);
     p->setPen(QColor(0xcc, 0xcc, 0xcc));
-    qreal y = kHeaderH + 4;
+    qreal y = params_top;
     for (const auto& pr : info_.params) {
         QRectF row(8, y, kWidth - 16, kRowH);
         float val = param_values_.at(pr.name);
@@ -484,12 +497,39 @@ NodeGraphScene::build_subtree(NodeItem* node) const {
     if (type == "Scale") {
         auto a = child(0);
         if (!a) return nullptr;
-        return std::make_shared<ScaleNode>(a, P("s"), id);
+        return std::make_shared<ScaleNode>(a, P("sx"), P("sy"), P("sz"), id);
+    }
+    if (type == "RotateX") {
+        auto a = child(0);
+        if (!a) return nullptr;
+        return std::make_shared<RotateXNode>(a, P("a"), id);
     }
     if (type == "RotateY") {
         auto a = child(0);
         if (!a) return nullptr;
         return std::make_shared<RotateYNode>(a, P("a"), id);
+    }
+    if (type == "RotateZ") {
+        auto a = child(0);
+        if (!a) return nullptr;
+        return std::make_shared<RotateZNode>(a, P("a"), id);
+    }
+
+    // ── Deformations ──────────────────────────────────────────────────────────
+    if (type == "TwistY") {
+        auto a = child(0);
+        if (!a) return nullptr;
+        return std::make_shared<TwistYNode>(a, P("k"), id);
+    }
+    if (type == "BendXY") {
+        auto a = child(0);
+        if (!a) return nullptr;
+        return std::make_shared<BendXYNode>(a, P("k"), id);
+    }
+    if (type == "TaperY") {
+        auto a = child(0);
+        if (!a) return nullptr;
+        return std::make_shared<TaperYNode>(a, P("t"), P("h"), id);
     }
 
     // ── Plugin-based primitives ───────────────────────────────────────────────
@@ -551,6 +591,18 @@ void NodeGraphScene::load_from_tree(const std::shared_ptr<FRepNode>& root) {
 
         auto* node = add_node(type, QPointF(x, y));
         if (!node) return nullptr;
+
+        // Instance references another object's geometry by id. We must NOT
+        // recurse into its shared child — that would duplicate the whole target
+        // subtree in the graph (and loop forever on a cyclic reference). Show it
+        // as a terminal node whose label carries the target id, so the graph
+        // reflects that an instance exists and what it points at.
+        if (fnode->kind == NodeKind::Instance) {
+            const auto* in = static_cast<const InstanceNode*>(fnode.get());
+            node->set_subtitle(QString("→ %1")
+                .arg(QString::fromStdString(in->target_id())));
+            return node;
+        }
 
         // Parameters.
         for (auto& [k, v] : fnode->params) {
@@ -618,15 +670,19 @@ void NodeGraphEditor::contextMenuEvent(QContextMenuEvent* e) {
     QMenu* prim = menu.addMenu("Primitives");
     QMenu* op   = menu.addMenu("Operations");
     QMenu* tr   = menu.addMenu("Transforms");
+    QMenu* def  = menu.addMenu("Deformations");
 
     QPointF scene_pos = mapToScene(e->pos());
 
     for (const auto& info : node_catalog()) {
         QMenu* target = nullptr;
         switch (info.category) {
-            case NodeCategory::Primitive: target = prim; break;
-            case NodeCategory::Operation: target = op;   break;
-            case NodeCategory::Transform: target = tr;   break;
+            case NodeCategory::Primitive:   target = prim; break;
+            case NodeCategory::Operation:   target = op;   break;
+            case NodeCategory::Transform:   target = tr;   break;
+            case NodeCategory::Deformation: target = def;  break;
+            // Instance isn't creatable from the palette (it needs a target
+            // object); it's created from the Scene toolbar and shown here.
             default: continue;
         }
         QString type = info.type_name;

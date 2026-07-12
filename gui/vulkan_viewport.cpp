@@ -1552,6 +1552,9 @@ VulkanViewport::VulkanViewport(QWidget* container,
     if (window_) {
         connect(window_, &FRepVulkanWindow::render_time_sampled,
                 this,    &IViewport::render_completed);
+        // Also stash the sampled GPU frame time for the metrics HUD.
+        connect(window_, &FRepVulkanWindow::render_time_sampled,
+                this,    [this](int ms) { last_gpu_ms_ = ms; });
         connect(window_, &FRepVulkanWindow::object_picked,
                 this,    [this](const QString& id, bool /*additive*/) {
                     // additive is consumed inside MainWindow's click
@@ -1585,6 +1588,27 @@ void VulkanViewport::set_tracer_config(const TracerConfig& cfg) {
     // per-frame scene-hash check then triggers a pipeline rebuild
     // on the next frame to actually re-emit GLSL with the new config.
     if (window_) window_->set_tracer_config(cfg);
+    using CM = TracerConfig::CullMethod;
+    switch (cfg.cull_method) {
+        case CM::Auto:      cull_method_ = "Auto";      break;
+        case CM::Lipschitz: cull_method_ = "Lipschitz"; break;
+        case CM::Interval:  cull_method_ = "Interval";  break;
+        case CM::Off:       cull_method_ = "Off";       break;
+    }
+}
+
+QString VulkanViewport::metrics_text() const {
+    // GPU frame time comes from a timestamp-query pair wrapping the compute
+    // dispatch (measured in the renderer, sampled ~10 Hz). Plus the tile-cull
+    // method in use.
+    QString s = "GPU_GLSL (real-time)";
+    if (last_gpu_ms_ > 0) {
+        double fps = 1000.0 / last_gpu_ms_;
+        s += QString("\n%1 ms  (%2 fps)")
+                 .arg(last_gpu_ms_).arg(fps, 0, 'f', 0);
+    }
+    if (!cull_method_.isEmpty()) s += "\ncull: " + cull_method_;
+    return s;
 }
 
 void VulkanViewport::set_ssaa(int n) {

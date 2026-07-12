@@ -73,6 +73,8 @@ private:
             case K::Translate:    return translate(n, b);
             case K::Scale:        return scale(n, b);
             case K::RotateY:      return rotate_y(n, b);
+            case K::RotateX:      return rotate_x(n, b);
+            case K::RotateZ:      return rotate_z(n, b);
             case K::TwistY:       return twist_y(n, b);
             case K::BendXY:       return bend_xy(n, b);
             case K::TaperY:       return taper_y(n, b);
@@ -186,22 +188,37 @@ private:
         return go(*n.children[0], t);
     }
     std::string scale(const FRepNode& n, const Box& b) {
-        std::string s = p(n, "s", 1.0f);
-        Box t{ "ival_div(" + b.x + ", vec2(" + s + "))",
-               "ival_div(" + b.y + ", vec2(" + s + "))",
-               "ival_div(" + b.z + ", vec2(" + s + "))" };
+        std::string sx=p(n,"sx",1.0f), sy=p(n,"sy",1.0f), sz=p(n,"sz",1.0f);
+        Box t{ "ival_div(" + b.x + ", vec2(" + sx + "))",
+               "ival_div(" + b.y + ", vec2(" + sy + "))",
+               "ival_div(" + b.z + ", vec2(" + sz + "))" };
         auto child = go(*n.children[0], t);
-        return tmp("vec2(" + child + ".x * " + s + ", " + child + ".y * " + s + ")");
+        // scale distance by the smallest |factor|; ival_mul keeps endpoints ordered
+        std::string mn = "min(abs(" + sx + "), min(abs(" + sy + "), abs(" + sz + ")))";
+        return tmp("ival_mul(" + child + ", vec2(" + mn + "))");
     }
     std::string rotate_y(const FRepNode& n, const Box& b) {
-        // x' = c*x + s*z ; z' = -s*x + c*z, with c,s the cos/sin of the angle.
-        // Constant angle -> constant c,s; the interval product is exact.
-        std::string ang = p(n, "angle", 0.0f);
-        // precompute c,s as scalar consts in the shader
+        std::string ang = p(n, "a", 0.0f);
         auto cs = "cos(" + ang + ")"; auto sn = "sin(" + ang + ")";
         Box t{ "ival_mul(vec2(" + cs + "), " + b.x + ") + ival_mul(vec2(" + sn + "), " + b.z + ")",
                b.y,
                "ival_mul(vec2(" + std::string("-") + sn + "), " + b.x + ") + ival_mul(vec2(" + cs + "), " + b.z + ")" };
+        return go(*n.children[0], t);
+    }
+    std::string rotate_x(const FRepNode& n, const Box& b) {
+        std::string ang = p(n, "a", 0.0f);
+        auto cs = "cos(" + ang + ")"; auto sn = "sin(" + ang + ")";
+        Box t{ b.x,
+               "ival_mul(vec2(" + cs + "), " + b.y + ") + ival_mul(vec2(" + sn + "), " + b.z + ")",
+               "ival_mul(vec2(" + std::string("-") + sn + "), " + b.y + ") + ival_mul(vec2(" + cs + "), " + b.z + ")" };
+        return go(*n.children[0], t);
+    }
+    std::string rotate_z(const FRepNode& n, const Box& b) {
+        std::string ang = p(n, "a", 0.0f);
+        auto cs = "cos(" + ang + ")"; auto sn = "sin(" + ang + ")";
+        Box t{ "ival_mul(vec2(" + cs + "), " + b.x + ") + ival_mul(vec2(" + sn + "), " + b.y + ")",
+               "ival_mul(vec2(" + std::string("-") + sn + "), " + b.x + ") + ival_mul(vec2(" + cs + "), " + b.y + ")",
+               b.z };
         return go(*n.children[0], t);
     }
     std::string twist_y(const FRepNode& n, const Box& b) {

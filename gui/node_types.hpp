@@ -27,7 +27,9 @@ struct NodeParam {
 enum class NodeCategory {
     Primitive,   // Sphere, Box, Plane — green
     Operation,   // Union, Intersection... — blue
-    Transform,   // Translate, Scale, RotateY — orange
+    Transform,   // Translate, Scale, RotateX/Y/Z — orange
+    Deformation, // TwistY, BendXY, TaperY — teal
+    Instance,    // Instance reference — pink
     Output,      // the special output node — purple
 };
 
@@ -44,6 +46,8 @@ struct NodeTypeInfo {
             case NodeCategory::Primitive: return QColor(0x4c, 0xaf, 0x50);
             case NodeCategory::Operation: return QColor(0x21, 0x96, 0xf3);
             case NodeCategory::Transform: return QColor(0xff, 0x98, 0x00);
+            case NodeCategory::Deformation: return QColor(0x00, 0x96, 0x88);
+            case NodeCategory::Instance:  return QColor(0xe0, 0x40, 0x9a);
             case NodeCategory::Output:    return QColor(0x9c, 0x27, 0xb0);
         }
         return Qt::gray;
@@ -80,9 +84,30 @@ inline const std::vector<NodeTypeInfo>& node_catalog() {
             {"ty", 0.0f, -5.0f, 5.0f},
             {"tz", 0.0f, -5.0f, 5.0f} } },
         { "Scale", "Scale", NodeCategory::Transform, 1,
-          { {"s", 1.0f, 0.1f, 5.0f} } },
+          { {"sx", 1.0f, 0.1f, 5.0f},
+            {"sy", 1.0f, 0.1f, 5.0f},
+            {"sz", 1.0f, 0.1f, 5.0f} } },
+        { "RotateX", "Rotate X", NodeCategory::Transform, 1,
+          { {"a", 0.0f, -3.14159f, 3.14159f} } },
         { "RotateY", "Rotate Y", NodeCategory::Transform, 1,
           { {"a", 0.0f, -3.14159f, 3.14159f} } },
+        { "RotateZ", "Rotate Z", NodeCategory::Transform, 1,
+          { {"a", 0.0f, -3.14159f, 3.14159f} } },
+
+        // ── Deformations ──────────────────────────────────────────────────────
+        { "TwistY", "Twist Y", NodeCategory::Deformation, 1,
+          { {"k", 1.0f, -5.0f, 5.0f} } },
+        { "BendXY", "Bend XY", NodeCategory::Deformation, 1,
+          { {"k", 1.0f, -5.0f, 5.0f} } },
+        { "TaperY", "Taper Y", NodeCategory::Deformation, 1,
+          { {"t", 0.5f, 0.05f, 2.0f},
+            {"h", 2.0f, 0.1f, 10.0f} } },
+
+        // ── Instance ──────────────────────────────────────────────────────────
+        // References another object's geometry. It has one input (the shared
+        // target) and no numeric params — the reference is the target's id, set
+        // when the instance is created. Shown so the graph reflects instances.
+        { "Instance", "Instance", NodeCategory::Instance, 1, {} },
     };
     return catalog;
 }

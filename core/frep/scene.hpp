@@ -200,6 +200,22 @@ public:
     void  set_scale(const std::string& id, float s);
     float get_rotation_y(const std::string& id) const;
     float get_scale(const std::string& id) const;
+    // Per-axis rotation gizmo (axis: 0=X, 1=Y, 2=Z). Keeps a canonical
+    // RotateX→RotateY→RotateZ chain so the three axes are independent.
+    void  set_rotation_axis(const std::string& id, int axis, float angle_rad);
+    float get_rotation_axis(const std::string& id, int axis) const;
+    // Per-axis (non-uniform) scale gizmo.
+    void  set_scale_xyz(const std::string& id, float sx, float sy, float sz);
+    void  get_scale_xyz(const std::string& id, float& sx, float& sy, float& sz) const;
+
+    // Set a single parameter of a node (found by node_id) inside an object's
+    // geometry tree, bumping the revision so the render updates. This is a
+    // parameter-only change (topology unchanged), so it can ride the incremental
+    // path when supported. Returns false if the object or node isn't found.
+    bool  set_node_param(const std::string& object_id, const std::string& node_id,
+                         const std::string& param, float value);
+    bool  get_node_param(const std::string& object_id, const std::string& node_id,
+                         const std::string& param, float& out) const;
 
     // ── Accessors ─────────────────────────────────────────────────────────────
     const auto& objects()  const { return objects_; }

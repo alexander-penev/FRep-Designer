@@ -23,6 +23,8 @@
 #include "core/frep/operations.hpp"
 #include "core/frep/transforms.hpp"
 #include "core/frep/deformations.hpp"
+#include "core/frep/instance.hpp"
+#include "core/io/scene_io.hpp"
 #include "core/frep/custom_expr.hpp"
 #include "core/frep/mesh_sdf.hpp"
 #include "core/mesh/marching_cubes.hpp"
@@ -518,6 +520,59 @@ static SceneGraph scene_textured() {
 
 // ── Main ──────────────────────────────────────────────────────────────────
 
+// 11 — Instancing + non-uniform scale + multi-axis rotation. One twisted shape
+// is authored once and instanced across a row (all instances share its geometry,
+// so editing the source would move them all and the emitted GLSL carries the
+// shape once). Behind it: three non-uniformly scaled ellipsoids and a box tilted
+// on all three axes, to exercise RotateX/Y/Z and per-axis Scale together.
+static SceneGraph scene_instances() {
+    SceneGraph s;
+    Material mp; mp.albedo = {0.55f, 0.57f, 0.6f};
+    s.add_object(std::make_shared<PlaneNode>(0, 1, 0, 1.0f, "floor"), mp);
+    const float pi = 3.14159265f;
+
+    // The source shape: a twisted rounded box. Authored once with id "src".
+    Material msrc; msrc.albedo = {0.85f, 0.35f, 0.30f};
+    auto src_geom = std::make_shared<TwistYNode>(
+        std::make_shared<BoxNode>(0.28f, 0.5f, 0.28f, "src_box"), 1.6f, "src");
+    s.add_object(std::make_shared<TranslateNode>(src_geom, -2.6f, 0.0f, 0.0f, "src_t"), msrc);
+
+    // Five instances of "src" marching to the right — same geometry, own places.
+    Material minst; minst.albedo = {0.30f, 0.55f, 0.85f};
+    for (int i = 1; i <= 5; ++i) {
+        auto inst = std::make_shared<InstanceNode>(src_geom, "src_t",
+            "inst" + std::to_string(i));
+        s.add_object(std::make_shared<TranslateNode>(
+            inst, -2.6f + 1.05f * i, 0.0f, 0.0f, "inst_t" + std::to_string(i)), minst);
+    }
+
+    // Back row: three non-uniformly scaled spheres (ellipsoids).
+    Material mell; mell.albedo = {0.9f, 0.75f, 0.25f};
+    auto ell = [&](float sx, float sy, float sz, float x, const char* id) {
+        auto e = std::make_shared<ScaleNode>(
+            std::make_shared<SphereNode>(0.4f, std::string(id) + "s"), sx, sy, sz,
+            std::string(id) + "sc");
+        s.add_object(std::make_shared<TranslateNode>(e, x, 0.6f, -2.2f,
+            std::string(id) + "t"), mell);
+    };
+    ell(2.0f, 0.7f, 0.7f, -2.2f, "e1");
+    ell(0.7f, 2.0f, 0.7f,  0.0f, "e2");
+    ell(0.7f, 0.7f, 2.0f,  2.2f, "e3");
+
+    // A box tilted on all three axes (RotateX∘RotateY∘RotateZ).
+    Material mrot; mrot.albedo = {0.55f, 0.8f, 0.55f};
+    auto tilted = std::make_shared<RotateXNode>(
+        std::make_shared<RotateYNode>(
+            std::make_shared<RotateZNode>(
+                std::make_shared<BoxNode>(0.5f, 0.5f, 0.5f, "tb"), pi/5, "tz"),
+            pi/6, "ty"), pi/7, "tx");
+    s.add_object(std::make_shared<TranslateNode>(tilted, 2.6f, 0.65f, 0.0f, "tt"), mrot);
+
+    // resolve instance references so they render.
+    io::resolve_instances(s, nullptr);
+    return s;
+}
+
 int main(int argc, char** argv) {
     namespace fs = std::filesystem;
     std::string out_dir = (argc >= 2) ? argv[1] : "gallery";
@@ -584,6 +639,9 @@ int main(int argc, char** argv) {
 
     std::printf("\n10_textured_scene\n");
     render_textured(scene_textured(), out_dir + "/10_textured_scene.ppm", 600, 400);
+
+    std::printf("\n11_instances\n");
+    render(scene_instances(), out_dir + "/11_instances.ppm", 1000, 420);
 
     std::printf("\nGallery written to: %s\n", out_dir.c_str());
     return 0;

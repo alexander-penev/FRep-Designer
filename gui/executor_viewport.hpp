@@ -62,6 +62,7 @@ public:
     void set_camera_control_config(const CameraControlConfig& c) override;
     QImage capture_image() override;
     QString status_text() const override;
+    QString metrics_text() const override;
 
     // ── multipath controls (driven by the MainWindow panel) ──────────────────
     // Set which paths are active. Order defines strip order. Empty → CPU_IR.
@@ -131,6 +132,7 @@ private:
     std::vector<QRect>  path_regions_;   // bounding region each path rendered
     std::vector<double> path_pixels_;    // pixels each path rendered this frame
     std::vector<bool>   path_ok_;        // did the path produce pixels
+    std::vector<std::string> path_error_; // first render error per path (empty = none)
 
     std::thread    worker_;
     std::atomic<bool> cancel_{false};

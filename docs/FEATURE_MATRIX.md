@@ -16,12 +16,25 @@ tracing).
 | Union / Intersection / Diff|   ✓    |   ✓    |    ✓     |    ✓    |
 | SmoothUnion                |   ✓    |   ✓    |    ✓     |    ✓    |
 | Negate                     |   ✓    |   ✓    |    ✓     |    ✓    |
-| Translate / Scale / RotateY|   ✓    |   ✓    |    ✓     |    ✓    |
+| Translate                  |   ✓    |   ✓    |    ✓     |    ✓    |
+| Scale (uniform + non-unif.)|   ✓    |   ✓    |    ✓     |    ✓    |
+| RotateX / RotateY / RotateZ|   ✓    |   ✓    |    ✓     |    ✓    |
 | TwistY / TaperY            |   ✓    |   ✓    |    ✓     |    ✓    |
 | BendXY                     |   ✓    |   ✓    |    ✓     |    ✓    |
 | CustomExpr                 |   ✓    |   ✓    |    ✓     |    ✓    |
 | **MeshSDF** (voxel grid)   |   ✓    |   ✓    |    ✓     |  ✓ (1)  |
 | Plugin nodes               |   ✓    |   ✓    |    ✓     |   (2)   |
+| **Instance** (L1: shared reference) | ✓ | ✓ |   ✓     |    ✓    |
+| **Instance** (L2: shared subprogram, memory) | ✓ | ✓ | ✓ |  —  |
+
+## Acceleration & debug (GLSL-emitter features)
+
+| Feature                    | CPU_IR | GPU_IR | GPU_GLSL | GPU_RTX |
+|----------------------------|:------:|:------:|:--------:|:-------:|
+| Tile cull — Lipschitz/Auto-metric | ✓ | ✓ | ✓ | — |
+| Tile cull — Interval              | — | — | ✓ | — |
+| Ray-box clip (scene AABB near/far) | ✓ | ✓ | (1) | — |
+| Debug views (step heatmap, cull span) | — | — | ✓ | — |
 
 ## Materials & shading
 
@@ -49,6 +62,26 @@ tracing).
    lifted `scene_normal`, which uses the emitter's normal (analytic where the
    sub-tree supports it, central-difference otherwise) — same as GPU_GLSL.
 
+4. **Instance — two levels.** *Level 1* is the reference semantics: an
+   InstanceNode shares (does not copy) the target's geometry pointer, so editing
+   the target updates every instance live. Because codegen emits geometry through
+   the virtual `FRepNode::codegen()` and InstanceNode delegates to its target,
+   Level 1 works unchanged on **all four paths**. *Level 2* is the memory
+   optimisation: the shared subtree is emitted **once** as a GLSL function and
+   called, so the emitted code grows with the number of distinct shapes, not the
+   instance count (60% smaller shader at 64 instances). Level 2 lives in the GLSL
+   emitter, so it is **GPU_GLSL-only**; the IR paths still inline each instance
+   (correct, just not deduplicated). Bringing L2 to the IR paths would mean
+   emitting shared LLVM functions in codegen.cpp — future work if the IR paths
+   need the memory win.
+
+5. **Tile cull and debug views** are GLSL-emitter features (the cull block and
+   the step-heatmap / cull-span shading are emitted into the GLSL march). They
+   are **GPU_GLSL-only** by construction. The IR paths have no tile cull; this is
+   a known gap, not a regression. Cull correctness and method selection
+   (Lipschitz L=1 for metric trees, Interval for non-metric, Auto by topology)
+   are covered in PERFORMANCE_TUNING.md.
+
 ## Distributed execution (orthogonal to the four paths)
 
 Distributed render is **implemented and tested**, not a placeholder: `dist::Master`
@@ -74,13 +107,20 @@ the energy/cost axes that decide *which* devices to add.
 
 ## Honest gap summary
 
-- **Real gap:** none — MeshSDF + Texture on GPU_RTX (descriptor plumbing) is
-  done and hardware-confirmed; RT is 17/17.
-- **Untested, likely fine:** plugin nodes on GPU_RTX. The `bend` / `mesh`
-  cross-path parity scenes are now hardware-confirmed on the RTX 2080 (mesh at
-  the floor), not just CPU.
-- **Done, was validation:** multi-machine LAN distributed run — a real
-  two-machine render completed (130 tiles, 16/114 split across a local + remote
-  worker).
+- **Real gap (IR paths):** the *interval* tile cull is GPU_GLSL-only (it needs an
+  IR interval emitter — the CPU/GLSL interval evaluators exist, but there is no
+  LLVM-IR interval codegen yet). The *Lipschitz* tile cull now runs on CpuIr and
+  GpuIr (for metric trees / Auto-on-metric, L=1 sound): a tile that misses the
+  geometry becomes an instant miss (~3.4x on a miss-tile), while tiles over the
+  surface are unchanged (correct — there's real work there). Combined with the
+  ray-box clip (4.48.0, empty space outside the scene box) the IR paths now cull
+  both the outside-box space and whole empty tiles; per-slab occupancy for
+  non-metric trees inside the box still needs the interval emitter. Note (1): the
+  GLSL path skips the ray-box clip because its tile cull already bounds the march
+  more tightly.
+- **Done, hardware-confirmed:** MeshSDF + Texture on GPU_RTX; RT is 17/17.
+- **Untested, likely fine:** plugin nodes on GPU_RTX.
+- **Done, was validation:** multi-machine LAN distributed run.
 - **Optimization, not correctness:** per-frame RT setup amortization; the GLSL
-  mesh double-emit (mesh_count=2); weighted distributed scheduler.
+  mesh double-emit (mesh_count=2); weighted distributed scheduler; extending
+  instancing Level 2 and tile cull to the IR paths.

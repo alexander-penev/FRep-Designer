@@ -335,12 +335,30 @@ struct NodeDeserializer {
         }
         if (type == "Scale") {
             if (kids.size() != 1) throw std::runtime_error("Scale needs 1 child");
+            // Non-uniform if sx/sy/sz present; else fall back to a uniform "s"
+            // (old files, and the uniform GUI path).
+            if (params.count("sx") || params.count("sy") || params.count("sz")) {
+                float s = param_or(params, "s", 1.0f);
+                return std::make_shared<ScaleNode>(
+                    kids[0], param_or(params, "sx", s),
+                    param_or(params, "sy", s), param_or(params, "sz", s), id);
+            }
             return std::make_shared<ScaleNode>(
                 kids[0], param_or(params, "s", 1.0f), id);
         }
         if (type == "RotateY") {
             if (kids.size() != 1) throw std::runtime_error("RotateY needs 1 child");
             return std::make_shared<RotateYNode>(
+                kids[0], param_or(params, "a", 0.0f), id);
+        }
+        if (type == "RotateX") {
+            if (kids.size() != 1) throw std::runtime_error("RotateX needs 1 child");
+            return std::make_shared<RotateXNode>(
+                kids[0], param_or(params, "a", 0.0f), id);
+        }
+        if (type == "RotateZ") {
+            if (kids.size() != 1) throw std::runtime_error("RotateZ needs 1 child");
+            return std::make_shared<RotateZNode>(
                 kids[0], param_or(params, "a", 0.0f), id);
         }
 

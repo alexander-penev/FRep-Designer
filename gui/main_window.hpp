@@ -98,6 +98,7 @@ private:
     void build_toolbar();
     QWidget* build_side_panel();
     QWidget* build_lights_panel();
+    QWidget* build_plugins_panel();      // registered plugin list (own tab)
     QWidget* build_lan_panel();          // distributed (LAN) render controls
 
     // LAN tab state. The master renders into the main viewport via a
@@ -216,6 +217,8 @@ private:
     // the same look on both paths.
     TracerConfig             render_config_;
     bool                     show_metrics_overlay_ = false;
+    QLabel*                  metrics_label_ = nullptr;   // on-viewport HUD (task 2)
+    QTimer*                  metrics_timer_ = nullptr;   // refreshes the HUD text
 
     // Universal viewport handle: works for both offscreen and
     // real-time paths. Signal connections (render_completed,

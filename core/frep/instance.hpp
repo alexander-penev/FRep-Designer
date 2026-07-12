@@ -51,14 +51,28 @@ public:
     // ── delegation: an instance evaluates exactly as its target ──────────────
     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
         if (!resolved()) return c.fc(1e30f);           // dangling -> empty (far)
-        return children[0]->codegen(c, x, y, z);
+        // Level 2: if the context provides a shared-function callback, emit a
+        // call to the target's shared subprogram instead of inlining it.
+        if (c.instance_call) {
+            if (llvm::Value* v = c.instance_call(children[0].get(), x, y, z))
+                return v;
+        }
+        return children[0]->codegen(c, x, y, z);       // Level 1 inline fallback
     }
     float eval(float x, float y, float z) const override {
         return resolved() ? children[0]->eval(x, y, z) : 1e30f;
     }
     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override {
-        return resolved() ? children[0]->codegen_grad(c, x, y, z)
-                          : FRepNode::codegen_grad(c, x, y, z);
+        if (!resolved()) return FRepNode::codegen_grad(c, x, y, z);
+        // Level 2: shared gradient subprogram if the context provides it.
+        if (c.instance_grad_call) {
+            llvm::Value* ov = nullptr; llvm::Value* od = nullptr;
+            if (c.instance_grad_call(children[0].get(),
+                                     x.val, x.dot, y.val, y.dot, z.val, z.dot,
+                                     ov, od))
+                return DualVal{ov, od};
+        }
+        return children[0]->codegen_grad(c, x, y, z);   // Level 1 inline fallback
     }
     AABB aabb() const override {
         return resolved() ? children[0]->aabb() : AABB::infinite();

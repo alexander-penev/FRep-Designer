@@ -39,6 +39,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace frep::gpu {
 
@@ -124,6 +125,28 @@ private:
         std::unordered_map<const void*, int> node_to_index;
     };
 
+    // Level 2 instancing: shared subprograms. A geometry subtree referenced by
+    // one or more InstanceNodes (and by its original object) is emitted as a GLSL
+    // function ONCE and called, instead of inlined at each use — so the emitted
+    // code, and the cost of recompiling it, grow with the number of *distinct*
+    // shapes, not the total instance count (the point of instancing for large
+    // repetitive models like a detector geometry). Dedup is by the shared node
+    // pointer: the InstanceNode's children[0] is the very same pointer as the
+    // target object's geometry root, so both map to the same function.
+    struct InstanceFuncs {
+        std::ostringstream defs;                       // emitted SDF function definitions
+        std::unordered_map<const void*, std::string> ptr_to_fn;  // target root -> SDF fn name
+        std::ostringstream grad_defs;                  // dual-number AD function defs
+        std::unordered_map<const void*, std::string> ptr_to_grad_fn;  // target -> grad fn name
+        int next_fn = 0;
+        int next_grad_fn = 0;
+        // Which target roots are worth functionalising: a subtree only becomes a
+        // function if at least one InstanceNode references it (a plain object with
+        // no instances stays inlined, avoiding a needless call). Filled by a
+        // pre-pass over the scene before emit.
+        std::unordered_set<const void*> shared_targets;
+    };
+
     // Per-call state held on the stack during emit_node().
     struct Ctx {
         std::ostringstream sdf_body;
@@ -132,6 +155,7 @@ private:
         int                next_var = 0;
         int                next_dvar = 0;
         MeshAccum*         mesh_accum = nullptr;  // borrowed
+        InstanceFuncs*     inst_funcs = nullptr;  // borrowed (Level 2 instancing)
         // Shared slot authority (borrowed). When set, a parameter the policy
         // placed Runtime is read from P.v[slot]; otherwise it is baked.
         const ParamBindingTable* bindings = nullptr;
@@ -149,6 +173,19 @@ private:
     // node emitters route parameter access through this so the same placement
     // governs both backends and the runtime-buffer layout matches the CPU path.
     static std::string pval(Ctx& c, const FRepNode& n, const char* name);
+
+    // Level 2 instancing: emit the given target subtree as a GLSL function into
+    // c.inst_funcs->defs (once, deduplicated by node pointer) and return its
+    // name, e.g. "_inst_fn_0". Called by the Instance dispatch and by the object
+    // loop when an object is itself an instance target, so both use one body.
+    static std::string emit_instance_fn(Ctx& c, const FRepNode& target);
+
+    // Dual-number AD twin of emit_instance_fn: emit the target as
+    // `Dual _inst_grad_fn_N(vec3 p)` once and return its name. Lets the gradient
+    // (normal) body share one body per shape instead of inlining the dual code
+    // at every instance — the gradient body is the largest per-object emission,
+    // so this is where most of the instancing memory saving comes from.
+    static std::string emit_instance_grad_fn(Ctx& c, const FRepNode& target);
 
     // Recursive emitter for the geometry of a single object. Returns the
     // variable name holding the SDF value at (x, y, z), or an error.
@@ -179,6 +216,10 @@ private:
     static std::string emit_scale    (Ctx& c, const FRepNode& n,
         const std::string& x, const std::string& y, const std::string& z);
     static std::string emit_rotate_y (Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    static std::string emit_rotate_x (Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    static std::string emit_rotate_z (Ctx& c, const FRepNode& n,
         const std::string& x, const std::string& y, const std::string& z);
 
     static std::string emit_twist_y  (Ctx& c, const FRepNode& n,

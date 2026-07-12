@@ -27,7 +27,7 @@ enum class NodeKind {
     Sphere, Box, Plane,
     Union, Intersection, Difference, SmoothUnion,
     Negate,
-    Translate, Scale, RotateY,
+    Translate, Scale, RotateY, RotateX, RotateZ,
     TwistY, BendXY, TaperY,
     Scene,
     Instance,
@@ -74,6 +74,28 @@ struct CgCtx {
                       const std::string& param_name,
                       float default_value,
                       int param_class)> slot_for_param;
+
+    // ── Instancing Level 2 (shared subprograms) ─────────────────────────────
+    // When set, an InstanceNode emits a call to a shared LLVM function for its
+    // target's geometry instead of inlining the target subtree. The callback
+    // returns (creating on first use, memoised by target pointer) the function
+    // `float f(x, y, z, params)` computing the target's SDF. When null, an
+    // InstanceNode falls back to inlining its target (Level 1). This is the IR
+    // twin of the GLSL emitter's _inst_fn_N sharing.
+    std::function<llvm::Value*(const class FRepNode* target,
+                               llvm::Value* x, llvm::Value* y, llvm::Value* z)>
+        instance_call;
+
+    // Level 2 for the AD (dual-number) path: an InstanceNode emits a call to a
+    // shared gradient function taking the incoming duals and returning the
+    // target's (value, derivative). Null -> inline (Level 1). Returns the two
+    // components via the out-params; the return value is non-null on success.
+    std::function<bool(const class FRepNode* target,
+                       llvm::Value* xv, llvm::Value* xd,
+                       llvm::Value* yv, llvm::Value* yd,
+                       llvm::Value* zv, llvm::Value* zd,
+                       llvm::Value*& out_val, llvm::Value*& out_dot)>
+        instance_grad_call;
 
     // Returns an LLVM Value* for the parameter — either a constant
     // (Constant mode, or when no slot was assigned) or a load from
@@ -315,12 +337,19 @@ inline bool node_is_unit_lipschitz(const FRepNode& n) {
         case NodeKind::Negate:
         case NodeKind::Translate:
         case NodeKind::RotateY:
+        case NodeKind::RotateX:
+        case NodeKind::RotateZ:
         case NodeKind::Scene:
         case NodeKind::Instance:      // metric-ness follows the shared target
             break;                       // gradient-preserving
-        case NodeKind::Scale: {          // sound only for |s| >= 1 (never amplifies)
-            auto it = n.params.find("s");
-            if (it == n.params.end() || it->second < 1.0f) return false;
+        case NodeKind::Scale: {          // sound only if every |factor| >= 1 (never amplifies)
+            auto ax = n.params.find("sx");
+            auto ay = n.params.find("sy");
+            auto az = n.params.find("sz");
+            float sx = ax==n.params.end()?1.0f:ax->second;
+            float sy = ay==n.params.end()?1.0f:ay->second;
+            float sz = az==n.params.end()?1.0f:az->second;
+            if (std::abs(sx) < 1.0f || std::abs(sy) < 1.0f || std::abs(sz) < 1.0f) return false;
             break;
         }
         default:                         // TwistY/BendXY/TaperY/Plugin/CustomExpr/...
@@ -342,6 +371,16 @@ inline int node_count(const FRepNode& n) {
     for (const auto& c : n.children)
         if (c) total += node_count(*c);
     return total;
+}
+
+// Find a node by its id anywhere in a subtree (depth-first). Returns nullptr if
+// no node has that id. Used by the property grid to locate the node whose
+// parameter is being edited.
+inline FRepNode* find_node_by_id(FRepNode& root, const std::string& id) {
+    if (root.id == id) return &root;
+    for (auto& c : root.children)
+        if (c) if (FRepNode* r = find_node_by_id(*c, id)) return r;
+    return nullptr;
 }
 
 } // namespace frep

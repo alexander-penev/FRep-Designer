@@ -8,6 +8,8 @@
 
 #include <QAbstractItemView>
 #include <QColorDialog>
+#include <QTreeWidget>
+#include <QTreeWidgetItem>
 #include <QMessageBox>
 #include <QSet>
 #include <QCheckBox>
@@ -117,36 +119,78 @@ SceneInspector::SceneInspector(SceneGraph* scene, QWidget* parent)
     snap_wrap->setLayout(snap_row);
     form->addRow("Grid:", snap_wrap);
 
-    // ── Rotation (Y) gizmo ────────────────────────────────────────────────────
-    // Single-axis (Y) rotation in degrees, committed as a
-    // SetRotationCommand. Stored internally in radians; the spinbox shows
-    // degrees for usability. Single-selection only, like translation.
-    sp_rot_y_ = new QDoubleSpinBox;
-    sp_rot_y_->setRange(-360.0, 360.0);
-    sp_rot_y_->setDecimals(1);
-    sp_rot_y_->setSingleStep(5.0);
-    sp_rot_y_->setSuffix("\u00B0");          // degree sign
-    sp_rot_y_->setWrapping(true);            // 360° wraps to -360°
-    sp_rot_y_->setEnabled(false);
-    connect(sp_rot_y_, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-            this, &SceneInspector::on_rotation_changed);
-    form->addRow("Rotation Y:", sp_rot_y_);
+    // ── Rotation gizmo (X / Y / Z) ────────────────────────────────────────────
+    // Three-axis rotation in degrees, committed as SetRotationAxisCommand. Stored
+    // internally in radians (canonical RotateX→Y→Z chain); shown in degrees.
+    // Single-selection only, like translation.
+    auto mk_rot_sp = [this]() {
+        auto* sp = new QDoubleSpinBox;
+        sp->setRange(-360.0, 360.0);
+        sp->setDecimals(1);
+        sp->setSingleStep(5.0);
+        sp->setSuffix("\u00B0");
+        sp->setWrapping(true);
+        sp->setEnabled(false);
+        connect(sp, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                this, &SceneInspector::on_rotation_changed);
+        return sp;
+    };
+    sp_rot_x_ = mk_rot_sp();
+    sp_rot_y_ = mk_rot_sp();   // kept name; existing refresh/handlers use it
+    sp_rot_z_ = mk_rot_sp();
+    {
+        auto* row = new QHBoxLayout;
+        row->addWidget(new QLabel("X")); row->addWidget(sp_rot_x_);
+        row->addWidget(new QLabel("Y")); row->addWidget(sp_rot_y_);
+        row->addWidget(new QLabel("Z")); row->addWidget(sp_rot_z_);
+        form->addRow("Rotation:", row);
+    }
 
-    // ── Uniform scale gizmo ───────────────────────────────────────────────────
-    // Uniform scale factor, committed as a SetScaleCommand. Range stays
-    // strictly positive (a zero/negative uniform scale collapses or
-    // inverts the SDF). Single-selection only.
-    sp_scale_ = new QDoubleSpinBox;
-    sp_scale_->setRange(0.05, 100.0);
-    sp_scale_->setDecimals(3);
-    sp_scale_->setSingleStep(0.1);
-    sp_scale_->setValue(1.0);
-    sp_scale_->setEnabled(false);
-    connect(sp_scale_, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-            this, &SceneInspector::on_scale_changed);
-    form->addRow("Scale:", sp_scale_);
+    // ── Per-axis scale gizmo ──────────────────────────────────────────────────
+    // Three factors (X/Y/Z). Equal values = uniform scale; unequal = a
+    // non-uniform (ellipsoidal) scale. Each stays strictly positive. Committed
+    // as a SetScaleCommand. Single-selection only.
+    auto mk_scale_sp = [this]() {
+        auto* sp = new QDoubleSpinBox;
+        sp->setRange(0.05, 100.0);
+        sp->setDecimals(3);
+        sp->setSingleStep(0.1);
+        sp->setValue(1.0);
+        sp->setEnabled(false);
+        connect(sp, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                this, &SceneInspector::on_scale_changed);
+        return sp;
+    };
+    sp_scale_   = mk_scale_sp();   // X (kept name for the existing handler)
+    sp_scale_y_ = mk_scale_sp();
+    sp_scale_z_ = mk_scale_sp();
+    {
+        auto* row = new QHBoxLayout;
+        row->addWidget(new QLabel("X")); row->addWidget(sp_scale_);
+        row->addWidget(new QLabel("Y")); row->addWidget(sp_scale_y_);
+        row->addWidget(new QLabel("Z")); row->addWidget(sp_scale_z_);
+        form->addRow("Scale:", row);
+    }
 
     layout->addLayout(form);
+
+    // ── Property grid ─────────────────────────────────────────────────────────
+    // A tree of the selected object's geometry nodes and their numeric
+    // parameters. The value column is editable; committing an edit applies an
+    // undoable SetParamCommand (parameter-only, so it can ride the incremental
+    // recompile). Rebuilt on every selection change and scene edit.
+    layout->addWidget(new QLabel("Properties:"));
+    prop_tree_ = new QTreeWidget;
+    prop_tree_->setColumnCount(2);
+    prop_tree_->setHeaderLabels({"Node / parameter", "Value"});
+    prop_tree_->setRootIsDecorated(true);
+    prop_tree_->setAlternatingRowColors(true);
+    prop_tree_->setEditTriggers(QAbstractItemView::DoubleClicked |
+                                QAbstractItemView::SelectedClicked);
+    prop_tree_->setMinimumHeight(160);
+    connect(prop_tree_, &QTreeWidget::itemChanged,
+            this, &SceneInspector::on_property_edited);
+    layout->addWidget(prop_tree_, 1);
 
     lbl_info_ = new QLabel;
     lbl_info_->setWordWrap(true);
@@ -283,7 +327,11 @@ void SceneInspector::on_selection_changed() {
     cb_snap_->setEnabled(single);
     sp_snap_->setEnabled(single && cb_snap_->isChecked());
     sp_rot_y_->setEnabled(single);
+    sp_rot_x_->setEnabled(single);
+    sp_rot_z_->setEnabled(single);
     sp_scale_->setEnabled(single);
+    sp_scale_y_->setEnabled(single);
+    sp_scale_z_->setEnabled(single);
 
     // Notify listeners of the new selection — the node graph view uses
     // ids[0] (the primary) for its tree view; multi-edit consumers
@@ -292,6 +340,7 @@ void SceneInspector::on_selection_changed() {
 
     if (!has) {
         lbl_info_->clear();
+        populate_properties(QString());   // clear the property grid
         return;
     }
 
@@ -351,14 +400,25 @@ void SceneInspector::on_selection_changed() {
         sp_ty_->setValue(t[1]);
         sp_tz_->setValue(t[2]);
     }
-    // Rotation (radians → degrees for display) and uniform scale.
+    // Rotation (radians → degrees for display) and per-axis scale.
     {
-        float rad = scene_->get_rotation_y(primary.toStdString());
-        float deg = rad * 180.0f / 3.14159265358979f;
-        QSignalBlocker br(sp_rot_y_), bs(sp_scale_);
-        sp_rot_y_->setValue(deg);
-        sp_scale_->setValue(scene_->get_scale(primary.toStdString()));
+        const float r2d = 180.0f / 3.14159265358979f;
+        float ax = scene_->get_rotation_axis(primary.toStdString(), 0) * r2d;
+        float ay = scene_->get_rotation_axis(primary.toStdString(), 1) * r2d;
+        float az = scene_->get_rotation_axis(primary.toStdString(), 2) * r2d;
+        float sx, sy, sz;
+        scene_->get_scale_xyz(primary.toStdString(), sx, sy, sz);
+        QSignalBlocker brx(sp_rot_x_), bry(sp_rot_y_), brz(sp_rot_z_),
+                       bs(sp_scale_), bsy(sp_scale_y_), bsz(sp_scale_z_);
+        sp_rot_x_->setValue(ax);
+        sp_rot_y_->setValue(ay);
+        sp_rot_z_->setValue(az);
+        sp_scale_->setValue(sx);
+        sp_scale_y_->setValue(sy);
+        sp_scale_z_->setValue(sz);
     }
+    // Property grid for the primary selection (empty for multi/none selection).
+    populate_properties(single ? primary : QString());
 }
 
 void SceneInspector::on_transform_changed() {
@@ -399,13 +459,84 @@ void SceneInspector::on_rotation_changed() {
     QStringList ids = selected_ids();
     if (ids.size() != 1) return;
     std::string id = ids.first().toStdString();
-    // UI is in degrees; the scene stores radians.
-    float rad = static_cast<float>(sp_rot_y_->value()) * 3.14159265358979f / 180.0f;
+    // UI is in degrees; the scene stores radians. Commit each axis whose value
+    // differs from the scene's current angle, so a single spinbox edit produces
+    // one undo entry rather than three.
+    const float d2r = 3.14159265358979f / 180.0f;
+    struct { QDoubleSpinBox* sp; int axis; } axes[] = {
+        { sp_rot_x_, 0 }, { sp_rot_y_, 1 }, { sp_rot_z_, 2 } };
+    for (auto& a : axes) {
+        float want = static_cast<float>(a.sp->value()) * d2r;
+        float have = scene_->get_rotation_axis(id, a.axis);
+        if (std::abs(want - have) < 1e-6f) continue;
+        if (undo_) {
+            undo_->push_apply(std::make_unique<undo::SetRotationAxisCommand>(
+                *scene_, id, a.axis, want));
+        } else {
+            scene_->set_rotation_axis(id, a.axis, want);
+        }
+    }
+    Q_EMIT scene_changed();
+}
+
+// Roles used to stash the (node_id, param_name) an editable value row targets.
+namespace { constexpr int RoleNodeId = Qt::UserRole + 1;
+            constexpr int RoleParam  = Qt::UserRole + 2; }
+
+// Recursively add a geometry node (and its children) to the property tree. Each
+// node becomes a top-level/child item labelled "type (id)", with one editable
+// child row per numeric parameter.
+static void add_node_item(QTreeWidgetItem* parent, const frep::FRepNode& n) {
+    auto* item = new QTreeWidgetItem(parent);
+    item->setText(0, QString("%1 (%2)")
+        .arg(QString::fromLatin1(n.type_name()))
+        .arg(QString::fromStdString(n.id)));
+    item->setFirstColumnSpanned(true);
+    std::vector<std::string> keys;
+    for (const auto& [k, v] : n.params) keys.push_back(k);
+    std::sort(keys.begin(), keys.end());
+    for (const auto& k : keys) {
+        auto* pr = new QTreeWidgetItem(item);
+        pr->setText(0, QString::fromStdString(k));
+        pr->setText(1, QString::number(n.params.at(k), 'g', 6));
+        pr->setData(0, RoleNodeId, QString::fromStdString(n.id));
+        pr->setData(0, RoleParam,  QString::fromStdString(k));
+        pr->setFlags(pr->flags() | Qt::ItemIsEditable);
+    }
+    for (const auto& c : n.children)
+        if (c) add_node_item(item, *c);
+}
+
+void SceneInspector::populate_properties(const QString& object_id) {
+    if (!prop_tree_) return;
+    building_props_ = true;
+    prop_tree_->clear();
+    const SceneObject* obj = object_id.isEmpty()
+        ? nullptr : scene_->find_object(object_id.toStdString());
+    if (obj && obj->geometry) {
+        add_node_item(prop_tree_->invisibleRootItem(), *obj->geometry);
+        prop_tree_->expandAll();
+        prop_tree_->resizeColumnToContents(0);
+    }
+    building_props_ = false;
+}
+
+void SceneInspector::on_property_edited(QTreeWidgetItem* item, int column) {
+    if (building_props_ || !item || column != 1) return;
+    const QString node_id = item->data(0, RoleNodeId).toString();
+    const QString param   = item->data(0, RoleParam).toString();
+    if (node_id.isEmpty() || param.isEmpty()) return;   // not a value row
+    bool ok = false;
+    float value = item->text(1).toFloat(&ok);
+    if (!ok) { populate_properties(selected_ids().value(0)); return; }  // revert bad input
+    QStringList sel = selected_ids();
+    if (sel.isEmpty()) return;
+    const std::string obj = sel.first().toStdString();
     if (undo_) {
-        undo_->push_apply(
-            std::make_unique<undo::SetRotationCommand>(*scene_, id, rad));
+        undo_->push_apply(std::make_unique<undo::SetParamCommand>(
+            *scene_, obj, node_id.toStdString(), param.toStdString(), value));
     } else {
-        scene_->set_rotation_y(id, rad);
+        scene_->set_node_param(obj, node_id.toStdString(), param.toStdString(), value);
     }
     Q_EMIT scene_changed();
 }
@@ -414,12 +545,14 @@ void SceneInspector::on_scale_changed() {
     QStringList ids = selected_ids();
     if (ids.size() != 1) return;
     std::string id = ids.first().toStdString();
-    float s = static_cast<float>(sp_scale_->value());
+    float sx = static_cast<float>(sp_scale_->value());
+    float sy = static_cast<float>(sp_scale_y_->value());
+    float sz = static_cast<float>(sp_scale_z_->value());
     if (undo_) {
         undo_->push_apply(
-            std::make_unique<undo::SetScaleCommand>(*scene_, id, s));
+            std::make_unique<undo::SetScaleXYZCommand>(*scene_, id, sx, sy, sz));
     } else {
-        scene_->set_scale(id, s);
+        scene_->set_scale_xyz(id, sx, sy, sz);
     }
     Q_EMIT scene_changed();
 }
