@@ -41,7 +41,13 @@ std::string lift_shared_region(const std::string& comp_src,
     std::size_t main_pos = comp_src.find("void main()");
     std::size_t start = comp_src.find("float scene_sdf");
     for (const char* helper : {"float sample_mesh_", "vec3 _unpack_rgb",
-                               "vec3 sample_texture", "float sample_texture"}) {
+                               "vec3 sample_texture", "float sample_texture",
+                               // Instancing Level 2: the shared _inst_fn_N /
+                               // _inst_grad_fn_N subprograms are emitted before
+                               // scene_sdf and called by it, so the lift must
+                               // start at the earliest of them or the RT shaders
+                               // reference undefined instance functions.
+                               "float _inst_fn_", "Dual _inst_grad_fn_"}) {
         std::size_t h = comp_src.find(helper);
         if (h != std::string::npos && h < start) start = h;
     }
@@ -83,8 +89,27 @@ inline std::string emit_intersection(const char* hdr, const std::string& push,
       << "    vec3 ro = gl_WorldRayOriginEXT;\n"
       << "    vec3 rd = gl_WorldRayDirectionEXT;\n"
       << "    float t = max(gl_RayTminEXT, 0.001);\n"
-      << "    float tmax = min(gl_RayTmaxEXT, " << cfg.max_dist << ");\n"
-      << "    bool hit = false; float last_d = 1e30; vec3 p = ro;\n"
+      << "    float tmax = min(gl_RayTmaxEXT, " << cfg.max_dist << ");\n";
+    // Interval pre-skip (the RTX analog of the compute path's tile cull): bound
+    // the field over the AABB of this ray's [t,tmax] segment; if the interval
+    // doesn't straddle 0 the surface can't be in this segment, so skip the whole
+    // sphere-trace. Emitted only when interval culling is on and sdf_ival was
+    // lifted into `shared`. The hardware BVH already does broad-phase between
+    // objects; this trims empty space *within* an object's AABB.
+    const bool interval_on = cfg.cull_slabs > 0 &&
+        (cfg.cull_method == TracerConfig::CullMethod::Interval ||
+         cfg.cull_method == TracerConfig::CullMethod::Auto);
+    if (interval_on && shared.find("sdf_ival") != std::string::npos) {
+        s << "    {\n"
+          << "        vec3 pa = ro + rd * t;\n"
+          << "        vec3 pb = ro + rd * tmax;\n"
+          << "        vec3 lo = min(pa, pb);\n"
+          << "        vec3 hi = max(pa, pb);\n"
+          << "        vec2 fi = sdf_ival(lo, hi);\n"
+          << "        if (fi.x > 0.0 || fi.y < 0.0) return;   // segment can't contain the surface\n"
+          << "    }\n";
+    }
+    s << "    bool hit = false; float last_d = 1e30; vec3 p = ro;\n"
       << "    float step_len = 0.0; float omega = " << cfg.over_relax << ";\n"
       << "    for (int i = 0; i < " << cfg.max_steps << "; ++i) {\n"
       << "        if (t > tmax) break;\n"
