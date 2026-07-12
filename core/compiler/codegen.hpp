@@ -73,6 +73,22 @@ struct TracerConfig {
     enum class DebugView { Off, StepHeatmap, CullSpan };
     DebugView debug_view = DebugView::Off;
 
+    // Level 2 instancing: emit each instanced geometry as a shared GLSL function
+    // called by the original and its instances, instead of inlining a copy at
+    // each use. Shrinks the emitted code (and its recompile cost) for models with
+    // many repeated shapes. On by default; can be turned off to force inlining
+    // (Level 1), e.g. to trade code size for avoiding the function-call overhead
+    // or the sub-pixel silhouette FP differences inlining vs a call can produce.
+    bool instance_shared_subprograms = true;
+
+    // Ray-box near/far clip for the IR raymarch paths (CpuIr/GpuIr). When on and
+    // the scene is bounded, camera rays are clipped to the scene AABB before
+    // marching, skipping empty space before/after the scene. The GLSL path has
+    // its own richer tile cull; this is the IR-path equivalent for the common
+    // "small object in a large view" case. Off falls back to marching from the
+    // near plane to max_dist.
+    bool bbox_clip = true;
+
     // Future work: when true and cull_method is Auto, the GPU executor selects
     // between Lipschitz and Interval by *timing* a few frames of each rather than
     // by topology (see the probe note in compile_sdf.hpp). Off by default — the
@@ -336,6 +352,11 @@ private:
     std::vector<ParamBinding>                          param_bindings_;
     std::unordered_map<std::string, int>               param_slot_by_key_;
     std::vector<std::uint8_t>                          texture_pixels_;
+    // Instancing Level 2: shared LLVM function per instance target, memoised by
+    // target node pointer so N instances of one shape emit one function called N
+    // times instead of N inline copies. Reset per module emission.
+    std::unordered_map<const FRepNode*, llvm::Function*> instance_fn_by_target_;
+    std::unordered_map<const FRepNode*, llvm::Function*> instance_grad_fn_by_target_;
     // Compile policy: decides per-parameter constant vs runtime placement.
     // When null, every parameter that reaches acquire_param_slot gets a
     // runtime slot (the previous all-incremental behaviour). Set via
@@ -354,6 +375,26 @@ private:
                            const std::string& param_name,
                            float default_value,
                            int param_class = 0);
+
+    // Instancing Level 2: return a CreateCall to the target's shared SDF
+    // function, creating that function on first use (memoised by target
+    // pointer). `caller` is the builder emitting the call site; `params` is the
+    // params buffer threaded through so the shared body can read runtime params.
+    llvm::Value* acquire_instance_fn(const FRepNode* target,
+                                     llvm::IRBuilder<>& caller,
+                                     llvm::Value* x, llvm::Value* y, llvm::Value* z,
+                                     llvm::Value* params);
+
+    // Level 2 for the AD path: shared gradient function. Fills out_val/out_dot
+    // via a call to the target's shared inst_grad function (created on first
+    // use). Returns true on success.
+    bool acquire_instance_grad_fn(const FRepNode* target,
+                                  llvm::IRBuilder<>& caller,
+                                  llvm::Value* xv, llvm::Value* xd,
+                                  llvm::Value* yv, llvm::Value* yd,
+                                  llvm::Value* zv, llvm::Value* zd,
+                                  llvm::Value* params,
+                                  llvm::Value*& out_val, llvm::Value*& out_dot);
 
     // Types
     llvm::Type*  f32()  { return llvm::Type::getFloatTy(ctx_); }

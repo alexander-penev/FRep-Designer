@@ -134,6 +134,7 @@ public:
     void     set_camera_control_config(const CameraControlConfig& c) override;
     QImage   capture_image() override;
     QString  status_text() const override { return status_; }
+    QString  metrics_text() const override;
 
     // Status message — populated during initialization, useful for the
     // GUI status bar to display "Real-time GPU viewport active" or
@@ -147,6 +148,8 @@ private:
     QWidget*          container_ = nullptr;  // owned via Qt parent-tree
     FRepVulkanWindow* window_    = nullptr;  // weak ref (Qt-owned), used for config forwarding
     QString  status_;
+    QString  cull_method_;   // last-configured cull method, for the metrics HUD
+    int      last_gpu_ms_ = -1;   // most recent GPU frame time (timestamp query)
 };
 
 } // namespace frep::gui

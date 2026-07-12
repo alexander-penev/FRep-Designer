@@ -82,18 +82,22 @@ FRepNode::DualVal TranslateNode::codegen_grad(CgCtx& c, DualVal x, DualVal y, Du
 // Here p/s means: val/s, dot/s. Then the result is multiplied by s,
 // which leaves dot unchanged again (s * dot/s = dot). Correct.
 FRepNode::DualVal ScaleNode::codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const {
-    // For incremental mode `s` is a runtime value, so we must compute
-    // 1/s in IR (FDiv 1, s) — losing the constant-fold of 1/s for free.
-    // For Constant mode the path is unchanged: c.param_value() returns
-    // a literal and FDiv 1.0, literal folds away.
-    auto s_v = c.param_value(id, "s", params.at("s"));
-    auto inv = c.b.CreateFDiv(c.fc(1.0f), s_v);
-    DualVal xs{c.b.CreateFMul(x.val, inv), c.b.CreateFMul(x.dot, inv)};
-    DualVal ys{c.b.CreateFMul(y.val, inv), c.b.CreateFMul(y.dot, inv)};
-    DualVal zs{c.b.CreateFMul(z.val, inv), c.b.CreateFMul(z.dot, inv)};
+    // Non-uniform: divide each axis by its own factor, then multiply the result
+    // by the smallest factor (conservative Lipschitz correction, matching the
+    // scalar codegen). In Constant mode the factors fold to literals.
+    auto sx = c.param_value(id, "sx", params.at("sx"));
+    auto sy = c.param_value(id, "sy", params.at("sy"));
+    auto sz = c.param_value(id, "sz", params.at("sz"));
+    auto ix = c.b.CreateFDiv(c.fc(1.0f), sx);
+    auto iy = c.b.CreateFDiv(c.fc(1.0f), sy);
+    auto iz = c.b.CreateFDiv(c.fc(1.0f), sz);
+    DualVal xs{c.b.CreateFMul(x.val, ix), c.b.CreateFMul(x.dot, ix)};
+    DualVal ys{c.b.CreateFMul(y.val, iy), c.b.CreateFMul(y.dot, iy)};
+    DualVal zs{c.b.CreateFMul(z.val, iz), c.b.CreateFMul(z.dot, iz)};
     auto inner = children[0]->codegen_grad(c, xs, ys, zs);
-    // result = inner * s  →  val*s, dot*s
-    return ai::mul_s(c, inner, s_v);
+    auto mn = frep::llvm_compat::binary_intrinsic(c.b, llvm::Intrinsic::minnum, sx, sy);
+    mn = frep::llvm_compat::binary_intrinsic(c.b, llvm::Intrinsic::minnum, mn, sz);
+    return ai::mul_s(c, inner, mn);
 }
 
 // ── RotateY ─────────────────────────────────────────────────────────────────
@@ -116,6 +120,38 @@ FRepNode::DualVal RotateYNode::codegen_grad(CgCtx& c, DualVal x, DualVal y, Dual
         b.CreateFSub(b.CreateFMul(ca, z.dot), b.CreateFMul(sa, x.dot))
     };
     return children[0]->codegen_grad(c, xr, y, zr);
+}
+
+FRepNode::DualVal RotateXNode::codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const {
+    auto a_v = c.param_value(id, "a", params.at("a"));
+    auto ca = frep::llvm_compat::unary_intrinsic(c.b, llvm::Intrinsic::cos, a_v);
+    auto sa = frep::llvm_compat::unary_intrinsic(c.b, llvm::Intrinsic::sin, a_v);
+    auto& b = c.b;
+    DualVal yr{
+        b.CreateFAdd(b.CreateFMul(ca, y.val), b.CreateFMul(sa, z.val)),
+        b.CreateFAdd(b.CreateFMul(ca, y.dot), b.CreateFMul(sa, z.dot))
+    };
+    DualVal zr{
+        b.CreateFSub(b.CreateFMul(ca, z.val), b.CreateFMul(sa, y.val)),
+        b.CreateFSub(b.CreateFMul(ca, z.dot), b.CreateFMul(sa, y.dot))
+    };
+    return children[0]->codegen_grad(c, x, yr, zr);
+}
+
+FRepNode::DualVal RotateZNode::codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const {
+    auto a_v = c.param_value(id, "a", params.at("a"));
+    auto ca = frep::llvm_compat::unary_intrinsic(c.b, llvm::Intrinsic::cos, a_v);
+    auto sa = frep::llvm_compat::unary_intrinsic(c.b, llvm::Intrinsic::sin, a_v);
+    auto& b = c.b;
+    DualVal xr{
+        b.CreateFAdd(b.CreateFMul(ca, x.val), b.CreateFMul(sa, y.val)),
+        b.CreateFAdd(b.CreateFMul(ca, x.dot), b.CreateFMul(sa, y.dot))
+    };
+    DualVal yr{
+        b.CreateFSub(b.CreateFMul(ca, y.val), b.CreateFMul(sa, x.val)),
+        b.CreateFSub(b.CreateFMul(ca, y.dot), b.CreateFMul(sa, x.dot))
+    };
+    return children[0]->codegen_grad(c, xr, yr, z);
 }
 
 } // namespace frep

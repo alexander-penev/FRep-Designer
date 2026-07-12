@@ -5,6 +5,7 @@
 // Everything is AlwaysInline → after O3, render_tile contains the inlined SDF directly.
 
 #include "codegen.hpp"
+#include "core/compiler/llvm_compat.hpp"
 
 #include "core/compiler/bvh.hpp"
 #include "core/frep/operations.hpp"
@@ -20,6 +21,8 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include <cassert>
+#include <cmath>
+#include <algorithm>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -74,6 +77,88 @@ int SceneCodegen::acquire_param_slot(const std::string& node_id,
     return slot;
 }
 
+llvm::Value* SceneCodegen::acquire_instance_fn(const FRepNode* target,
+                                               llvm::IRBuilder<>& caller,
+                                               llvm::Value* x, llvm::Value* y,
+                                               llvm::Value* z, llvm::Value* params)
+{
+    auto* fty = llvm::FunctionType::get(f32(),
+        {f32(), f32(), f32(), fptr()}, false);
+
+    auto it = instance_fn_by_target_.find(target);
+    llvm::Function* fn = (it != instance_fn_by_target_.end()) ? it->second : nullptr;
+    if (!fn) {
+        // Create the shared function and emit the target's geometry into it once.
+        fn = llvm::Function::Create(
+            fty, llvm::Function::InternalLinkage,
+            "inst_geom_" + std::to_string(instance_fn_by_target_.size()),
+            mod_.get());
+        fn->addFnAttr(llvm::Attribute::NoInline);   // keep it a real shared call
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        fn->addFnAttr(llvm::Attribute::WillReturn);
+        // Register before emitting the body so a self/cyclic reference resolves
+        // to a call rather than recursing forever.
+        instance_fn_by_target_[target] = fn;
+
+        auto* bb = llvm::BasicBlock::Create(ctx_, "entry", fn);
+        llvm::IRBuilder<> body(bb);
+        auto a = fn->arg_begin();
+        auto* ax = &*a++; auto* ay = &*a++; auto* az = &*a++; auto* apb = &*a++;
+        // A fresh CgCtx bound to the shared function's own builder. It also gets
+        // the instance_call callback so nested instances share too.
+        CgCtx sub = make_cgctx(body, apb);
+        body.CreateRet(target->codegen(sub, ax, ay, az));
+        verify_fn(fn);
+    }
+    // Emit the call at the caller's site.
+    return caller.CreateCall(fn, {x, y, z, params});
+}
+
+bool SceneCodegen::acquire_instance_grad_fn(const FRepNode* target,
+                                            llvm::IRBuilder<>& caller,
+                                            llvm::Value* xv, llvm::Value* xd,
+                                            llvm::Value* yv, llvm::Value* yd,
+                                            llvm::Value* zv, llvm::Value* zd,
+                                            llvm::Value* params,
+                                            llvm::Value*& out_val, llvm::Value*& out_dot)
+{
+    // Return a { value, derivative } pair as a literal struct.
+    auto* ret_ty = llvm::StructType::get(ctx_, {f32(), f32()});
+    auto* fty = llvm::FunctionType::get(ret_ty,
+        {f32(), f32(), f32(), f32(), f32(), f32(), fptr()}, false);
+
+    auto it = instance_grad_fn_by_target_.find(target);
+    llvm::Function* fn = (it != instance_grad_fn_by_target_.end()) ? it->second : nullptr;
+    if (!fn) {
+        fn = llvm::Function::Create(
+            fty, llvm::Function::InternalLinkage,
+            "inst_grad_" + std::to_string(instance_grad_fn_by_target_.size()),
+            mod_.get());
+        fn->addFnAttr(llvm::Attribute::NoInline);
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        fn->addFnAttr(llvm::Attribute::WillReturn);
+        instance_grad_fn_by_target_[target] = fn;
+
+        auto* bb = llvm::BasicBlock::Create(ctx_, "entry", fn);
+        llvm::IRBuilder<> body(bb);
+        auto a = fn->arg_begin();
+        auto* axv=&*a++; auto* axd=&*a++; auto* ayv=&*a++; auto* ayd=&*a++;
+        auto* azv=&*a++; auto* azd=&*a++; auto* apb=&*a++;
+        CgCtx sub = make_cgctx(body, apb);
+        FRepNode::DualVal dx{axv, axd}, dy{ayv, ayd}, dz{azv, azd};
+        FRepNode::DualVal r = target->codegen_grad(sub, dx, dy, dz);
+        llvm::Value* agg = llvm::UndefValue::get(ret_ty);
+        agg = body.CreateInsertValue(agg, r.val, {0});
+        agg = body.CreateInsertValue(agg, r.dot, {1});
+        body.CreateRet(agg);
+        verify_fn(fn);
+    }
+    auto* call = caller.CreateCall(fn, {xv, xd, yv, yd, zv, zd, params});
+    out_val = caller.CreateExtractValue(call, {0});
+    out_dot = caller.CreateExtractValue(call, {1});
+    return true;
+}
+
 CgCtx SceneCodegen::make_cgctx(llvm::IRBuilder<>& b, llvm::Value* params_buffer) {
     CgCtx c{ctx_, *mod_, b};
     if (cfg_.incremental_params && params_buffer) {
@@ -87,6 +172,26 @@ CgCtx SceneCodegen::make_cgctx(llvm::IRBuilder<>& b, llvm::Value* params_buffer)
                                   int param_class) {
             return this->acquire_param_slot(node_id, param_name,
                                             default_value, param_class);
+        };
+    }
+    // Instancing Level 2: bind the shared-subprogram callback. Capture `this`
+    // (for the memo table + emitter) and the params buffer so the shared body
+    // can read runtime params; the call site uses the caller's builder `b`.
+    if (cfg_.instance_shared_subprograms) {
+        llvm::IRBuilder<>* caller = &b;
+        llvm::Value* pbuf = params_buffer;
+        c.instance_call = [this, caller, pbuf](const FRepNode* target,
+                                               llvm::Value* x, llvm::Value* y,
+                                               llvm::Value* z) -> llvm::Value* {
+            return this->acquire_instance_fn(target, *caller, x, y, z, pbuf);
+        };
+        c.instance_grad_call = [this, caller, pbuf](
+                const FRepNode* target,
+                llvm::Value* xv, llvm::Value* xd, llvm::Value* yv, llvm::Value* yd,
+                llvm::Value* zv, llvm::Value* zd,
+                llvm::Value*& ov, llvm::Value*& od) -> bool {
+            return this->acquire_instance_grad_fn(target, *caller,
+                xv, xd, yv, yd, zv, zd, pbuf, ov, od);
         };
     }
     return c;
@@ -1045,6 +1150,40 @@ llvm::Function* SceneCodegen::emit_tracer(const SceneGraph& scene,
                                           llvm::Function* normal_fn,
                                           llvm::Function* shader_fn,
                                           llvm::Function* mat_fn) {
+    // Scene bounding box (union of visible object AABBs) for the optional ray-box
+    // near/far clip below. If any visible object is unbounded (planes, unknown
+    // implicits report an infinite AABB), the clip is disabled — an infinite box
+    // can't narrow anything. Computed once here; the march uses it per ray.
+    bool scene_bounded = false;
+    FRepNode::AABB scene_box{};
+    {
+        auto finite = [](float v){ return std::isfinite(v); };
+        for (auto& [id, obj] : scene.objects()) {
+            if (!obj.visible || !obj.geometry) continue;
+            FRepNode::AABB b = obj.geometry->aabb();
+            bool ok = finite(b.min_x)&&finite(b.min_y)&&finite(b.min_z)&&
+                      finite(b.max_x)&&finite(b.max_y)&&finite(b.max_z);
+            if (!ok) { scene_bounded = false; break; }
+            if (!scene_bounded) { scene_box = b; scene_bounded = true; }
+            else {
+                scene_box.min_x = std::min(scene_box.min_x, b.min_x);
+                scene_box.min_y = std::min(scene_box.min_y, b.min_y);
+                scene_box.min_z = std::min(scene_box.min_z, b.min_z);
+                scene_box.max_x = std::max(scene_box.max_x, b.max_x);
+                scene_box.max_y = std::max(scene_box.max_y, b.max_y);
+                scene_box.max_z = std::max(scene_box.max_z, b.max_z);
+            }
+        }
+        if (scene_bounded) {
+            float m = 0.05f * std::max({scene_box.max_x - scene_box.min_x,
+                                        scene_box.max_y - scene_box.min_y,
+                                        scene_box.max_z - scene_box.min_z, 0.1f});
+            scene_box.min_x -= m; scene_box.min_y -= m; scene_box.min_z -= m;
+            scene_box.max_x += m; scene_box.max_y += m; scene_box.max_z += m;
+        }
+    }
+    const bool use_bbox_clip = scene_bounded && cfg_.bbox_clip;
+
     // Optional: shadow and AO. Pass nullptr if they are not needed.
     llvm::Function* shadow_fn = cfg_.enable_shadows ? emit_shadow(sdf_fn) : nullptr;
     llvm::Function* ao_fn     = cfg_.enable_ao      ? emit_ao(sdf_fn)     : nullptr;
@@ -1156,6 +1295,137 @@ llvm::Function* SceneCodegen::emit_tracer(const SceneGraph& scene,
 
     b.CreateBr(py_cond);
 
+    // ══ Per-tile Lipschitz cull ═══════════════════════════════════════════════
+    // The IR analog of the GLSL tile cull. Once per tile (here, before the pixel
+    // loops), split [near, max_dist] into cull_slabs depth slabs; for each slab
+    // build an AABB enclosing the tile frustum's corners at the slab's near/far
+    // depth, and mark the slab occupied if the surface can pass through it —
+    // Lipschitz test |scene_sdf(center)| <= L * halfdiag. The occupied slabs'
+    // depth span [t0,t1] then clamps every ray's march. Unlike the whole-scene
+    // ray-box clip (which only trims empty space outside the scene box), this can
+    // also skip empty slabs *between* surfaces within the box. Emitted only when
+    // cull_slabs > 0 and the method resolves to Lipschitz (interval cull would
+    // need an IR interval emitter — future work); computed into tile_t0/tile_t1
+    // which stay null (no effect) when off.
+    llvm::Value* tile_t0 = nullptr;
+    llvm::Value* tile_t1 = nullptr;
+    {
+        using CM = TracerConfig::CullMethod;
+        // Metric if every visible object's tree is unit-Lipschitz (so L=1 is a
+        // sound occupancy bound). Mirrors what emit_render_tile's root would give.
+        bool metric = true;
+        for (auto& [id, obj] : scene.objects()) {
+            if (!obj.visible || !obj.geometry) continue;
+            if (!node_is_unit_lipschitz(*obj.geometry)) { metric = false; break; }
+        }
+        bool want_lip = cfg_.cull_slabs > 0 &&
+            (cfg_.cull_method == CM::Lipschitz ||
+             (cfg_.cull_method == CM::Auto && metric));
+        if (want_lip) {
+            const int   S    = cfg_.cull_slabs;
+            const float near = 0.001f;
+            const float st   = (cfg_.max_dist - near) / float(S);
+            const float L    = (cfg_.cull_method == CM::Auto) ? 1.0f
+                                                              : cfg_.cull_lipschitz;
+            auto* term = entry_bb->getTerminator();
+            b.SetInsertPoint(term);   // emit before the branch to py_cond
+            // Local float-constant helper (the member fc() takes a builder arg).
+            auto fc = [&](float v){ return llvm::ConstantFP::get(f32(), v); };
+
+            auto sfp = [&](llvm::Value* v){ return b.CreateSIToFP(v, f32()); };
+            auto* iwf = sfp(IW); auto* ihf = sfp(IH);
+            auto* aspc = b.CreateFDiv(iwf, ihf);
+            auto* tx0f = sfp(TX); auto* ty0f = sfp(TY);
+            auto* tx1f = sfp(b.CreateAdd(TX, TW));
+            auto* ty1f = sfp(b.CreateAdd(TY, TH));
+            auto* is_o = b.CreateFCmpOLT(FOVS, fc(0.0f));
+            auto* afov = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::fabs, FOVS);
+
+            auto corner = [&](llvm::Value* pxf, llvm::Value* pyf,
+                              llvm::Value*& ox, llvm::Value*& oy, llvm::Value*& oz,
+                              llvm::Value*& dx, llvm::Value*& dy, llvm::Value*& dz) {
+                auto* u = b.CreateFMul(b.CreateFSub(
+                    b.CreateFMul(fc(2.0f), b.CreateFDiv(pxf, iwf)), fc(1.0f)), aspc);
+                auto* v = b.CreateFSub(fc(1.0f),
+                    b.CreateFMul(fc(2.0f), b.CreateFDiv(pyf, ihf)));
+                auto mk = [&](llvm::Value* f, llvm::Value* r, llvm::Value* up){
+                    return b.CreateFAdd(f, b.CreateFAdd(
+                        b.CreateFMul(b.CreateFMul(u, afov), r),
+                        b.CreateFMul(b.CreateFMul(v, afov), up))); };
+                auto* pdx = mk(FDX, RX, UX); auto* pdy = mk(FDY, RY, UY); auto* pdz = mk(FDZ, RZ, UZ);
+                auto* pl = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sqrt,
+                    b.CreateFAdd(b.CreateFMul(pdx,pdx),
+                    b.CreateFAdd(b.CreateFMul(pdy,pdy), b.CreateFMul(pdz,pdz))));
+                auto* pin = b.CreateFDiv(fc(1.0f), pl);
+                auto* oox = b.CreateFAdd(OX, b.CreateFAdd(
+                    b.CreateFMul(b.CreateFMul(u, afov), RX),
+                    b.CreateFMul(b.CreateFMul(v, afov), UX)));
+                auto* ooy = b.CreateFAdd(OY, b.CreateFAdd(
+                    b.CreateFMul(b.CreateFMul(u, afov), RY),
+                    b.CreateFMul(b.CreateFMul(v, afov), UY)));
+                auto* ooz = b.CreateFAdd(OZ, b.CreateFAdd(
+                    b.CreateFMul(b.CreateFMul(u, afov), RZ),
+                    b.CreateFMul(b.CreateFMul(v, afov), UZ)));
+                ox = b.CreateSelect(is_o, oox, OX);
+                oy = b.CreateSelect(is_o, ooy, OY);
+                oz = b.CreateSelect(is_o, ooz, OZ);
+                dx = b.CreateSelect(is_o, FDX, b.CreateFMul(pdx, pin));
+                dy = b.CreateSelect(is_o, FDY, b.CreateFMul(pdy, pin));
+                dz = b.CreateSelect(is_o, FDZ, b.CreateFMul(pdz, pin));
+            };
+
+            llvm::Value* cox[4]; llvm::Value* coy[4]; llvm::Value* coz[4];
+            llvm::Value* cdx[4]; llvm::Value* cdy[4]; llvm::Value* cdz[4];
+            llvm::Value* cxs[4] = {tx0f, tx1f, tx0f, tx1f};
+            llvm::Value* cys[4] = {ty0f, ty0f, ty1f, ty1f};
+            for (int c = 0; c < 4; ++c)
+                corner(cxs[c], cys[c], cox[c], coy[c], coz[c], cdx[c], cdy[c], cdz[c]);
+
+            auto mn = [&](llvm::Value* a, llvm::Value* b_){
+                return frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::minnum, a, b_); };
+            auto mx = [&](llvm::Value* a, llvm::Value* b_){
+                return frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::maxnum, a, b_); };
+
+            llvm::Value* acc0 = fc(1e30f);
+            llvm::Value* acc1 = fc(-1e30f);
+            for (int s = 0; s < S; ++s) {
+                float ta = near + st * float(s);
+                float tb = ta + st;
+                llvm::Value* lo_x=fc(1e30f), *lo_y=fc(1e30f), *lo_z=fc(1e30f);
+                llvm::Value* hi_x=fc(-1e30f), *hi_y=fc(-1e30f), *hi_z=fc(-1e30f);
+                for (int c = 0; c < 4; ++c) {
+                    for (float t : {ta, tb}) {
+                        auto* px = b.CreateFAdd(cox[c], b.CreateFMul(cdx[c], fc(t)));
+                        auto* py = b.CreateFAdd(coy[c], b.CreateFMul(cdy[c], fc(t)));
+                        auto* pz = b.CreateFAdd(coz[c], b.CreateFMul(cdz[c], fc(t)));
+                        lo_x = mn(lo_x, px); hi_x = mx(hi_x, px);
+                        lo_y = mn(lo_y, py); hi_y = mx(hi_y, py);
+                        lo_z = mn(lo_z, pz); hi_z = mx(hi_z, pz);
+                    }
+                }
+                auto* ccx = b.CreateFMul(fc(0.5f), b.CreateFAdd(lo_x, hi_x));
+                auto* ccy = b.CreateFMul(fc(0.5f), b.CreateFAdd(lo_y, hi_y));
+                auto* ccz = b.CreateFMul(fc(0.5f), b.CreateFAdd(lo_z, hi_z));
+                auto* ex = b.CreateFMul(fc(0.5f), b.CreateFSub(hi_x, lo_x));
+                auto* ey = b.CreateFMul(fc(0.5f), b.CreateFSub(hi_y, lo_y));
+                auto* ez = b.CreateFMul(fc(0.5f), b.CreateFSub(hi_z, lo_z));
+                auto* hd = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sqrt,
+                    b.CreateFAdd(b.CreateFMul(ex,ex),
+                    b.CreateFAdd(b.CreateFMul(ey,ey), b.CreateFMul(ez,ez))));
+                auto* r = b.CreateFMul(fc(L), hd);
+                auto* fcv = b.CreateCall(sdf_fn, {ccx, ccy, ccz, PARAMS});
+                auto* occ = b.CreateAnd(
+                    b.CreateFCmpOLE(b.CreateFSub(fcv, r), fc(0.0f)),
+                    b.CreateFCmpOGE(b.CreateFAdd(fcv, r), fc(0.0f)));
+                acc0 = b.CreateSelect(occ, mn(acc0, fc(ta)), acc0);
+                acc1 = b.CreateSelect(occ, mx(acc1, fc(tb)), acc1);
+            }
+            float mrg = st;
+            tile_t0 = b.CreateFSub(acc0, fc(mrg));
+            tile_t1 = b.CreateFAdd(acc1, fc(mrg));
+        }
+    }
+
     // ══ py loop ═══════════════════════════════════════════════════════════════
     b.SetInsertPoint(py_cond);
     auto* py_phi = b.CreatePHI(i32(), 2, "py");
@@ -1241,6 +1511,51 @@ llvm::Function* SceneCodegen::emit_tracer(const SceneGraph& scene,
     auto rdyn = b.CreateFDiv(rdy, rdl, "rdyn");
     auto rdzn = b.CreateFDiv(rdz, rdl, "rdzn");
 
+    // Optional ray-box near/far clip. Slab method: for each axis compute the two
+    // t values where the ray crosses the box planes, take the near/far envelope.
+    // t_enter = max over axes of the near crossings, t_exit = min of the far.
+    // If the scene is unbounded or the flag is off, t_enter/t_exit default to the
+    // usual [0.001, max_dist] so behaviour is unchanged.
+    llvm::Value* t_enter0 = llvm::ConstantFP::get(f32(), 0.001f);
+    llvm::Value* t_exit0  = llvm::ConstantFP::get(f32(), cfg_.max_dist);
+    if (use_bbox_clip) {
+        auto slab = [&](llvm::Value* o, llvm::Value* dn, float lo, float hi,
+                        llvm::Value*& tmin, llvm::Value*& tmax) {
+            // Guard against a near-zero direction component (ray parallel to slab):
+            // use a large inv so the crossings land far outside [near,far] and don't
+            // wrongly clip. 1/dn with dn floored away from 0 in magnitude.
+            auto* inv = b.CreateFDiv(llvm::ConstantFP::get(f32(), 1.0f), dn);
+            auto* t1  = b.CreateFMul(b.CreateFSub(llvm::ConstantFP::get(f32(), lo), o), inv);
+            auto* t2  = b.CreateFMul(b.CreateFSub(llvm::ConstantFP::get(f32(), hi), o), inv);
+            auto* mn  = frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::minnum, t1, t2);
+            auto* mx  = frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::maxnum, t1, t2);
+            tmin = tmin ? frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::maxnum, tmin, mn) : mn;
+            tmax = tmax ? frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::minnum, tmax, mx) : mx;
+        };
+        llvm::Value* tmin = nullptr; llvm::Value* tmax = nullptr;
+        slab(ox_eff, rdxn, scene_box.min_x, scene_box.max_x, tmin, tmax);
+        slab(oy_eff, rdyn, scene_box.min_y, scene_box.max_y, tmin, tmax);
+        slab(oz_eff, rdzn, scene_box.min_z, scene_box.max_z, tmin, tmax);
+        // Start no earlier than the default near, and no earlier than box entry.
+        t_enter0 = frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::maxnum,
+                       t_enter0, tmin);
+        // Stop no later than max_dist, and no later than box exit. If the ray
+        // misses the box (tmax < tmin), t_exit0 < t_enter0 and the loop's
+        // dist_ok test fails immediately -> instant miss (correct, and fast).
+        t_exit0 = frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::minnum,
+                      t_exit0, tmax);
+    }
+    // Per-tile Lipschitz cull (computed before the loops) further narrows the
+    // march: start no earlier than the first occupied slab, stop no later than
+    // the last. If no slab was occupied, tile_t1 < tile_t0 and dist_ok fails
+    // immediately -> the whole tile is a fast miss (correct — nothing in view).
+    if (tile_t0 && tile_t1) {
+        t_enter0 = frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::maxnum,
+                       t_enter0, tile_t0);
+        t_exit0  = frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::minnum,
+                       t_exit0, tile_t1);
+    }
+
     b.CreateBr(st_cond);
 
     // ══ Sphere tracing loop ═══════════════════════════════════════════════════
@@ -1251,14 +1566,14 @@ llvm::Function* SceneCodegen::emit_tracer(const SceneGraph& scene,
     auto* slen_phi  = b.CreatePHI(f32(), 2, "step_len");
     auto* omega_phi = b.CreatePHI(f32(), 2, "omega");
     step_phi ->addIncoming(b.getInt32(0),                       px_body);
-    t_phi    ->addIncoming(llvm::ConstantFP::get(f32(), 0.001f), px_body);
+    t_phi    ->addIncoming(t_enter0, px_body);
     lastd_phi->addIncoming(llvm::ConstantFP::get(f32(), 1e30f),  px_body);
     slen_phi ->addIncoming(llvm::ConstantFP::get(f32(), 0.0f),   px_body);
     omega_phi->addIncoming(llvm::ConstantFP::get(f32(), cfg_.over_relax), px_body);
 
     // step < MAX_STEPS && t < MAX_DIST
     auto* step_ok  = b.CreateICmpSLT(step_phi, b.getInt32(cfg_.max_steps), "step_ok");
-    auto* dist_ok  = b.CreateFCmpOLT(t_phi, llvm::ConstantFP::get(f32(), cfg_.max_dist), "dist_ok");
+    auto* dist_ok  = b.CreateFCmpOLT(t_phi, t_exit0, "dist_ok");
     b.CreateCondBr(b.CreateAnd(step_ok, dist_ok), st_body, miss_bb);
 
     b.SetInsertPoint(st_body);
@@ -2413,6 +2728,7 @@ llvm::Function* SceneCodegen::emit_render_tile(const SceneGraph& scene,
         throw std::runtime_error("emit_render_tile: empty scene");
 
     auto root = union_all(geoms);   // keep geoms for optional split path
+
 
     // Adaptive raymarch step. safety_factor < 1 is only needed when the
     // scene's distance field isn't a true Euclidean SDF — i.e. it

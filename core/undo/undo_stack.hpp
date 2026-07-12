@@ -246,6 +246,25 @@ private:
     float old_ = 0.0f, new_ = 0.0f;
 };
 
+// Per-axis rotation (axis 0=X, 1=Y, 2=Z).
+class SetRotationAxisCommand : public UndoCommand {
+public:
+    SetRotationAxisCommand(SceneGraph& s, std::string id, int axis, float angle_rad)
+        : s_(s), id_(std::move(id)), axis_(axis), new_(angle_rad)
+    {
+        old_ = s_.get_rotation_axis(id_, axis_);
+    }
+    void apply() override { s_.set_rotation_axis(id_, axis_, new_); }
+    void undo()  override { s_.set_rotation_axis(id_, axis_, old_); }
+    std::string description() const override { return "Rotate " + id_; }
+
+private:
+    SceneGraph& s_;
+    std::string id_;
+    int axis_ = 1;
+    float old_ = 0.0f, new_ = 0.0f;
+};
+
 // Uniform-scale gizmo edit. Mirrors SetTransformCommand.
 class SetScaleCommand : public UndoCommand {
 public:
@@ -262,6 +281,47 @@ private:
     SceneGraph& s_;
     std::string id_;
     float old_ = 1.0f, new_ = 1.0f;
+};
+
+// Per-axis (non-uniform) scale.
+class SetScaleXYZCommand : public UndoCommand {
+public:
+    SetScaleXYZCommand(SceneGraph& s, std::string id, float sx, float sy, float sz)
+        : s_(s), id_(std::move(id)), nx_(sx), ny_(sy), nz_(sz)
+    {
+        s_.get_scale_xyz(id_, ox_, oy_, oz_);
+    }
+    void apply() override { s_.set_scale_xyz(id_, nx_, ny_, nz_); }
+    void undo()  override { s_.set_scale_xyz(id_, ox_, oy_, oz_); }
+    std::string description() const override { return "Scale " + id_; }
+
+private:
+    SceneGraph& s_;
+    std::string id_;
+    float ox_=1, oy_=1, oz_=1, nx_=1, ny_=1, nz_=1;
+};
+
+// Sets a single parameter of a node inside an object's geometry tree — used by
+// the Scene-tab property grid. Parameter-only (topology unchanged), so it can
+// ride the incremental recompile path.
+class SetParamCommand : public UndoCommand {
+public:
+    SetParamCommand(SceneGraph& s, std::string object_id, std::string node_id,
+                    std::string param, float value)
+        : s_(s), obj_(std::move(object_id)), node_(std::move(node_id)),
+          param_(std::move(param)), new_(value)
+    {
+        has_old_ = s_.get_node_param(obj_, node_, param_, old_);
+    }
+    void apply() override { s_.set_node_param(obj_, node_, param_, new_); }
+    void undo()  override { if (has_old_) s_.set_node_param(obj_, node_, param_, old_); }
+    std::string description() const override { return "Set " + node_ + "." + param_; }
+
+private:
+    SceneGraph& s_;
+    std::string obj_, node_, param_;
+    float old_ = 0.0f, new_ = 0.0f;
+    bool has_old_ = false;
 };
 
 // Adds a light. Captures the index so undo removes the right one.

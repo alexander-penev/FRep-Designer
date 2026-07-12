@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <iomanip>
+#include <functional>
 
 namespace frep::gpu {
 
@@ -106,26 +107,23 @@ std::string GlslEmitter::emit_translate(Ctx& c, const FRepNode& n,
 std::string GlslEmitter::emit_scale(Ctx& c, const FRepNode& n,
     const std::string& x, const std::string& y, const std::string& z)
 {
-    auto sv  = c.fresh("s");
-    auto av  = c.fresh("as");
-    auto isv = c.fresh("is");
-    auto xp  = c.fresh("sx");
-    auto yp  = c.fresh("sy");
-    auto zp  = c.fresh("sz");
-    // |s| and 1/max(eps,|s|) computed in-shader so a runtime edit of s needs no
-    // re-emit; for a baked s these fold to the same constants.
-    c.sdf_body << "    float " << sv  << " = " << pval(c, n, "s") << ";\n"
-               << "    float " << av  << " = abs(" << sv << ");\n"
-               << "    float " << isv << " = 1.0 / max(1.0e-6, " << av << ");\n"
-               << "    float " << xp  << " = " << x << " * " << isv << ";\n"
-               << "    float " << yp  << " = " << y << " * " << isv << ";\n"
-               << "    float " << zp  << " = " << z << " * " << isv << ";\n";
+    auto sxv=c.fresh("sx"), syv=c.fresh("sy"), szv=c.fresh("sz");
+    auto xp=c.fresh("xs"), yp=c.fresh("ys"), zp=c.fresh("zs");
+    auto mnv=c.fresh("smn");
+    // Per-axis factors read at runtime so an edit needs no re-emit; baked
+    // factors fold. Non-uniform scale is not distance-preserving, so scale the
+    // resulting distance by the SMALLEST factor to keep a conservative SDF.
+    c.sdf_body << "    float " << sxv << " = " << pval(c, n, "sx") << ";\n"
+               << "    float " << syv << " = " << pval(c, n, "sy") << ";\n"
+               << "    float " << szv << " = " << pval(c, n, "sz") << ";\n"
+               << "    float " << xp  << " = " << x << " / " << sxv << ";\n"
+               << "    float " << yp  << " = " << y << " / " << syv << ";\n"
+               << "    float " << zp  << " = " << z << " / " << szv << ";\n";
     auto child = emit_node(c, *n.children[0], xp, yp, zp);
     if (!child) return "0.0";
-    // Scale the resulting distance back by |s| so the SDF stays a valid
-    // Lipschitz field.
     auto v = c.fresh();
-    c.sdf_body << "    float " << v << " = " << *child << " * " << av << ";\n";
+    c.sdf_body << "    float " << mnv << " = min(" << sxv << ", min(" << syv << ", " << szv << "));\n"
+               << "    float " << v << " = " << *child << " * " << mnv << ";\n";
     return v;
 }
 
@@ -147,6 +145,34 @@ std::string GlslEmitter::emit_rotate_y(Ctx& c, const FRepNode& n,
                << "    float " << zp  << " = -" << sav << " * " << x
                << " + " << cav << " * " << z << ";\n";
     auto child = emit_node(c, *n.children[0], xp, y, zp);
+    return child.value_or("0.0");
+}
+
+std::string GlslEmitter::emit_rotate_x(Ctx& c, const FRepNode& n,
+    const std::string& x, const std::string& y, const std::string& z)
+{
+    auto av=c.fresh("a"), cav=c.fresh("ca"), sav=c.fresh("sa");
+    auto yp=c.fresh("ry"), zp=c.fresh("rz");
+    c.sdf_body << "    float " << av  << " = " << pval(c, n, "a") << ";\n"
+               << "    float " << cav << " = cos(" << av << ");\n"
+               << "    float " << sav << " = sin(" << av << ");\n"
+               << "    float " << yp  << " = " << cav << " * " << y << " + " << sav << " * " << z << ";\n"
+               << "    float " << zp  << " = -" << sav << " * " << y << " + " << cav << " * " << z << ";\n";
+    auto child = emit_node(c, *n.children[0], x, yp, zp);
+    return child.value_or("0.0");
+}
+
+std::string GlslEmitter::emit_rotate_z(Ctx& c, const FRepNode& n,
+    const std::string& x, const std::string& y, const std::string& z)
+{
+    auto av=c.fresh("a"), cav=c.fresh("ca"), sav=c.fresh("sa");
+    auto xp=c.fresh("rx"), yp=c.fresh("ry");
+    c.sdf_body << "    float " << av  << " = " << pval(c, n, "a") << ";\n"
+               << "    float " << cav << " = cos(" << av << ");\n"
+               << "    float " << sav << " = sin(" << av << ");\n"
+               << "    float " << xp  << " = " << cav << " * " << x << " + " << sav << " * " << y << ";\n"
+               << "    float " << yp  << " = -" << sav << " * " << x << " + " << cav << " * " << y << ";\n";
+    auto child = emit_node(c, *n.children[0], xp, yp, z);
     return child.value_or("0.0");
 }
 
@@ -297,6 +323,62 @@ std::string GlslEmitter::emit_mesh_sdf(Ctx& c, const FRepNode& n,
 
 // ── Dispatch on node kind ──────────────────────────────────────────────────
 
+// Emit `target` as a standalone GLSL function once, keyed by pointer. The body
+// is produced by emit_node into a fresh sub-Ctx (so its temporaries are local to
+// the function), then wrapped as `float _inst_fn_N(float x,float y,float z)`.
+// The sub-Ctx shares the mesh accumulator (so a mesh inside an instanced subtree
+// still registers its voxels once) and the binding table, but gets its OWN
+// inst_funcs pointer set to the same table, so a nested instance inside the
+// target also emits/reuses functions. Returns "" on failure.
+std::string GlslEmitter::emit_instance_fn(Ctx& c, const FRepNode& target) {
+    auto& F = *c.inst_funcs;
+    if (auto it = F.ptr_to_fn.find(&target); it != F.ptr_to_fn.end())
+        return it->second;                          // already emitted
+
+    std::string name = "_inst_fn_" + std::to_string(F.next_fn++);
+    // Reserve the name before emitting the body so a self-consistent (acyclic)
+    // nested reference can find it; cycles are already excluded upstream.
+    F.ptr_to_fn[&target] = name;
+
+    Ctx sub;
+    sub.mesh_accum = c.mesh_accum;
+    sub.bindings   = c.bindings;
+    sub.inst_funcs = c.inst_funcs;
+    auto body = emit_node(sub, target, "x", "y", "z");
+    if (!body) return {};
+
+    F.defs << "float " << name << "(float x, float y, float z) {\n"
+           << sub.sdf_body.str()
+           << "    return " << *body << ";\n"
+           << "}\n";
+    return name;
+}
+
+std::string GlslEmitter::emit_instance_grad_fn(Ctx& c, const FRepNode& target) {
+    auto& F = *c.inst_funcs;
+    if (auto it = F.ptr_to_grad_fn.find(&target); it != F.ptr_to_grad_fn.end())
+        return it->second;
+
+    std::string name = "_inst_grad_fn_" + std::to_string(F.next_grad_fn++);
+    F.ptr_to_grad_fn[&target] = name;
+
+    Ctx sub;
+    sub.mesh_accum = c.mesh_accum;
+    sub.bindings   = c.bindings;
+    sub.inst_funcs = c.inst_funcs;
+    // The function takes the incoming Duals (which may already carry an outer
+    // transform's derivative) rather than resetting them to identity, so AD stays
+    // correct when the instance is wrapped in Translate/Rotate/etc.
+    auto body = emit_node_dual(sub, target, "x", "y", "z");
+    if (!body) return {};   // e.g. BendXY has no dual emitter -> caller inlines
+
+    F.grad_defs << "Dual " << name << "(Dual x, Dual y, Dual z) {\n"
+                << sub.grad_body.str()
+                << "    return " << *body << ";\n"
+                << "}\n";
+    return name;
+}
+
 std::expected<std::string, std::string>
 GlslEmitter::emit_node(Ctx& c, const FRepNode& n,
                        const std::string& x, const std::string& y,
@@ -315,16 +397,31 @@ GlslEmitter::emit_node(Ctx& c, const FRepNode& n,
         case K::Translate: return emit_translate(c, n, x, y, z);
         case K::Scale:     return emit_scale(c, n, x, y, z);
         case K::RotateY:   return emit_rotate_y(c, n, x, y, z);
+        case K::RotateX:   return emit_rotate_x(c, n, x, y, z);
+        case K::RotateZ:   return emit_rotate_z(c, n, x, y, z);
         case K::TwistY:    return emit_twist_y(c, n, x, y, z);
         case K::BendXY:    return emit_bend_xy(c, n, x, y, z);
         case K::TaperY:    return emit_taper_y(c, n, x, y, z);
 
-        case K::Instance:  // Level 1: inline the shared target subtree. (Level 2
-                           // will emit the target once as a function and call it;
-                           // the shared child pointer is the dedup key for that.)
+        case K::Instance: {
             if (n.children.empty() || !n.children[0])
                 return std::string("1e30");        // dangling -> empty
-            return emit_node(c, *n.children[0], x, y, z);
+            const FRepNode* target = n.children[0].get();
+            // Level 2: if this target is shared (referenced by >=1 instance) and
+            // we have a function table, emit the target as a function once and
+            // call it here. Otherwise fall back to inlining (Level 1 behaviour).
+            if (c.inst_funcs &&
+                c.inst_funcs->shared_targets.count(target)) {
+                std::string fn = emit_instance_fn(c, *target);
+                if (fn.empty())
+                    return std::unexpected(std::string("instance fn emit failed"));
+                std::string v = c.fresh();
+                c.sdf_body << "    float " << v << " = " << fn
+                           << "(" << x << ", " << y << ", " << z << ");\n";
+                return v;
+            }
+            return emit_node(c, *target, x, y, z);   // inline (no instances of it)
+        }
 
         case K::Union:
         case K::Intersection:
@@ -467,20 +564,19 @@ GlslEmitter::emit_node_dual(Ctx& c, const FRepNode& n,
             return emit_node_dual(c, *n.children[0], xp, yp, zp);
         }
         case K::Scale: {
-            auto sv  = c.fresh("s");
-            auto asv = c.fresh("as");
-            auto isv = c.fresh("is");
-            g << "    float " << sv  << " = " << pval(c, n, "s") << ";\n"
-              << "    float " << asv << " = abs(" << sv << ");\n"
-              << "    float " << isv << " = 1.0 / max(1.0e-6, " << asv << ");\n";
+            auto sxv=c.fresh("sx"), syv=c.fresh("sy"), szv=c.fresh("sz"), mnv=c.fresh("smn");
+            g << "    float " << sxv << " = " << pval(c, n, "sx") << ";\n"
+              << "    float " << syv << " = " << pval(c, n, "sy") << ";\n"
+              << "    float " << szv << " = " << pval(c, n, "sz") << ";\n";
             auto xp = c.fresh_d(), yp = c.fresh_d(), zp = c.fresh_d();
-            g << "    Dual " << xp << " = d_mul_s(" << x << ", " << isv << ");\n"
-              << "    Dual " << yp << " = d_mul_s(" << y << ", " << isv << ");\n"
-              << "    Dual " << zp << " = d_mul_s(" << z << ", " << isv << ");\n";
+            g << "    Dual " << xp << " = d_mul_s(" << x << ", 1.0 / " << sxv << ");\n"
+              << "    Dual " << yp << " = d_mul_s(" << y << ", 1.0 / " << syv << ");\n"
+              << "    Dual " << zp << " = d_mul_s(" << z << ", 1.0 / " << szv << ");\n";
             auto child = emit_node_dual(c, *n.children[0], xp, yp, zp);
             if (!child) return child;
             auto v = c.fresh_d();
-            g << "    Dual " << v << " = d_mul_s(" << *child << ", " << asv << ");\n";
+            g << "    float " << mnv << " = min(" << sxv << ", min(" << syv << ", " << szv << "));\n"
+              << "    Dual " << v << " = d_mul_s(" << *child << ", " << mnv << ");\n";
             return v;
         }
         case K::RotateY: {
@@ -497,6 +593,30 @@ GlslEmitter::emit_node_dual(Ctx& c, const FRepNode& n,
               << "    Dual " << zp << " = d_add(d_mul_s(" << x << ", -" << sav
               << "), d_mul_s(" << z << ", " << cav << "));\n";
             return emit_node_dual(c, *n.children[0], xp, y, zp);
+        }
+        case K::RotateX: {
+            auto av=c.fresh("a"), cav=c.fresh("ca"), sav=c.fresh("sa");
+            g << "    float " << av  << " = " << pval(c, n, "a") << ";\n"
+              << "    float " << cav << " = cos(" << av << ");\n"
+              << "    float " << sav << " = sin(" << av << ");\n";
+            auto yp = c.fresh_d(), zp = c.fresh_d();
+            g << "    Dual " << yp << " = d_add(d_mul_s(" << y << ", " << cav
+              << "), d_mul_s(" << z << ", " << sav << "));\n"
+              << "    Dual " << zp << " = d_add(d_mul_s(" << y << ", -" << sav
+              << "), d_mul_s(" << z << ", " << cav << "));\n";
+            return emit_node_dual(c, *n.children[0], x, yp, zp);
+        }
+        case K::RotateZ: {
+            auto av=c.fresh("a"), cav=c.fresh("ca"), sav=c.fresh("sa");
+            g << "    float " << av  << " = " << pval(c, n, "a") << ";\n"
+              << "    float " << cav << " = cos(" << av << ");\n"
+              << "    float " << sav << " = sin(" << av << ");\n";
+            auto xp = c.fresh_d(), yp = c.fresh_d();
+            g << "    Dual " << xp << " = d_add(d_mul_s(" << x << ", " << cav
+              << "), d_mul_s(" << y << ", " << sav << "));\n"
+              << "    Dual " << yp << " = d_add(d_mul_s(" << x << ", -" << sav
+              << "), d_mul_s(" << y << ", " << cav << "));\n";
+            return emit_node_dual(c, *n.children[0], xp, yp, z);
         }
         case K::TwistY: {
             auto kv = c.fresh("k");
@@ -598,7 +718,19 @@ GlslEmitter::emit_node_dual(Ctx& c, const FRepNode& n,
         case K::Instance: {
             if (n.children.empty() || !n.children[0])
                 return std::unexpected(std::string("Instance is dangling (dual)"));
-            return emit_node_dual(c, *n.children[0], x, y, z);   // delegate to target
+            const FRepNode* target = n.children[0].get();
+            if (c.inst_funcs && c.inst_funcs->shared_targets.count(target)) {
+                std::string fn = emit_instance_grad_fn(c, *target);
+                if (!fn.empty()) {
+                    std::string v = c.fresh_d();
+                    c.grad_body << "    Dual " << v << " = " << fn
+                                << "(" << x << ", " << y << ", " << z << ");\n";
+                    return v;
+                }
+                // grad fn unavailable (target has a node with no dual emitter):
+                // fall through to inline delegation below.
+            }
+            return emit_node_dual(c, *target, x, y, z);   // delegate to target
         }
         default:
             // BendXY and plugin/mesh/custom nodes: no dual emitter yet.
@@ -712,6 +844,24 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
     // is acceptable in this iteration.
     MeshAccum accum;
 
+    // Level 2 instancing pre-pass: find every geometry root referenced by an
+    // InstanceNode. Those roots (and only those) become shared GLSL functions,
+    // so N instances of a shape emit one function + N calls instead of N copies.
+    InstanceFuncs inst_funcs;
+    if (cfg.instance_shared_subprograms) {
+        // Walk all objects' trees; for each InstanceNode, mark its resolved
+        // target pointer as a shared target.
+        std::function<void(const FRepNode*)> scan = [&](const FRepNode* nn) {
+            if (!nn) return;
+            if (nn->kind == NodeKind::Instance && !nn->children.empty() && nn->children[0])
+                inst_funcs.shared_targets.insert(nn->children[0].get());
+            for (const auto& ch : nn->children)
+                if (ch) scan(ch.get());
+        };
+        for (const auto& [id, obj] : scene.objects())
+            if (obj.geometry) scan(obj.geometry.get());
+    }
+
     // Texture aggregation. Each material with pattern == Texture pushes
     // its RGBA8 pixels into `tex_pixels` and records (offset, w, h).
     // The shader then samples via constant offsets baked into the
@@ -734,7 +884,22 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
             Ctx c;
             c.mesh_accum = &accum;
             c.bindings = bindings;
-            auto child = emit_node(c, *obj.geometry, "x", "y", "z");
+            c.inst_funcs = &inst_funcs;
+            std::expected<std::string, std::string> child;
+            // If this object's own geometry root is a shared instance target,
+            // emit/reuse its function and call it, so the original and all its
+            // instances share one body (the actual memory saving). Otherwise emit
+            // inline as before.
+            if (inst_funcs.shared_targets.count(obj.geometry.get())) {
+                std::string fn = emit_instance_fn(c, *obj.geometry);
+                if (fn.empty())
+                    return std::unexpected("object '" + id + "' (sdf): instance fn emit failed");
+                std::string v = c.fresh();
+                c.sdf_body << "    float " << v << " = " << fn << "(x, y, z);\n";
+                child = v;
+            } else {
+                child = emit_node(c, *obj.geometry, "x", "y", "z");
+            }
             if (!child) {
                 return std::unexpected(
                     "object '" + id + "' (sdf): " + child.error());
@@ -757,12 +922,32 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
             Ctx c;
             c.mesh_accum = &accum;
             c.bindings = bindings;
-            // Seed dual coords: value = coord, gradient = basis vector.
-            c.grad_body
-                << "    Dual x = Dual(p.x, vec3(1.0, 0.0, 0.0));\n"
-                << "    Dual y = Dual(p.y, vec3(0.0, 1.0, 0.0));\n"
-                << "    Dual z = Dual(p.z, vec3(0.0, 0.0, 1.0));\n";
-            auto child = emit_node_dual(c, *obj.geometry, "x", "y", "z");
+            c.inst_funcs = &inst_funcs;
+            std::expected<std::string, std::string> child;
+            // If this object's root is a shared instance target, emit/reuse its
+            // grad function and call it (so the original and its instances share
+            // one dual-AD body — the largest per-object emission). Else inline.
+            if (inst_funcs.shared_targets.count(obj.geometry.get())) {
+                std::string fn = emit_instance_grad_fn(c, *obj.geometry);
+                if (fn.empty()) {
+                    analytic_normals = false;   // target has a node with no dual AD
+                    child = std::unexpected(std::string("no dual"));
+                } else {
+                    std::string v = c.fresh_d();
+                    c.grad_body << "    Dual x = Dual(p.x, vec3(1.0,0.0,0.0));\n"
+                                << "    Dual y = Dual(p.y, vec3(0.0,1.0,0.0));\n"
+                                << "    Dual z = Dual(p.z, vec3(0.0,0.0,1.0));\n"
+                                << "    Dual " << v << " = " << fn << "(x, y, z);\n";
+                    child = v;
+                }
+            } else {
+                // Seed dual coords: value = coord, gradient = basis vector.
+                c.grad_body
+                    << "    Dual x = Dual(p.x, vec3(1.0, 0.0, 0.0));\n"
+                    << "    Dual y = Dual(p.y, vec3(0.0, 1.0, 0.0));\n"
+                    << "    Dual z = Dual(p.z, vec3(0.0, 0.0, 1.0));\n";
+                child = emit_node_dual(c, *obj.geometry, "x", "y", "z");
+            }
             if (!child) {
                 // This object can't do analytic AD — disable it globally.
                 analytic_normals = false;
@@ -783,7 +968,21 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
             Ctx c;
             c.mesh_accum = &accum;
             c.bindings = bindings;
-            auto child = emit_node(c, *obj.geometry, "x", "y", "z");
+            c.inst_funcs = &inst_funcs;
+            std::expected<std::string, std::string> child;
+            // Reuse the shared SDF function for the distance test when this
+            // object is an instance target (the material colour below stays
+            // per-object). Avoids re-emitting the geometry in the albedo body.
+            if (inst_funcs.shared_targets.count(obj.geometry.get())) {
+                std::string fn = emit_instance_fn(c, *obj.geometry);
+                if (fn.empty())
+                    return std::unexpected("object '" + id + "' (albedo): instance fn emit failed");
+                std::string v = c.fresh();
+                c.sdf_body << "    float " << v << " = " << fn << "(x, y, z);\n";
+                child = v;
+            } else {
+                child = emit_node(c, *obj.geometry, "x", "y", "z");
+            }
             if (!child) {
                 return std::unexpected(
                     "object '" + id + "' (albedo): " + child.error());
@@ -1108,6 +1307,9 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
         }
     }
 
+    // Level 2 instancing: shared subprogram definitions, emitted before
+    // scene_sdf so its body can call them. Empty when no instances are present.
+    src << inst_funcs.defs.str();
     src << "float scene_sdf(float x, float y, float z) {\n"
         << sdf_body.str()
         << "}\n"
@@ -1221,6 +1423,7 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
             << "    Dual corr = d_mul_s(h3, kk / 6.0);\n"
             << "    return d_sub(mn, corr);\n"
             << "}\n"
+            << inst_funcs.grad_defs.str()   // Level 2: shared grad subprograms
             << "Dual scene_sdf_grad(vec3 p) {\n"
             << grad_body.str()
             << "    return best_grad;\n"

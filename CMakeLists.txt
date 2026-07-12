@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(frep VERSION 4.41.0 LANGUAGES C CXX)
+project(frep VERSION 4.51.0 LANGUAGES C CXX)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # C++26
@@ -549,15 +549,23 @@ if(FREP_BUILD_GUI)
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
         # ── Headless reproduction of the multi-view cpu_ir-dark report ─────────
+        # Moc the Q_OBJECT headers explicitly via qt6_wrap_cpp, exactly like
+        # frep_designer above. AUTOMOC does not reliably pick these up because the
+        # .cpp files include their headers with a `gui/` path prefix, so it emits
+        # "no files require moc" and the vtables/signals go undefined at link.
+        qt6_wrap_cpp(REPRO_MOC_SOURCES
+            gui/iviewport.hpp
+            gui/executor_viewport.hpp
+        )
         add_executable(repro_cpu_ir_black
             tools/repro_cpu_ir_black.cpp
             gui/executor_viewport.cpp
-            gui/executor_viewport.hpp
-            gui/iviewport.hpp
+            gui/iviewport.cpp
+            ${REPRO_MOC_SOURCES}
         )
         set_target_properties(repro_cpu_ir_black PROPERTIES
             CXX_STANDARD 23
-            AUTOMOC ON)
+            AUTOMOC OFF)
         target_include_directories(repro_cpu_ir_black PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
             ${LLVM_INCLUDE_DIRS})

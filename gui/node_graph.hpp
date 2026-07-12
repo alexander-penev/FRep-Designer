@@ -92,6 +92,10 @@ public:
     // Called when the node is moved — updates the connected edges.
     void moved();
 
+    // Optional second line under the title (e.g. an Instance's target id).
+    void set_subtitle(const QString& s) { subtitle_ = s; update(); }
+    const QString& subtitle() const { return subtitle_; }
+
 protected:
     QVariant itemChange(GraphicsItemChange change, const QVariant& value) override;
     // Double-click on a parameter row pops up an inline editor.
@@ -100,6 +104,7 @@ protected:
 private:
     NodeTypeInfo               info_;
     int                        node_id_;
+    QString                    subtitle_;
     std::map<QString, float>   param_values_;
     std::vector<PortItem*>     inputs_;
     PortItem*                  output_ = nullptr;

@@ -31,7 +31,7 @@ What you get:
 
 - **Procedural primitives + CSG** (Union, Intersection, Difference,
   smooth Union).
-- **Transforms** (Translate, Scale, RotateY) and non-linear
+- **Transforms** (Translate, non-uniform Scale, RotateX/Y/Z) and non-linear
   **deformations** (Twist, Bend, Taper).
 - **Mesh import** (OBJ/STL) — meshes are voxelised into SDF grids and
   participate in CSG as first-class objects.
@@ -147,7 +147,14 @@ Material, Lights, Node Graph) plus the viewport and toolbar:
 - **Node Graph tab** — visual editing of the FRepNode tree for the
   currently selected object. "Editing:" dropdown switches the active
   object; "Follow" checkbox controls whether selection changes
-  elsewhere update the graph; "Fit" frames all nodes in view.
+  elsewhere update the graph; "Fit" frames all nodes in view. The
+  right-click palette groups node types by category — Primitives,
+  Operations, Transforms (Translate, non-uniform Scale, RotateX/Y/Z),
+  Deformations (TwistY, BendXY, TaperY), and Plugins. Instances appear
+  in the graph as a pink node labelled with the target object's id (→ id);
+  they aren't created from the palette (an instance needs a target — make
+  one from the Scene toolbar), and their shared target subtree is not
+  re-expanded in the graph to avoid duplicating it.
 
 ### About `--realtime`
 
@@ -359,11 +366,14 @@ Each `geometry` object has a `type` field plus type-specific parameters:
 | `SmoothUnion` | `child` × 2 + `k` | quintic smin |
 | `Negate` | `child` | flips inside/outside |
 | `Translate` | `child` + `tx, ty, tz` | offset in space |
-| `Scale` | `child` + `s` | uniform scale |
+| `Scale` | `child` + `s` (uniform) or `sx, sy, sz` (non-uniform) | scale; non-uniform makes ellipsoids etc. |
+| `RotateX` | `child` + `a` (radians) | rotate around X |
 | `RotateY` | `child` + `a` (radians) | rotate around Y |
+| `RotateZ` | `child` + `a` (radians) | rotate around Z |
 | `TwistY` | `child` + `k` | helix-twist with rate k |
 | `BendXY` | `child` + `k` | bend around X by curvature k |
 | `TaperY` | `child` + `t, h` | linear taper, ratio t over height h |
+| `Instance` | `target_id` | live reference to another object's geometry (shares it, not a copy) |
 
 Composite nodes recursively contain a `child` (or `children`) JSON
 object that follows the same schema.

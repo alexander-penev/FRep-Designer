@@ -75,9 +75,9 @@ FRepNode::AABB TranslateNode::aabb() const {
 
 FRepNode::AABB ScaleNode::aabb() const {
     auto c = children[0]->aabb();
-    float s = params.at("s");
-    return {c.min_x * s, c.min_y * s, c.min_z * s,
-            c.max_x * s, c.max_y * s, c.max_z * s};
+    float sx=params.at("sx"), sy=params.at("sy"), sz=params.at("sz");
+    return {c.min_x * sx, c.min_y * sy, c.min_z * sz,
+            c.max_x * sx, c.max_y * sy, c.max_z * sz};
 }
 
 // RotateY: the rotated box may be larger — conservatively we take
@@ -89,6 +89,22 @@ FRepNode::AABB RotateYNode::aabb() const {
     float rz = std::max(std::abs(c.min_z), std::abs(c.max_z));
     float r  = std::sqrt(rx * rx + rz * rz);
     return {-r, c.min_y, -r, r, c.max_y, r};
+}
+
+FRepNode::AABB RotateXNode::aabb() const {
+    auto c = children[0]->aabb();
+    float ry = std::max(std::abs(c.min_y), std::abs(c.max_y));
+    float rz = std::max(std::abs(c.min_z), std::abs(c.max_z));
+    float r  = std::sqrt(ry * ry + rz * rz);
+    return {c.min_x, -r, -r, c.max_x, r, r};
+}
+
+FRepNode::AABB RotateZNode::aabb() const {
+    auto c = children[0]->aabb();
+    float rx = std::max(std::abs(c.min_x), std::abs(c.max_x));
+    float ry = std::max(std::abs(c.min_y), std::abs(c.max_y));
+    float r  = std::sqrt(rx * rx + ry * ry);
+    return {-r, -r, c.min_z, r, r, c.max_z};
 }
 
 } // namespace frep

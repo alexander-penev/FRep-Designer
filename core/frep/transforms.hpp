@@ -50,33 +50,47 @@ public:
 class ScaleNode final : public FRepNode {
     const char* type_name() const noexcept override { return "Scale"; }
 public:
+    // Uniform scale (backward-compatible): stores sx=sy=sz=s.
     ScaleNode(FRepNode::Ptr child, float s, std::string nid = "sc") {
         kind = NodeKind::Scale; id = std::move(nid);
-        params["s"] = s;
+        params["sx"] = s; params["sy"] = s; params["sz"] = s;
+        children = {std::move(child)};
+    }
+    // Non-uniform scale: independent per-axis factors.
+    ScaleNode(FRepNode::Ptr child, float sx, float sy, float sz, std::string nid = "sc") {
+        kind = NodeKind::Scale; id = std::move(nid);
+        params["sx"] = sx; params["sy"] = sy; params["sz"] = sz;
         children = {std::move(child)};
     }
 
     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
         auto& b   = c.b;
-        auto s_v  = c.param_value(id, "s", params.at("s"));
-        auto inv  = b.CreateFDiv(c.fc(1.0f), s_v, "inv_s");
-        auto  xs  = b.CreateFMul(x, inv, "xs");
-        auto  ys  = b.CreateFMul(y, inv, "ys");
-        auto  zs  = b.CreateFMul(z, inv, "zs");
+        auto sx = c.param_value(id, "sx", params.at("sx"));
+        auto sy = c.param_value(id, "sy", params.at("sy"));
+        auto sz = c.param_value(id, "sz", params.at("sz"));
+        auto  xs  = b.CreateFDiv(x, sx, "xs");
+        auto  ys  = b.CreateFDiv(y, sy, "ys");
+        auto  zs  = b.CreateFDiv(z, sz, "zs");
         auto  sdf = children[0]->codegen(c, xs, ys, zs);
-        return b.CreateFMul(sdf, s_v, "sc_sdf");
+        // Non-uniform scale is not distance-preserving; multiply by the SMALLEST
+        // axis factor to keep the result a conservative (never-overshooting) SDF.
+        auto mn = frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::minnum, sx, sy);
+        mn = frep::llvm_compat::binary_intrinsic(b, llvm::Intrinsic::minnum, mn, sz);
+        return b.CreateFMul(sdf, mn, "sc_sdf");
     }
-
 
     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
     AABB aabb() const override;
     float eval(float x, float y, float z) const override {
-        float sv = params.at("s");
-        return children[0]->eval(x/sv, y/sv, z/sv) * sv;
+        float sx=params.at("sx"), sy=params.at("sy"), sz=params.at("sz");
+        float mn = std::min(sx, std::min(sy, sz));
+        return children[0]->eval(x/sx, y/sy, z/sz) * mn;
     }
     std::size_t structural_hash() const noexcept override {
         return children[0]->structural_hash()
-             ^ std::hash<float>{}(params.at("s"))
+             ^ std::hash<float>{}(params.at("sx"))
+             ^ (std::hash<float>{}(params.at("sy")) << 1)
+             ^ (std::hash<float>{}(params.at("sz")) << 2)
              ^ 0x9900'1122ull;
     }
 };
@@ -119,6 +133,70 @@ public:
         return children[0]->structural_hash()
              ^ std::hash<float>{}(params.at("a"))
              ^ 0xAA11'BB22ull;
+    }
+};
+
+// Rotate about the X axis: rotates (y, z), leaves x. Mirrors RotateYNode.
+class RotateXNode final : public FRepNode {
+    const char* type_name() const noexcept override { return "RotateX"; }
+public:
+    RotateXNode(FRepNode::Ptr child, float angle_rad, std::string nid = "rx") {
+        kind = NodeKind::RotateX; id = std::move(nid);
+        params["a"] = angle_rad;
+        children = {std::move(child)};
+    }
+    llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+        auto& b  = c.b;
+        auto  a_v = c.param_value(id, "a", params.at("a"));
+        auto  ca = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::cos, a_v);
+        auto  sa = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sin, a_v);
+        auto  yr = b.CreateFAdd(b.CreateFMul(ca, y), b.CreateFMul(sa, z), "yr");
+        auto  zr = b.CreateFSub(b.CreateFMul(ca, z), b.CreateFMul(sa, y), "zr");
+        return children[0]->codegen(c, x, yr, zr);
+    }
+    DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+    AABB aabb() const override;
+    float eval(float x, float y, float z) const override {
+        float a = params.at("a");
+        float ca = std::cos(a), sa = std::sin(a);
+        return children[0]->eval(x, ca*y + sa*z, ca*z - sa*y);
+    }
+    std::size_t structural_hash() const noexcept override {
+        return children[0]->structural_hash()
+             ^ std::hash<float>{}(params.at("a"))
+             ^ 0xBB22'CC33ull;
+    }
+};
+
+// Rotate about the Z axis: rotates (x, y), leaves z. Mirrors RotateYNode.
+class RotateZNode final : public FRepNode {
+    const char* type_name() const noexcept override { return "RotateZ"; }
+public:
+    RotateZNode(FRepNode::Ptr child, float angle_rad, std::string nid = "rz") {
+        kind = NodeKind::RotateZ; id = std::move(nid);
+        params["a"] = angle_rad;
+        children = {std::move(child)};
+    }
+    llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+        auto& b  = c.b;
+        auto  a_v = c.param_value(id, "a", params.at("a"));
+        auto  ca = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::cos, a_v);
+        auto  sa = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sin, a_v);
+        auto  xr = b.CreateFAdd(b.CreateFMul(ca, x), b.CreateFMul(sa, y), "xr");
+        auto  yr = b.CreateFSub(b.CreateFMul(ca, y), b.CreateFMul(sa, x), "yr");
+        return children[0]->codegen(c, xr, yr, z);
+    }
+    DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+    AABB aabb() const override;
+    float eval(float x, float y, float z) const override {
+        float a = params.at("a");
+        float ca = std::cos(a), sa = std::sin(a);
+        return children[0]->eval(ca*x + sa*y, ca*y - sa*x, z);
+    }
+    std::size_t structural_hash() const noexcept override {
+        return children[0]->structural_hash()
+             ^ std::hash<float>{}(params.at("a"))
+             ^ 0xCC33'DD44ull;
     }
 };
 

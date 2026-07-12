@@ -141,15 +141,29 @@ inline Iv node_interval(const FRepNode& n, Iv X, Iv Y, Iv Z) {
                                         {Y.lo-pf("ty",0.0f),Y.hi-pf("ty",0.0f)},
                                         {Z.lo-pf("tz",0.0f),Z.hi-pf("tz",0.0f)});
         case NodeKind::Scale: {
-            float s=pf("s",1.0f);
-            Iv c=node_interval(*n.children[0], div(X,{s,s}), div(Y,{s,s}), div(Z,{s,s}));
-            return {c.lo*s, c.hi*s};
+            float sx=pf("sx",1.0f), sy=pf("sy",1.0f), sz=pf("sz",1.0f);
+            float mn=std::min(std::abs(sx),std::min(std::abs(sy),std::abs(sz)));
+            Iv c=node_interval(*n.children[0], div(X,{sx,sx}), div(Y,{sy,sy}), div(Z,{sz,sz}));
+            // scale distance by smallest |factor|; result endpoints stay ordered
+            return {std::min(c.lo*mn,c.hi*mn), std::max(c.lo*mn,c.hi*mn)};
         }
         case NodeKind::RotateY: {
-            float ang=pf("angle",0.0f), cs=std::cos(ang), sn=std::sin(ang);
+            float ang=pf("a",0.0f), cs=std::cos(ang), sn=std::sin(ang);
             Iv nx=add(mul({cs,cs},X), mul({sn,sn},Z));
             Iv nz=add(mul({-sn,-sn},X), mul({cs,cs},Z));
             return node_interval(*n.children[0], nx, Y, nz);
+        }
+        case NodeKind::RotateX: {
+            float ang=pf("a",0.0f), cs=std::cos(ang), sn=std::sin(ang);
+            Iv ny=add(mul({cs,cs},Y), mul({sn,sn},Z));
+            Iv nz=add(mul({-sn,-sn},Y), mul({cs,cs},Z));
+            return node_interval(*n.children[0], X, ny, nz);
+        }
+        case NodeKind::RotateZ: {
+            float ang=pf("a",0.0f), cs=std::cos(ang), sn=std::sin(ang);
+            Iv nx=add(mul({cs,cs},X), mul({sn,sn},Y));
+            Iv ny=add(mul({-sn,-sn},X), mul({cs,cs},Y));
+            return node_interval(*n.children[0], nx, ny, Z);
         }
         case NodeKind::TwistY: {
             float k=pf("k",1.0f);

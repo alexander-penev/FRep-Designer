@@ -8,6 +8,7 @@
 
 #include <QStringList>
 #include <QWidget>
+#include <QTreeWidget>
 
 #include <string>
 #include <vector>
@@ -103,7 +104,20 @@ private:
     // scale gizmos. Like translation, single-selection only; editing
     // commits a SetRotationCommand / SetScaleCommand.
     QDoubleSpinBox* sp_rot_y_  = nullptr;
+    QDoubleSpinBox* sp_rot_x_  = nullptr;
+    QDoubleSpinBox* sp_rot_z_  = nullptr;
     QDoubleSpinBox* sp_scale_  = nullptr;
+    QDoubleSpinBox* sp_scale_y_ = nullptr;
+    QDoubleSpinBox* sp_scale_z_ = nullptr;
+
+    // Property grid: a tree of the selected object's nodes and their numeric
+    // parameters, editable. populate_properties() rebuilds it; on_property_edited
+    // commits a value edit. building_props_ guards the itemChanged signal while
+    // we populate (so programmatic fills don't look like user edits).
+    QTreeWidget* prop_tree_ = nullptr;
+    bool         building_props_ = false;
+    void populate_properties(const QString& object_id);
+    void on_property_edited(QTreeWidgetItem* item, int column);
 };
 
 } // namespace frep::gui
