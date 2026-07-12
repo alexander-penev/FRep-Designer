@@ -32,7 +32,7 @@ tracing).
 | Feature                    | CPU_IR | GPU_IR | GPU_GLSL | GPU_RTX |
 |----------------------------|:------:|:------:|:--------:|:-------:|
 | Tile cull — Lipschitz/Auto-metric | ✓ | ✓ | ✓ | — |
-| Tile cull — Interval              | — | — | ✓ | — |
+| Tile cull — Interval / Auto-nonmetric | ✓ | ✓ | ✓ | — |
 | Ray-box clip (scene AABB near/far) | ✓ | ✓ | (1) | — |
 | Debug views (step heatmap, cull span) | — | — | ✓ | — |
 
@@ -107,17 +107,16 @@ the energy/cost axes that decide *which* devices to add.
 
 ## Honest gap summary
 
-- **Real gap (IR paths):** the *interval* tile cull is GPU_GLSL-only (it needs an
-  IR interval emitter — the CPU/GLSL interval evaluators exist, but there is no
-  LLVM-IR interval codegen yet). The *Lipschitz* tile cull now runs on CpuIr and
-  GpuIr (for metric trees / Auto-on-metric, L=1 sound): a tile that misses the
-  geometry becomes an instant miss (~3.4x on a miss-tile), while tiles over the
-  surface are unchanged (correct — there's real work there). Combined with the
-  ray-box clip (4.48.0, empty space outside the scene box) the IR paths now cull
-  both the outside-box space and whole empty tiles; per-slab occupancy for
-  non-metric trees inside the box still needs the interval emitter. Note (1): the
-  GLSL path skips the ray-box clip because its tile cull already bounds the march
-  more tightly.
+- **Cross-path consistency (tile cull):** both Lipschitz and interval tile cull
+  now run on CpuIr, GpuIr, and GpuGlsl. The IR paths gained a third interval
+  implementation — an LLVM-IR interval emitter (node_interval_ir.hpp), alongside
+  the CPU evaluator and the GLSL string emitter — so interval culling (sound for
+  non-metric trees) is no longer GLSL-only. Auto resolves to Lipschitz on metric
+  trees (L=1, cheapest) and interval otherwise, matching the GLSL resolver.
+  Verified byte-identical to no-cull on CpuIr; a miss-tile is up to ~93x faster
+  on a non-metric (twisted) scene where sphere tracing otherwise crawls. Note
+  (1): the GLSL path skips the ray-box clip because its tile cull already bounds
+  the march tightly. The only remaining cull gap is GPU_RTX.
 - **Done, hardware-confirmed:** MeshSDF + Texture on GPU_RTX; RT is 17/17.
 - **Untested, likely fine:** plugin nodes on GPU_RTX.
 - **Done, was validation:** multi-machine LAN distributed run.
