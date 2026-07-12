@@ -25,15 +25,15 @@ tracing).
 | **MeshSDF** (voxel grid)   |   ✓    |   ✓    |    ✓     |  ✓ (1)  |
 | Plugin nodes               |   ✓    |   ✓    |    ✓     |   (2)   |
 | **Instance** (L1: shared reference) | ✓ | ✓ |   ✓     |    ✓    |
-| **Instance** (L2: shared subprogram, memory) | ✓ | ✓ | ✓ |  —  |
+| **Instance** (L2: shared subprogram, memory) | ✓ | ✓ | ✓ |  ✓  |
 
 ## Acceleration & debug (GLSL-emitter features)
 
 | Feature                    | CPU_IR | GPU_IR | GPU_GLSL | GPU_RTX |
 |----------------------------|:------:|:------:|:--------:|:-------:|
 | Tile cull — Lipschitz/Auto-metric | ✓ | ✓ | ✓ | — |
-| Tile cull — Interval / Auto-nonmetric | ✓ | ✓ | ✓ | — |
-| Ray-box clip (scene AABB near/far) | ✓ | ✓ | (1) | — |
+| Tile cull — Interval / Auto-nonmetric | ✓ | ✓ | ✓ | ✓ (2) |
+| Ray-box clip (scene AABB near/far) | ✓ | ✓ | (1) | (2) |
 | Debug views (step heatmap, cull span) | — | — | ✓ | — |
 
 ## Materials & shading
@@ -107,16 +107,22 @@ the energy/cost axes that decide *which* devices to add.
 
 ## Honest gap summary
 
-- **Cross-path consistency (tile cull):** both Lipschitz and interval tile cull
-  now run on CpuIr, GpuIr, and GpuGlsl. The IR paths gained a third interval
-  implementation — an LLVM-IR interval emitter (node_interval_ir.hpp), alongside
-  the CPU evaluator and the GLSL string emitter — so interval culling (sound for
-  non-metric trees) is no longer GLSL-only. Auto resolves to Lipschitz on metric
-  trees (L=1, cheapest) and interval otherwise, matching the GLSL resolver.
-  Verified byte-identical to no-cull on CpuIr; a miss-tile is up to ~93x faster
-  on a non-metric (twisted) scene where sphere tracing otherwise crawls. Note
-  (1): the GLSL path skips the ray-box clip because its tile cull already bounds
-  the march tightly. The only remaining cull gap is GPU_RTX.
+- **Cross-path consistency (complete):** instancing Level 2 and interval tile
+  cull now run on all four paths — CpuIr, GpuIr, GpuGlsl, and GpuRtx. For RTX,
+  Level 2 works because the shared _inst_fn_N subprograms are lifted into the RT
+  intersection shader (the lift now starts at the earliest instance function, not
+  scene_sdf); the "tile cull" analog is an interval pre-skip in the intersection
+  shader that bounds the field over each ray's AABB segment and skips the
+  sphere-trace when the segment can't contain the surface (the hardware BVH
+  already does object-level broad-phase; this trims empty space within an
+  object's AABB). Both verified by real rendering on the lavapipe software RT
+  device: RTX interval cull on-vs-off and Level-2 vs Level-1 are byte-identical
+  (max diff 0.0000). Notes: (1) the GLSL compute path skips the ray-box clip
+  because its tile cull already bounds the march tightly; (2) on RTX the hardware
+  BVH provides the broad-phase, and the interval pre-skip provides the
+  within-AABB trim, so a separate ray-box clip is redundant. Performance on real
+  NVIDIA RT hardware is for the user to confirm; the software RT device
+  establishes correctness and shader validity.
 - **Done, hardware-confirmed:** MeshSDF + Texture on GPU_RTX; RT is 17/17.
 - **Untested, likely fine:** plugin nodes on GPU_RTX.
 - **Done, was validation:** multi-machine LAN distributed run.
