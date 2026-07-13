@@ -93,7 +93,16 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
     };
 
     const auto& name = n.ident;
-    if (name == "sqrt")  return unary(llvm::Intrinsic::sqrt);
+    if (name == "sqrt") {
+        // Domain-safe: sqrt of a negative (from imported expressions that assume
+        // clamped domains) would be NaN. Clamp the argument at 0 like libfive.
+        auto* mx0 = llvm::Intrinsic::getDeclaration(
+            mod_, llvm::Intrinsic::maxnum, {b.getFloatTy()});
+        auto* S = llvm::Intrinsic::getDeclaration(
+            mod_, llvm::Intrinsic::sqrt, {b.getFloatTy()});
+        return b.CreateCall(S, {b.CreateCall(mx0,
+            {args[0], llvm::ConstantFP::get(b.getFloatTy(), 0.0f)})});
+    }
     if (name == "abs")   return unary(llvm::Intrinsic::fabs);
     if (name == "sin")   return unary(llvm::Intrinsic::sin);
     if (name == "cos")   return unary(llvm::Intrinsic::cos);
@@ -103,7 +112,32 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
     if (name == "ceil")  return unary(llvm::Intrinsic::ceil);
     if (name == "min")   return binary(llvm::Intrinsic::minnum);
     if (name == "max")   return binary(llvm::Intrinsic::maxnum);
-    if (name == "pow")   return binary(llvm::Intrinsic::pow);
+    if (name == "pow") {
+        // Domain-safe pow: copysign(|a|^b, a). Raw llvm.pow is NaN for a negative
+        // base with a fractional exponent, which turns imported analytic scenes
+        // (the involute-gear .let files use pow(x,-0.2) etc.) into all-NaN black
+        // frames. For a non-negative base this equals plain pow, so the blend h^k
+        // case is unchanged. The extra fabs/copysign cost is negligible next to
+        // the pow itself; scenes with hundreds of pow calls (gears) are expensive
+        // to compile regardless, because of their sheer expression size.
+        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {b.getFloatTy()});
+        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {b.getFloatTy()});
+        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {b.getFloatTy()});
+        auto* mag = b.CreateCall(P, {b.CreateCall(fa, {args[0]}), args[1]});
+        return b.CreateCall(cs, {mag, args[0]});
+    }
+    if (name == "nth_root") {
+        // b-th root, domain-safe for negative bases: copysign(|a|^(1/b), a).
+        // This is what libfive's OP_NTH_ROOT does; the converter emits it (rather
+        // than pow(a,1/b), which is NaN for a negative base). Plain pow stays the
+        // raw fast intrinsic — only genuine nth-roots pay for the sign handling.
+        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {b.getFloatTy()});
+        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {b.getFloatTy()});
+        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {b.getFloatTy()});
+        auto* inv = b.CreateFDiv(llvm::ConstantFP::get(b.getFloatTy(), 1.0f), args[1]);
+        auto* mag = b.CreateCall(P, {b.CreateCall(fa, {args[0]}), inv});
+        return b.CreateCall(cs, {mag, args[0]});
+    }
     // Inverse-trig / atan2 / mod: no LLVM intrinsics -> libm calls.
     // CPU-JIT resolves them from the process; GPU_IR (NVPTX) needs
     // self-contained transcendentals, so these are CPU-only for now.
@@ -115,8 +149,19 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
         auto* fty = llvm::FunctionType::get(b.getFloatTy(), {b.getFloatTy(), b.getFloatTy()}, false);
         return b.CreateCall(mod_->getOrInsertFunction(fn, fty), {args[0], args[1]});
     };
-    if (name == "asin")  return libm1("asinf");
-    if (name == "acos")  return libm1("acosf");
+    // clamp helper for inverse-trig domain [-1, 1]
+    auto clamp_unit = [&](llvm::Value* v) {
+        auto* mn = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::minnum, {b.getFloatTy()});
+        auto* mx = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::maxnum, {b.getFloatTy()});
+        auto* lo = b.CreateCall(mx, {v, llvm::ConstantFP::get(b.getFloatTy(), -1.0f)});
+        return b.CreateCall(mn, {lo, llvm::ConstantFP::get(b.getFloatTy(), 1.0f)});
+    };
+    auto libm1c = [&](const char* fn, llvm::Value* arg) {
+        auto* fty = llvm::FunctionType::get(b.getFloatTy(), {b.getFloatTy()}, false);
+        return b.CreateCall(mod_->getOrInsertFunction(fn, fty), {arg});
+    };
+    if (name == "asin")  return libm1c("asinf", clamp_unit(args[0]));
+    if (name == "acos")  return libm1c("acosf", clamp_unit(args[0]));
     if (name == "atan")  return libm1("atanf");
     if (name == "atan2") return libm2("atan2f");
     if (name == "mod")   return libm2("fmodf");
@@ -258,6 +303,14 @@ CustomExprCompiler::gen_call_ival(const expr::Node& n) {
         auto*P=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::pow,{b.getFloatTy()});
         auto lo=mx(a[0].first,fc(0.0f)), hi=mx(a[0].second,fc(0.0f));
         return {b.CreateCall(P,{lo,a[1].first}), b.CreateCall(P,{hi,a[1].second})}; }
+    if (nm=="nth_root"){ // b-th root: monotone increasing in the base for b>0
+        auto*P=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::pow,{b.getFloatTy()});
+        auto*fa=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::fabs,{b.getFloatTy()});
+        auto*cs=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::copysign,{b.getFloatTy()});
+        auto invlo=b.CreateFDiv(fc(1.0f),a[1].first), invhi=b.CreateFDiv(fc(1.0f),a[1].second);
+        auto lo=b.CreateCall(cs,{b.CreateCall(P,{b.CreateCall(fa,{a[0].first}),invlo}),a[0].first});
+        auto hi=b.CreateCall(cs,{b.CreateCall(P,{b.CreateCall(fa,{a[0].second}),invhi}),a[0].second});
+        return {mn(lo,hi), mx(lo,hi)}; }
     // trig etc.: not yet interval-supported
     auto Fc=[&](float v){ return fc(v); };
     auto Sin=[&](llvm::Value* v){ return I(llvm::Intrinsic::sin,v); };
@@ -464,7 +517,24 @@ llvm::Value* CustomExprCompiler::gen_call_vec(const expr::Node& n) {
     if (nm == "log")   return vintr(llvm::Intrinsic::log);
     if (nm == "floor") return vintr(llvm::Intrinsic::floor);
     if (nm == "ceil")  return vintr(llvm::Intrinsic::ceil);
-    if (nm == "pow")   return vintr(llvm::Intrinsic::pow);
+    if (nm == "pow") {
+        // Match the scalar path's domain-safe pow: copysign(|a|^b, a).
+        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {a[0]->getType()});
+        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {a[0]->getType()});
+        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {a[0]->getType()});
+        auto* mag = b.CreateCall(P, {b.CreateCall(fa, {a[0]}), a[1]});
+        return b.CreateCall(cs, {mag, a[0]});
+    }
+    if (nm == "nth_root") {
+        // copysign(|a|^(1/b), a), vector-wide.
+        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {a[0]->getType()});
+        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {a[0]->getType()});
+        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {a[0]->getType()});
+        auto* one = llvm::ConstantFP::get(a[0]->getType(), 1.0f);
+        auto* inv = b.CreateFDiv(one, a[1]);
+        auto* mag = b.CreateCall(P, {b.CreateCall(fa, {a[0]}), inv});
+        return b.CreateCall(cs, {mag, a[0]});
+    }
     if (nm == "min")   return vintr(llvm::Intrinsic::minnum);
     if (nm == "max")   return vintr(llvm::Intrinsic::maxnum);
     if (nm == "tan") { llvm::Value* s; llvm::Value* c; vp.sincos(a[0], &s, &c);
@@ -647,7 +717,8 @@ float CustomExprNode::eval_ast(const expr::Node& n, float x, float y, float z) {
             if (name == "atan")  return std::atan(a0);
             if (name == "ceil")  return std::ceil(a0);
             float a1 = eval_ast(*n.children[1], x, y, z);
-            if (name == "pow")   return std::pow(a0, a1);
+            if (name == "pow")   return std::copysign(std::pow(std::fabs(a0), a1), a0);
+            if (name == "nth_root") return std::copysign(std::pow(std::fabs(a0), 1.0f/a1), a0);
             if (name == "min")   return std::fmin(a0, a1);
             if (name == "max")   return std::fmax(a0, a1);
             if (name == "atan2") return std::atan2(a0, a1);
