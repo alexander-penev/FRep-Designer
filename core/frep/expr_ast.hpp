@@ -161,6 +161,7 @@ inline int builtin_arity(const std::string& name) {
     if (name == "asin"  ) return 1;
     if (name == "acos"  ) return 1;
     if (name == "pow"   ) return 2;
+    if (name == "nth_root") return 2;   // b-th root, domain-safe for negative base
     if (name == "atan2" ) return 2;
     if (name == "mod"   ) return 2;
     if (name == "min"   ) return 2;
