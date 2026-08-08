@@ -1,4 +1,4 @@
-# F-Rep Designer — Proof of Concept
+# F-Rep Designer 4.0
 
 An implementation of the "everything is code" approach from the papers
 *F-Rep Designer 2.0* and *Geometric Modeling Systems as Visual Programming
