@@ -20,6 +20,39 @@ done
 | `04_patterned_spheres.json` | Solid, Checker, and Stripes pattern materials |
 | `05_carved_sphere.json` | Sphere with a cubic Difference cut-out |
 | `06_textured_objects.json` | Wood-textured sphere + marble-textured cube (loaded from `textures/`) |
+| `07_default_twisted_columns.json` | The GUI's default startup scene plus a back row of four twisted columns, one per twist rate |
+
+`07_default_twisted_columns.json` is the figure scene (`docs/gallery/fig1_scene_only.png`).
+It reproduces `build_default_scene()` from `gui/main.cpp` node for node — red
+sphere, blue box, green rounded cube, yellow SmoothUnion blob, grey floor plane —
+then adds a back row of four `Translate → TwistY → RotateY → Box` columns, all the
+same size, differing only in twist rate, direction and starting phase:
+
+| column | `tx` | `k` | phase | quarter-turns |
+|---|---|---|---|---|
+| 1 | −3.75 | +1.00 | 81° | 3.1 |
+| 2 | −1.25 | +0.55 | 79° | 1.7 |
+| 3 | +1.25 | +1.25 | 50° | 3.9 |
+| 4 | +3.75 | −1.00 | 31° | 3.1 |
+
+The `tx` values came out of the fit as −3.82/−1.25/+1.26/+3.80 and are snapped
+to a uniform 2.5 spacing — the same spacing as the front row (box −2.5, sphere 0,
+cube +2.5), offset by 1.25. The snap moves each column by under 0.08 world units,
+inside the fit's own residual.
+
+Columns 1 and 4 have the same rate in opposite directions; 2 is the slow one;
+3 is the fastest. The `RotateY` sits *under* the `TwistY`, so the total rotation
+at height y is `k·y + a` — a pure phase offset that does not touch the rate.
+All four are `Box(0.54, 2.45, 0.54)` at `ty = 0.75, tz = −5.32`, so their bases
+sit exactly on the floor plane at `y = −1.7`.
+
+The camera — `(0, 1.13, 8.33)` looking at `(0, −0.30, 0)`, fov 56.3° — and the
+column geometry were solved back from the reference image rather than eyeballed:
+the horizon row, the sphere's silhouette and the box's eight projected corners
+fix the camera to 1.2 px rms; the column silhouettes plus the row where columns
+2 and 3 meet the floor fix their position, thickness and height to 2.3 px rms.
+The twist rates come from autocorrelating each column's shading pattern along
+its own axis. Phases are the least certain number in the table.
 
 The `textures/` subdirectory contains the BMP texture assets referenced
 by the textured scenes — these are procedurally generated (256×256
