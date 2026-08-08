@@ -1,0 +1,291 @@
+{
+  "version": "4.0",
+  "camera": {
+    "position": [0, 1.13, 8.33],
+    "target": [0, -0.3, 0],
+    "up": [0, 1, 0],
+    "fov_deg": 56.3,
+    "projection": "perspective",
+    "ortho_size": 4
+  },
+  "lights": [
+    {
+      "pos": [5, 10, 5],
+      "color": [1, 1, 1],
+      "intensity": 1
+    }
+  ],
+  "objects": [
+    {
+      "id": "sphere",
+      "visible": true,
+      "material": {
+        "albedo": [0.9, 0.3, 0.2],
+        "roughness": 0.5,
+        "metallic": 0,
+        "emission": 0
+      },
+      "geometry": {
+        "type": "Sphere",
+        "id": "sphere",
+        "params": { "r": 1 }
+      }
+    },
+    {
+      "id": "tr_box",
+      "visible": true,
+      "material": {
+        "albedo": [0.2, 0.6, 0.9],
+        "roughness": 0.5,
+        "metallic": 0,
+        "emission": 0
+      },
+      "geometry": {
+        "type": "Translate",
+        "id": "tr_box",
+        "params": { "tx": -2.5, "ty": 0, "tz": 0 },
+        "children": [
+          {
+            "type": "Box",
+            "id": "box",
+            "params": { "hx": 0.8, "hy": 0.8, "hz": 0.8 }
+          }
+        ]
+      }
+    },
+    {
+      "id": "tr_rb",
+      "visible": true,
+      "material": {
+        "albedo": [0.3, 0.9, 0.4],
+        "roughness": 0.5,
+        "metallic": 0,
+        "emission": 0
+      },
+      "geometry": {
+        "type": "Translate",
+        "id": "tr_rb",
+        "params": { "tx": 2.5, "ty": 0, "tz": 0 },
+        "children": [
+          {
+            "type": "Intersection",
+            "id": "rounded",
+            "params": {},
+            "children": [
+              {
+                "type": "Box",
+                "id": "rb_box",
+                "params": { "hx": 0.9, "hy": 0.9, "hz": 0.9 }
+              },
+              {
+                "type": "Sphere",
+                "id": "rb_s",
+                "params": { "r": 1.15 }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "blobs",
+      "visible": true,
+      "material": {
+        "albedo": [0.9, 0.7, 0.2],
+        "roughness": 0.5,
+        "metallic": 0,
+        "emission": 0
+      },
+      "geometry": {
+        "type": "SmoothUnion",
+        "id": "blobs",
+        "params": { "k": 0.4 },
+        "children": [
+          {
+            "type": "Translate",
+            "id": "tba",
+            "params": { "tx": 0.4, "ty": -1.2, "tz": 1 },
+            "children": [
+              {
+                "type": "Sphere",
+                "id": "ba",
+                "params": { "r": 0.55 }
+              }
+            ]
+          },
+          {
+            "type": "Translate",
+            "id": "tbb",
+            "params": { "tx": -0.4, "ty": -1.2, "tz": 1 },
+            "children": [
+              {
+                "type": "Sphere",
+                "id": "bb",
+                "params": { "r": 0.5 }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "tr_col1",
+      "visible": true,
+      "material": {
+        "albedo": [0.63, 0.52, 0.8],
+        "roughness": 0.5,
+        "metallic": 0,
+        "emission": 0
+      },
+      "geometry": {
+        "type": "Translate",
+        "id": "tr_col1",
+        "params": { "tx": -3.75, "ty": 0.75, "tz": -5.32 },
+        "children": [
+          {
+            "type": "TwistY",
+            "id": "tw_col1",
+            "params": { "k": 1.0 },
+            "children": [
+              {
+                "type": "RotateY",
+                "id": "ph_col1",
+                "params": { "a": 1.414 },
+                "children": [
+                  {
+                    "type": "Box",
+                    "id": "col1",
+                    "params": { "hx": 0.54, "hy": 2.45, "hz": 0.54 }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "tr_col2",
+      "visible": true,
+      "material": {
+        "albedo": [0.54, 0.59, 0.8],
+        "roughness": 0.5,
+        "metallic": 0,
+        "emission": 0
+      },
+      "geometry": {
+        "type": "Translate",
+        "id": "tr_col2",
+        "params": { "tx": -1.25, "ty": 0.75, "tz": -5.32 },
+        "children": [
+          {
+            "type": "TwistY",
+            "id": "tw_col2",
+            "params": { "k": 0.55 },
+            "children": [
+              {
+                "type": "RotateY",
+                "id": "ph_col2",
+                "params": { "a": 1.379 },
+                "children": [
+                  {
+                    "type": "Box",
+                    "id": "col2",
+                    "params": { "hx": 0.54, "hy": 2.45, "hz": 0.54 }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "tr_col3",
+      "visible": true,
+      "material": {
+        "albedo": [0.68, 0.56, 0.8],
+        "roughness": 0.5,
+        "metallic": 0,
+        "emission": 0
+      },
+      "geometry": {
+        "type": "Translate",
+        "id": "tr_col3",
+        "params": { "tx": 1.25, "ty": 0.75, "tz": -5.32 },
+        "children": [
+          {
+            "type": "TwistY",
+            "id": "tw_col3",
+            "params": { "k": 1.25 },
+            "children": [
+              {
+                "type": "RotateY",
+                "id": "ph_col3",
+                "params": { "a": 0.873 },
+                "children": [
+                  {
+                    "type": "Box",
+                    "id": "col3",
+                    "params": { "hx": 0.54, "hy": 2.45, "hz": 0.54 }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "tr_col4",
+      "visible": true,
+      "material": {
+        "albedo": [0.54, 0.5, 0.8],
+        "roughness": 0.5,
+        "metallic": 0,
+        "emission": 0
+      },
+      "geometry": {
+        "type": "Translate",
+        "id": "tr_col4",
+        "params": { "tx": 3.75, "ty": 0.75, "tz": -5.32 },
+        "children": [
+          {
+            "type": "TwistY",
+            "id": "tw_col4",
+            "params": { "k": -1.0 },
+            "children": [
+              {
+                "type": "RotateY",
+                "id": "ph_col4",
+                "params": { "a": 0.541 },
+                "children": [
+                  {
+                    "type": "Box",
+                    "id": "col4",
+                    "params": { "hx": 0.54, "hy": 2.45, "hz": 0.54 }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "floor",
+      "visible": true,
+      "material": {
+        "albedo": [0.75, 0.75, 0.77],
+        "roughness": 0.5,
+        "metallic": 0,
+        "emission": 0
+      },
+      "geometry": {
+        "type": "Plane",
+        "id": "floor",
+        "params": { "nx": 0, "ny": 1, "nz": 0, "d": 1.7 }
+      }
+    }
+  ]
+}
