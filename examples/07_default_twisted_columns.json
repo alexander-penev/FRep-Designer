@@ -150,7 +150,7 @@
               {
                 "type": "RotateY",
                 "id": "ph_col1",
-                "params": { "a": 1.414 },
+                "params": { "a": 1.335 },
                 "children": [
                   {
                     "type": "Box",
@@ -181,12 +181,12 @@
           {
             "type": "TwistY",
             "id": "tw_col2",
-            "params": { "k": 0.55 },
+            "params": { "k": 1.1 },
             "children": [
               {
                 "type": "RotateY",
                 "id": "ph_col2",
-                "params": { "a": 1.379 },
+                "params": { "a": 0.231 },
                 "children": [
                   {
                     "type": "Box",
@@ -217,12 +217,12 @@
           {
             "type": "TwistY",
             "id": "tw_col3",
-            "params": { "k": 1.25 },
+            "params": { "k": 1.21 },
             "children": [
               {
                 "type": "RotateY",
                 "id": "ph_col3",
-                "params": { "a": 0.873 },
+                "params": { "a": 0.634 },
                 "children": [
                   {
                     "type": "Box",
@@ -258,7 +258,7 @@
               {
                 "type": "RotateY",
                 "id": "ph_col4",
-                "params": { "a": 0.541 },
+                "params": { "a": 0.159 },
                 "children": [
                   {
                     "type": "Box",
