@@ -28,12 +28,12 @@ sphere, blue box, green rounded cube, yellow SmoothUnion blob, grey floor plane 
 then adds a back row of four `Translate → TwistY → RotateY → Box` columns, all the
 same size, differing only in twist rate, direction and starting phase:
 
-| column | `tx` | `k` | phase (`a`) | quarter-turns |
+| column | `tx` | `k` | phase (`a`) | match to the figure |
 |---|---|---|---|---|
-| 1 | −3.75 | +1.00 | 76.5° (1.335 rad) | 3.1 |
-| 2 | −1.25 | +1.10 | 13.2° (0.231 rad) | 3.4 |
-| 3 | +1.25 | +1.21 | 36.3° (0.634 rad) | 3.8 |
-| 4 | +3.75 | −1.00 | 9.1° (0.159 rad) | 3.1 |
+| 1 | −3.75 | +0.96 | 0° | 1 px |
+| 2 | −1.25 | +0.54 | 52.5° (0.916 rad) | 0 px (one crossing) |
+| 3 | +1.25 | +1.25 | 7.5° (0.131 rad) | 1 px |
+| 4 | +3.75 | −1.05 | 87.5° (1.527 rad) | 1 px |
 
 The `tx` values came out of the fit as −3.82/−1.25/+1.26/+3.80 and are snapped
 to a uniform 2.5 spacing — the same spacing as the front row (box −2.5, sphere 0,
@@ -44,14 +44,24 @@ Columns 1 and 4 have the same rate in opposite directions; 3 is the fastest.
 The `RotateY` sits *under* the `TwistY`, so the total rotation at height y is
 `k·y + a` — a pure phase offset that does not touch the rate.
 
-The rates and phases come from the rows where a face edge crosses each column's
-screen axis: that happens exactly when a corner points at the camera, so
-`a = β − 45° − k·y` where β is the azimuth from the column to the eye. Columns
-with two visible crossings (1 and 3) validate themselves — the two independent
-rows agree on `a` to within 0.2°, and the crossing spacing gives `k` directly
-(1.574 world units per quarter turn for column 1 → k = 0.998). Note the β term:
-the crossing condition is measured in the *view* frame while `RotateY` acts in
-the *world* frame, and the two differ by 5–15° depending on the column.
+Note that phases 87.5° and 0° are the same thing — the pattern of a square
+cross-section repeats every 90° — so three of the four columns sit at
+effectively zero phase. The apparent "different starting rotation" between
+columns comes from their differing rates and from each column's own azimuth
+relative to the eye, not from a modelled offset.
+
+`k` and `a` were found by ray-probing: cast one ray per image row down a
+candidate column's screen axis, record the rows where the surface normal jumps
+(a box edge crossing the axis), and search `(k, a)` for the pair reproducing the
+rows measured in the figure. This bypasses every closed-form silhouette model —
+and it had to, because three simpler estimators each failed in a different way:
+autocorrelation of the shading pattern locked onto the second harmonic; a
+closed-form phase formula was wrong because the crossing is observed in the view
+frame while `RotateY` acts in the world frame; and a silhouette-width fit is
+biased because a twisted box's silhouette is a ruled surface, not the per-height
+cross-section the model assumed. Column 2's rate is pinned by a count rather
+than a position: over rows 168–486 the figure shows exactly **one** crossing,
+which `k = 1.10` turns into 3–4 and `k = 0.80` into 2–3.
 All four are `Box(0.54, 2.45, 0.54)` at `ty = 0.75, tz = −5.32`, so their bases
 sit exactly on the floor plane at `y = −1.7`.
 
