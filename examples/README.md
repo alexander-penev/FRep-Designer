@@ -28,21 +28,30 @@ sphere, blue box, green rounded cube, yellow SmoothUnion blob, grey floor plane 
 then adds a back row of four `Translate → TwistY → RotateY → Box` columns, all the
 same size, differing only in twist rate, direction and starting phase:
 
-| column | `tx` | `k` | phase | quarter-turns |
+| column | `tx` | `k` | phase (`a`) | quarter-turns |
 |---|---|---|---|---|
-| 1 | −3.75 | +1.00 | 81° | 3.1 |
-| 2 | −1.25 | +0.55 | 79° | 1.7 |
-| 3 | +1.25 | +1.25 | 50° | 3.9 |
-| 4 | +3.75 | −1.00 | 31° | 3.1 |
+| 1 | −3.75 | +1.00 | 76.5° (1.335 rad) | 3.1 |
+| 2 | −1.25 | +1.10 | 13.2° (0.231 rad) | 3.4 |
+| 3 | +1.25 | +1.21 | 36.3° (0.634 rad) | 3.8 |
+| 4 | +3.75 | −1.00 | 9.1° (0.159 rad) | 3.1 |
 
 The `tx` values came out of the fit as −3.82/−1.25/+1.26/+3.80 and are snapped
 to a uniform 2.5 spacing — the same spacing as the front row (box −2.5, sphere 0,
 cube +2.5), offset by 1.25. The snap moves each column by under 0.08 world units,
 inside the fit's own residual.
 
-Columns 1 and 4 have the same rate in opposite directions; 2 is the slow one;
-3 is the fastest. The `RotateY` sits *under* the `TwistY`, so the total rotation
-at height y is `k·y + a` — a pure phase offset that does not touch the rate.
+Columns 1 and 4 have the same rate in opposite directions; 3 is the fastest.
+The `RotateY` sits *under* the `TwistY`, so the total rotation at height y is
+`k·y + a` — a pure phase offset that does not touch the rate.
+
+The rates and phases come from the rows where a face edge crosses each column's
+screen axis: that happens exactly when a corner points at the camera, so
+`a = β − 45° − k·y` where β is the azimuth from the column to the eye. Columns
+with two visible crossings (1 and 3) validate themselves — the two independent
+rows agree on `a` to within 0.2°, and the crossing spacing gives `k` directly
+(1.574 world units per quarter turn for column 1 → k = 0.998). Note the β term:
+the crossing condition is measured in the *view* frame while `RotateY` acts in
+the *world* frame, and the two differ by 5–15° depending on the column.
 All four are `Box(0.54, 2.45, 0.54)` at `ty = 0.75, tz = −5.32`, so their bases
 sit exactly on the floor plane at `y = −1.7`.
 
