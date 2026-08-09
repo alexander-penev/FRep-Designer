@@ -50,7 +50,7 @@ Languages*:
 - 📊 [**Benchmark report**](docs/BENCHMARKS.md) — performance numbers
   across all major features, regenerable via `./build/frep_bench`.
 - 📂 [**Example scenes**](examples/) — hand-editable `.json` scene files
-  for `frep_gpu_render --scene`.
+  for `frep_multipath <scene.json>`.
 - 📚 **API reference** — generated from inline Doxygen-style comments:
   ```bash
   cmake --build build --target docs
@@ -348,7 +348,8 @@ plugins/dynamic/
   `glslangValidator` as a subprocess, mirroring the approach we use
   for the Khronos llvm-spirv translator. `frep_gpu_render` learned a
   `--scene <file.json>` argument that loads a saved scene, emits GLSL,
-  compiles it at runtime, and renders it. End-to-end this lets arbitrary
+  compiles it at runtime, and renders it. (That binary no longer exists;
+  the scene-loading CLI today is `frep_multipath <scene.json>`.) End-to-end this lets arbitrary
   FRepNode trees execute on the GPU — not just the one hard-coded
   scene from the previous milestone. 8 new tests cover emit
   well-formedness for primitives, CSG, and deformations, plus
