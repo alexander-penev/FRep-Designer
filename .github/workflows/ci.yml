@@ -97,7 +97,7 @@ jobs:
           mkdir -p smoke/examples
           for f in examples/*.json; do
             name=$(basename "$f" .json)
-            ./build/frep_gpu_render "smoke/examples/$name.ppm" 320 240 --scene "$f"
+            ./build/frep_multipath "$f" --width 320 --height 240 --out "smoke/examples/$name.ppm"
             test -s "smoke/examples/$name.ppm"
           done
 
