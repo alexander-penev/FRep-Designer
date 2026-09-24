@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
         // The user-edited value of R must have flowed through.
         assert(plug_tree->params.at("R") == 1.75f);
         // The unedited r took its default.
-        assert(plug_tree->params.count("r") == 1);
+        assert(plug_tree->params.contains("r"));
         printf("Plugin tree params: R=%g r=%g\n",
                plug_tree->params.at("R"), plug_tree->params.at("r"));
     }

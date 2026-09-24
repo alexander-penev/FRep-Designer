@@ -66,6 +66,20 @@ inline llvm::Value* unary_intrinsic(llvm::IRBuilder<>& b,
 #endif
 }
 
+// Intrinsic declaration lookup. LLVM 20 renamed Intrinsic::getDeclaration to
+// getOrInsertDeclaration and LLVM 22 removed the old spelling, which is what
+// stopped this project building against the very version its CMakeLists
+// requires ("LLVM 22+"): 28 call sites in custom_expr.cpp, one error each.
+// Absorbing it here is what this header is for.
+inline llvm::Function* get_declaration(llvm::Module* m, llvm::Intrinsic::ID id,
+                                       llvm::ArrayRef<llvm::Type*> tys = {}) {
+#if LLVM_VERSION_MAJOR >= 20
+    return llvm::Intrinsic::getOrInsertDeclaration(m, id, tys);
+#else
+    return llvm::Intrinsic::getDeclaration(m, id, tys);
+#endif
+}
+
 // Binary intrinsic call (e.g. minnum, maxnum) with an optional result name.
 inline llvm::Value* binary_intrinsic(llvm::IRBuilder<>& b,
                                      llvm::Intrinsic::ID id,

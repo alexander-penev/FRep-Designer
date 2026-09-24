@@ -31,6 +31,8 @@
 // from a real FRepNode through the thin NodeView adapter (see scene_bindings).
 
 #include "core/compiler/compile_policy.hpp"
+#include "core/frep/node_kind.hpp"
+#include "core/frep/param_store.hpp"
 
 #include <string>
 #include <unordered_map>
@@ -39,19 +41,10 @@
 
 namespace frep {
 
-// NodeKind mirrored as plain ints so this header need not include the
-// LLVM-coupled node.hpp. Keep in sync with frep::NodeKind.
-namespace pk {
-enum : int {
-    Sphere = 0, Box, Plane,
-    Union, Intersection, Difference, SmoothUnion,
-    Negate,
-    Translate, Scale, RotateY,
-    TwistY, BendXY, TaperY,
-    Scene,
-    Plugin,
-};
-} // namespace pk
+// NodeKind is shared with node.hpp via node_kind.hpp. It used to be
+// mirrored here as a second enum so this header need not include the
+// LLVM-coupled node.hpp; that copy drifted by two positions and silently
+// handed most kinds the wrong schema. See node_kind.hpp.
 
 // One bound runtime parameter.
 struct ParamSlot {
@@ -66,48 +59,77 @@ struct ParamSlot {
 // order fixes slot assignment; classes drive class-based policies. Centralises
 // what used to be the scattered `param_class` argument at each emit site.
 inline const std::vector<std::pair<std::string, ParamClass>>&
-node_param_schema(int kind) {
-    static const std::vector<std::pair<std::string, ParamClass>> empty{};
-    static const std::vector<std::pair<std::string, ParamClass>> sphere{
-        {"r", ParamClass::Geometry}};
-    static const std::vector<std::pair<std::string, ParamClass>> box{
-        {"hx", ParamClass::Geometry}, {"hy", ParamClass::Geometry},
-        {"hz", ParamClass::Geometry}};
-    static const std::vector<std::pair<std::string, ParamClass>> plane{
-        {"nx", ParamClass::Geometry}, {"ny", ParamClass::Geometry},
-        {"nz", ParamClass::Geometry}, {"d", ParamClass::Geometry}};
-    static const std::vector<std::pair<std::string, ParamClass>> smooth{
-        {"k", ParamClass::Geometry}};
-    static const std::vector<std::pair<std::string, ParamClass>> translate{
-        {"tx", ParamClass::Geometry}, {"ty", ParamClass::Geometry},
-        {"tz", ParamClass::Geometry}};
-    static const std::vector<std::pair<std::string, ParamClass>> scale{
-        {"s", ParamClass::Geometry}};
-    static const std::vector<std::pair<std::string, ParamClass>> rotatey{
-        {"a", ParamClass::Geometry}};
-    static const std::vector<std::pair<std::string, ParamClass>> twist{
-        {"k", ParamClass::Deform}};
-    static const std::vector<std::pair<std::string, ParamClass>> bend{
-        {"k", ParamClass::Deform}};
-    static const std::vector<std::pair<std::string, ParamClass>> taper{
-        {"t", ParamClass::Deform}, {"h", ParamClass::Deform}};
+node_param_schema(NodeKind kind) {
+    using P = std::pair<std::string, ParamClass>;
+    using V = std::vector<P>;
+    const auto G = ParamClass::Geometry;
+    const auto D = ParamClass::Deform;
+    static const V empty{};
+    static const V sphere{{"r", G}};
+    static const V box{{"hx", G}, {"hy", G}, {"hz", G}};
+    static const V plane{{"nx", G}, {"ny", G}, {"nz", G}, {"d", G}};
+    static const V smooth{{"k", G}};
+    static const V translate{{"tx", G}, {"ty", G}, {"tz", G}};
+    // sx/sy/sz, not "s": ScaleNode stores three factors even when
+    // constructed from one, and the old single-entry schema matched none of
+    // them, so a Scale node could never have a runtime parameter.
+    static const V scale{{"sx", G}, {"sy", G}, {"sz", G}};
+    static const V angle{{"a", G}};                       // RotateX/Y/Z
+    static const V twist{{"k", D}};
+    static const V bend{{"k", D}};
+    static const V taper{{"t", D}, {"h", D}};
+    // HEP nodes. The order is the constructor's, and it fixes slot
+    // assignment, so entries are appended rather than reordered.
+    static const V tube{{"rmin", G}, {"rmax", G}, {"hz", G},
+                        {"phi0", G}, {"dphi", G}};
+    static const V cone{{"rmin1", G}, {"rmax1", G}, {"rmin2", G},
+                        {"rmax2", G}, {"hz", G}, {"phi0", G}, {"dphi", G}};
+    static const V shell{{"rmin", G}, {"rmax", G}, {"phi0", G},
+                         {"dphi", G}, {"theta0", G}, {"dtheta", G}};
+    static const V trd{{"dx1", G}, {"dx2", G}, {"dy1", G}, {"dy2", G},
+                       {"hz", G}};
+    static const V poly{{"rmin1", G}, {"rmax1", G}, {"rmin2", G},
+                        {"rmax2", G}, {"hz", G}, {"phi0", G}, {"dphi", G},
+                        {"nside", G}};
+    static const V frame{{"r0", G}, {"r1", G}, {"r2", G},
+                         {"r3", G}, {"r4", G}, {"r5", G},
+                         {"r6", G}, {"r7", G}, {"r8", G},
+                         {"tx", G}, {"ty", G}, {"tz", G}};
     switch (kind) {
-        case pk::Sphere:     return sphere;
-        case pk::Box:        return box;
-        case pk::Plane:      return plane;
-        case pk::SmoothUnion:return smooth;
-        case pk::Translate:  return translate;
-        case pk::Scale:      return scale;
-        case pk::RotateY:    return rotatey;
-        case pk::TwistY:     return twist;
-        case pk::BendXY:     return bend;
-        case pk::TaperY:     return taper;
-        default:             return empty;  // Union/Diff/Negate/Scene/Plugin
+        case NodeKind::Sphere:         return sphere;
+        case NodeKind::Box:            return box;
+        case NodeKind::Plane:          return plane;
+        case NodeKind::SmoothUnion:    return smooth;
+        case NodeKind::Translate:      return translate;
+        case NodeKind::Scale:          return scale;
+        case NodeKind::RotateX:
+        case NodeKind::RotateY:
+        case NodeKind::RotateZ:        return angle;
+        case NodeKind::TwistY:         return twist;
+        case NodeKind::BendXY:         return bend;
+        case NodeKind::TaperY:         return taper;
+        case NodeKind::Tube:           return tube;
+        case NodeKind::Cone:           return cone;
+        case NodeKind::SphericalShell: return shell;
+        case NodeKind::Trapezoid:      return trd;
+        case NodeKind::Polyhedron:     return poly;
+        case NodeKind::Frame:          return frame;
+        // Union/Intersection/Difference/Negate/Scene/Instance/Plugin carry
+        // no parameters of their own. Plugin nodes bind through their own
+        // capsule rather than this table.
+        case NodeKind::Union:
+        case NodeKind::Intersection:
+        case NodeKind::Difference:
+        case NodeKind::Negate:
+        case NodeKind::Scene:
+        case NodeKind::Instance:
+        case NodeKind::Plugin:         return empty;
     }
+    return empty;
 }
 
 // (kind, param) -> class, via the schema. Geometry if unknown.
-inline ParamClass classify_param(int kind, const std::string& param) {
+inline ParamClass classify_param(NodeKind kind, const std::string& param) {
     for (const auto& ps : node_param_schema(kind))
         if (ps.first == param) return ps.second;
     return ParamClass::Geometry;
@@ -119,9 +141,9 @@ public:
     // tested without depending on the LLVM-coupled FRepNode. The project
     // adapts a real scene into this view (children by value; trees are small).
     struct NodeView {
-        int                                          kind = pk::Scene;
+        NodeKind                                     kind = NodeKind::Scene;
         std::string                                  id;
-        const std::unordered_map<std::string, float>* params = nullptr;
+        const ParamStore*                            params = nullptr;
         std::vector<NodeView>                        children;
     };
 
@@ -175,15 +197,19 @@ private:
     void walk(const NodeView& n, const CompilePolicy& policy) {
         for (const auto& ps : node_param_schema(n.kind)) {
             const std::string& name = ps.first;
-            if (!n.params || !n.params->count(name)) continue;  // not set
+            if (!n.params || !n.params->contains(name)) continue;  // not set
             if (policy.decide(n.id, name, ps.second) != ParamPlacement::Runtime)
                 continue;                                       // baked constant
             const std::string key = n.id + "::" + name;
             if (slot_.count(key)) continue;                     // already bound
             int slot = static_cast<int>(slots_.size());
             slot_[key] = slot;
+            // Narrowed on purpose: a runtime slot lands in the kernel's
+            // `float* params` buffer, whose ABI is shared with OpenCL and
+            // CUDA. The map keeps the full double for the constant path and
+            // for evalw; the slot carries what the buffer can hold.
             slots_.push_back({n.id, name, slot,
-                              n.params->at(name), ps.second});
+                              float(n.params->at(name)), ps.second});
         }
         for (const auto& c : n.children) walk(c, policy);
     }

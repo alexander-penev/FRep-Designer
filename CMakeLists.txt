@@ -134,6 +134,8 @@ add_library(frep_core STATIC
     core/frep/operations_ad.cpp
     core/frep/deformations_ad.cpp
     core/frep/aabb.cpp
+    core/frep/hep_codegen.cpp
+    core/frep/hep_ad.cpp
     core/frep/scene.cpp
     core/frep/mesh_sdf.cpp
     core/accel/guard_calibration.cpp
@@ -283,6 +285,7 @@ if(FREP_BUILD_GPU)
     target_sources(frep_core PRIVATE
         core/gpu/vulkan_ctx.cpp
         core/gpu/glsl_emitter.cpp
+    core/gpu/glsl_hep.cpp
         core/gpu/rtx_caps.cpp
         core/gpu/rtx_ctx.cpp
         core/gpu/rtx_accel.cpp
@@ -615,6 +618,13 @@ add_executable(frep_tests
     tests/test_spirv.cpp
     tests/test_deformations_patterns.cpp
     tests/test_custom_expr_eval.cpp
+    tests/test_scalar_type.cpp
+    tests/test_param_schema.cpp
+    tests/test_mixed_eval.cpp
+    tests/test_codegen_f64.cpp
+    tests/test_simd_scalar_type.cpp
+    tests/test_hep_ad.cpp
+    tests/test_glsl_hep.cpp
     tests/test_expr_backends.cpp
     tests/test_plugin_runtime.cpp
     tests/test_scene_set_geometry.cpp

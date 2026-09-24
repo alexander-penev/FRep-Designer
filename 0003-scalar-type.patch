@@ -1,0 +1,1673 @@
+From a6e0f84e4d72df1c624b0c13d20124ac7e6152a1 Mon Sep 17 00:00:00 2001
+From: Alexander Penev <alexander.p.penev@gmail.com>
+Date: Thu, 24 Sep 2026 09:26:57 +0300
+Subject: [PATCH] core: evaluation parameterised on the scalar type
+
+FRepNode::eval was float and params was a map of float, so the ceiling was
+f32 everywhere. Three separate things sat under that one type, and they are
+now separate:
+
+  STORAGE. params is a map of double. A radius from a detector description
+  arrives as a double and a float map rounded it before any arithmetic
+  happened - up to 2.6e-05 mm on the converter's own models (307 of 16397
+  parameters in lattice_512 past 1e-6 mm). scene_io already WROTE these as
+  double, so the map and param_or() were throwing away precision the file on
+  disk held correctly. expr_ast literals likewise.
+
+  EVALUATION. Each node implements one templated eval_t<T> and the macro
+  FREP_EVAL_T generates eval (float) and evalw (double) from it, so the two
+  cannot drift - the discipline codegen() already owed eval(). 20 of 26 node
+  types converted; MeshSdf stays float because its grid is float.
+
+  REPORTING. wide_eval() says whether evalw is real or a forward through
+  float. A scene evaluated "in double" that is really float somewhere is
+  worse than one that is float everywhere, because the error is in an
+  unknown place.
+
+ScalarTraits<T> (core/frep/scalar.hpp) carries V, W, from/to, sqrtv/absv/
+minv/maxv, up/down and eps/tol/maxFinite/exactAdditive/name - the same
+member set as G4-FRep's include/frep/core/scalar.hh, so a type that works
+there works here. f16 and fixed point are deliberately not defined: no
+executor here can carry them yet.
+
+Measured, 15 node types x 400 points:
+  - the float path is BIT-IDENTICAL to the previous tree, all 6000 samples;
+  - evalw differs from eval by up to 6.5e-05 mm at 400 mm coordinates;
+  - throughput unchanged (-16% to +4% per node kind, 98 ns/eval overall).
+
+That last number cost a defect. The first version read parameters through
+an `auto P = [&](const char* k)` lambda, which clang emitted OUT OF LINE:
+one real call per parameter, +35% on every node kind including the ones
+with no parameters of their own. Using the literal at the site restores it.
+Worth recording separately: 40 of a Box's 45 ns are three string-keyed map
+lookups, so FD4's evaluator is ~90% hash table and the arithmetic is noise.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5ALyYbzrXTGtc7LqRPGCz
+---
+ CMakeLists.txt                        |   1 +
+ core/compiler/node_interval.hpp       |   7 +-
+ core/compiler/node_interval_ir.hpp    |   2 +-
+ core/compiler/param_binding_table.hpp |   8 +-
+ core/frep/custom_expr.cpp             |  30 ++--
+ core/frep/custom_expr.hpp             |  12 +-
+ core/frep/deformations.hpp            |  69 ++++----
+ core/frep/expr_ast.hpp                |   5 +-
+ core/frep/hep.hpp                     | 228 ++++++++++++++------------
+ core/frep/hep_codegen.cpp             |  24 +--
+ core/frep/instance.hpp                |   8 +-
+ core/frep/node.hpp                    |  40 ++++-
+ core/frep/operations.hpp              |  50 ++++--
+ core/frep/primitives.hpp              |  61 +++----
+ core/frep/scalar.hpp                  | 115 +++++++++++++
+ core/frep/scene.hpp                   |   3 +-
+ core/frep/transforms.hpp              |  82 +++++----
+ core/io/scene_io.cpp                  |   9 +-
+ tests/test_scalar_type.cpp            | 190 +++++++++++++++++++++
+ 19 files changed, 694 insertions(+), 250 deletions(-)
+ create mode 100644 core/frep/scalar.hpp
+ create mode 100644 tests/test_scalar_type.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ea31b7b..f09a40e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -616,6 +616,7 @@ add_executable(frep_tests
+     tests/test_spirv.cpp
+     tests/test_deformations_patterns.cpp
+     tests/test_custom_expr_eval.cpp
++    tests/test_scalar_type.cpp
+     tests/test_expr_backends.cpp
+     tests/test_plugin_runtime.cpp
+     tests/test_scene_set_geometry.cpp
+diff --git a/core/compiler/node_interval.hpp b/core/compiler/node_interval.hpp
+index d921bd5..4ad188e 100644
+--- a/core/compiler/node_interval.hpp
++++ b/core/compiler/node_interval.hpp
+@@ -66,7 +66,7 @@ inline Iv expr_interval(const expr::Node& n, Iv X, Iv Y, Iv Z) {
+     using namespace ivdetail;
+     using K = expr::Node::Kind;
+     switch (n.kind) {
+-        case K::Number: return {n.num, n.num};
++        case K::Number: { const float v = float(n.num); return {v, v}; }
+         case K::Const:  { float v = n.ident=="pi"?3.14159265359f:2.71828182846f; return {v,v}; }
+         case K::Var:    return n.ident=="x"?X : n.ident=="y"?Y : Z;
+         case K::UnaryNeg: return neg(expr_interval(*n.children[0],X,Y,Z));
+@@ -102,7 +102,10 @@ inline Iv expr_interval(const expr::Node& n, Iv X, Iv Y, Iv Z) {
+ // Interval bound of a node tree over box [lo,hi] (mirrors NodeIntervalEmitter).
+ inline Iv node_interval(const FRepNode& n, Iv X, Iv Y, Iv Z) {
+     using namespace ivdetail;
+-    auto pf = [&](const char* k, float d){ auto it=n.params.find(k); return it!=n.params.end()?it->second:d; };
++    auto pf = [&](const char* k, float d) -> float {
++        auto it = n.params.find(k);
++        return it != n.params.end() ? float(it->second) : d;
++    };
+     switch (n.kind) {
+         case NodeKind::Sphere: {
+             Iv s = add(add(sqr(X), sqr(Y)), sqr(Z));
+diff --git a/core/compiler/node_interval_ir.hpp b/core/compiler/node_interval_ir.hpp
+index 2bf9e9f..ac7b77d 100644
+--- a/core/compiler/node_interval_ir.hpp
++++ b/core/compiler/node_interval_ir.hpp
+@@ -126,7 +126,7 @@ private:
+     }
+ 
+     float pf(const FRepNode& n, const char* k, float d) {
+-        auto it = n.params.find(k); return it != n.params.end() ? it->second : d;
++        auto it = n.params.find(k); return it != n.params.end() ? float(it->second) : d;
+     }
+ 
+     // ── Node dispatch (mirrors node_interval() in node_interval.hpp) ──────────
+diff --git a/core/compiler/param_binding_table.hpp b/core/compiler/param_binding_table.hpp
+index 792f29a..ff0d578 100644
+--- a/core/compiler/param_binding_table.hpp
++++ b/core/compiler/param_binding_table.hpp
+@@ -121,7 +121,7 @@ public:
+     struct NodeView {
+         int                                          kind = pk::Scene;
+         std::string                                  id;
+-        const std::unordered_map<std::string, float>* params = nullptr;
++        const std::unordered_map<std::string, double>* params = nullptr;
+         std::vector<NodeView>                        children;
+     };
+ 
+@@ -182,8 +182,12 @@ private:
+             if (slot_.count(key)) continue;                     // already bound
+             int slot = static_cast<int>(slots_.size());
+             slot_[key] = slot;
++            // Narrowed on purpose: a runtime slot lands in the kernel's
++            // `float* params` buffer, whose ABI is shared with OpenCL and
++            // CUDA. The map keeps the full double for the constant path and
++            // for evalw; the slot carries what the buffer can hold.
+             slots_.push_back({n.id, name, slot,
+-                              n.params->at(name), ps.second});
++                              float(n.params->at(name)), ps.second});
+         }
+         for (const auto& c : n.children) walk(c, policy);
+     }
+diff --git a/core/frep/custom_expr.cpp b/core/frep/custom_expr.cpp
+index b934af0..df0e4d5 100644
+--- a/core/frep/custom_expr.cpp
++++ b/core/frep/custom_expr.cpp
+@@ -674,24 +674,26 @@ llvm::Function* CustomExprCompiler::compile(llvm::Module&       mod,
+ // Back-end #2: CPU evaluation (direct AST interpretation)
+ // ═════════════════════════════════════════════════════════════════════════════
+ 
+-float CustomExprNode::eval_ast(const expr::Node& n, float x, float y, float z) {
++template <class T>
++T CustomExprNode::eval_ast(const expr::Node& n, T x, T y, T z) {
++    using S = ScalarTraits<T>;
+     using Kind = expr::Node::Kind;
+     switch (n.kind) {
+-        case Kind::Number: return n.num;
++        case Kind::Number: return S::from(n.num);
+         case Kind::Var:
+             if (n.ident == "x") return x;
+             if (n.ident == "y") return y;
+             if (n.ident == "z") return z;
+             throw std::runtime_error("unknown variable '" + n.ident + "'");
+         case Kind::Const:
+-            if (n.ident == "pi") return std::numbers::pi_v<float>;
+-            if (n.ident == "e")  return std::numbers::e_v<float>;
++            if (n.ident == "pi") return S::from(std::numbers::pi_v<double>);
++            if (n.ident == "e")  return S::from(std::numbers::e_v<double>);
+             throw std::runtime_error("unknown constant '" + n.ident + "'");
+         case Kind::UnaryNeg:
+-            return -eval_ast(*n.children[0], x, y, z);
++            return -eval_ast<T>(*n.children[0], x, y, z);
+         case Kind::BinOp: {
+-            float l = eval_ast(*n.children[0], x, y, z);
+-            float r = eval_ast(*n.children[1], x, y, z);
++            const T l = eval_ast<T>(*n.children[0], x, y, z);
++            const T r = eval_ast<T>(*n.children[1], x, y, z);
+             switch (n.bop) {
+                 case expr::Op::Add: return l + r;
+                 case expr::Op::Sub: return l - r;
+@@ -702,8 +704,10 @@ float CustomExprNode::eval_ast(const expr::Node& n, float x, float y, float z) {
+         }
+         case Kind::Call: {
+             const auto& name = n.ident;
+-            // Eval args first.
+-            float a0 = eval_ast(*n.children[0], x, y, z);
++            // Eval args first. std::sin of a T picks sinf for float and sin
++            // for double, so each type gets its own libm entry point rather
++            // than a widened float one.
++            const T a0 = eval_ast<T>(*n.children[0], x, y, z);
+             if (name == "sin")   return std::sin(a0);
+             if (name == "cos")   return std::cos(a0);
+             if (name == "tan")   return std::tan(a0);
+@@ -716,9 +720,10 @@ float CustomExprNode::eval_ast(const expr::Node& n, float x, float y, float z) {
+             if (name == "acos")  return std::acos(a0);
+             if (name == "atan")  return std::atan(a0);
+             if (name == "ceil")  return std::ceil(a0);
+-            float a1 = eval_ast(*n.children[1], x, y, z);
++            const T a1 = eval_ast<T>(*n.children[1], x, y, z);
+             if (name == "pow")   return std::copysign(std::pow(std::fabs(a0), a1), a0);
+-            if (name == "nth_root") return std::copysign(std::pow(std::fabs(a0), 1.0f/a1), a0);
++            if (name == "nth_root")
++                return std::copysign(std::pow(std::fabs(a0), S::from(1.0)/a1), a0);
+             if (name == "min")   return std::fmin(a0, a1);
+             if (name == "max")   return std::fmax(a0, a1);
+             if (name == "atan2") return std::atan2(a0, a1);
+@@ -729,6 +734,9 @@ float CustomExprNode::eval_ast(const expr::Node& n, float x, float y, float z) {
+     throw std::runtime_error("unhandled AST kind in eval");
+ }
+ 
++template float  CustomExprNode::eval_ast<float>(const expr::Node&, float, float, float);
++template double CustomExprNode::eval_ast<double>(const expr::Node&, double, double, double);
++
+ 
+ // ═════════════════════════════════════════════════════════════════════════════
+ // Back-end #3: GLSL emission
+diff --git a/core/frep/custom_expr.hpp b/core/frep/custom_expr.hpp
+index 6f18e71..d815f83 100644
+--- a/core/frep/custom_expr.hpp
++++ b/core/frep/custom_expr.hpp
+@@ -20,6 +20,7 @@
+ 
+ #include "core/frep/expr_ast.hpp"
+ #include "core/frep/node.hpp"
++#include "core/frep/scalar.hpp"
+ 
+ #include <llvm/IR/Function.h>
+ #include <llvm/IR/IRBuilder.h>
+@@ -123,10 +124,12 @@ public:
+         id   = std::move(nid);
+     }
+ 
+-    float eval(float x, float y, float z) const override {
++    template <class T>
++    T eval_t(T x, T y, T z) const {
+         ensure_parsed();
+-        return eval_ast(*ast_, x, y, z);
++        return eval_ast<T>(*ast_, x, y, z);
+     }
++    FREP_EVAL_T
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x,
+                          llvm::Value* y, llvm::Value* z) const override;
+@@ -171,7 +174,10 @@ private:
+         if (!ast_) ast_ = expr::fold(expr::parse(expr_));
+     }
+ 
+-    static float eval_ast(const expr::Node& n, float x, float y, float z);
++    /// The AST in T. Instantiated for float and double in custom_expr.cpp;
++    /// one body, so the two cannot drift.
++    template <class T>
++    static T eval_ast(const expr::Node& n, T x, T y, T z);
+     static void  emit_glsl_ast(std::ostream& out, const expr::Node& n);
+ };
+ 
+diff --git a/core/frep/deformations.hpp b/core/frep/deformations.hpp
+index f3ea333..5db206f 100644
+--- a/core/frep/deformations.hpp
++++ b/core/frep/deformations.hpp
+@@ -23,6 +23,7 @@
+ 
+ #include "core/compiler/llvm_compat.hpp"
+ #include "core/frep/node.hpp"
++#include "core/frep/scalar.hpp"
+ 
+ #include <cmath>
+ #include <memory>
+@@ -63,18 +64,21 @@ public:
+         return a;
+     }
+ 
+-    float eval(float x, float y, float z) const override {
+-        float k = params.at("k");
+-        float a = k * y;
+-        float ca = std::cos(a), sa = std::sin(a);
+-        float xr =  ca*x + sa*z;
+-        float zr = -sa*x + ca*z;
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T k = S::from(params.at("k"));
++        const T a = k * y;
++        const T ca = std::cos(a), sa = std::sin(a);
++        const T xr =  ca*x + sa*z;
++        const T zr = -sa*x + ca*z;
+         // Lipschitz correction: locally the warp's Jacobian has spectral
+         // norm <= sqrt(1 + (k*r)^2). We approximate r by xz-radius.
+-        float r = std::sqrt(x*x + z*z);
+-        float lip = std::sqrt(1.0f + (k*r)*(k*r));
+-        return children[0]->eval(xr, y, zr) / lip;
++        const T r = S::sqrtv(x*x + z*z);
++        const T lip = S::sqrtv(S::from(1.0) + (k*r)*(k*r));
++        return children[0]->eval_as<T>(xr, y, zr) / lip;
+     }
++    FREP_EVAL_T
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b = c.b;
+@@ -138,18 +142,21 @@ public:
+         return a;
+     }
+ 
+-    float eval(float x, float y, float z) const override {
+-        float k = params.at("k");
+-        if (std::abs(k) < 1e-6f) return children[0]->eval(x, y, z);
+-        float invk  = 1.0f / k;
+-        float theta = k * x;
+-        float r     = invk + y;
+-        float xr    = r * std::sin(theta);
+-        float yr    = r * std::cos(theta) - invk;
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T k = S::from(params.at("k"));
++        if (S::absv(k) < S::from(1e-6)) return children[0]->eval_as<T>(x, y, z);
++        const T invk  = S::from(1.0) / k;
++        const T theta = k * x;
++        const T r     = invk + y;
++        const T xr    = r * std::sin(theta);
++        const T yr    = r * std::cos(theta) - invk;
+         // Lipschitz correction analogous to twist.
+-        float lip = std::max(1.0f, std::abs(k) * std::abs(r));
+-        return children[0]->eval(xr, yr, z) / lip;
++        const T lip = S::maxv(S::from(1.0), S::absv(k) * S::absv(r));
++        return children[0]->eval_as<T>(xr, yr, z) / lip;
+     }
++    FREP_EVAL_T
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b = c.b;
+@@ -213,19 +220,21 @@ public:
+         return a;
+     }
+ 
+-    float eval(float x, float y, float z) const override {
+-        float t = params.at("t");
+-        float h = params.at("h");
+-        float u = std::clamp((y + 0.5f*h) / h, 0.0f, 1.0f);
+-        float s = 1.0f + u * (t - 1.0f);
+-        s = std::max(s, 1e-3f);
+-        float xr = x / s;
+-        float zr = z / s;
+-        // Lipschitz: 1/s on x and z, 1 on y → spectral norm 1/s when s < 1,
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T one = S::from(1.0);
++        const T t = S::from(params.at("t")), h = S::from(params.at("h"));
++        const T u = std::clamp((y + S::from(0.5)*h) / h, S::from(0.0), one);
++        T s = one + u * (t - one);
++        s = S::maxv(s, S::from(1e-3));
++        const T xr = x / s, zr = z / s;
++        // Lipschitz: 1/s on x and z, 1 on y -> spectral norm 1/s when s < 1,
+         // 1 otherwise. Use the conservative 1/min(s,1).
+-        float lip = std::max(1.0f, 1.0f / s);
+-        return children[0]->eval(xr, y, zr) / lip;
++        const T lip = S::maxv(one, one / s);
++        return children[0]->eval_as<T>(xr, y, zr) / lip;
+     }
++    FREP_EVAL_T
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b = c.b;
+diff --git a/core/frep/expr_ast.hpp b/core/frep/expr_ast.hpp
+index 3b75c67..7db6647 100644
+--- a/core/frep/expr_ast.hpp
++++ b/core/frep/expr_ast.hpp
+@@ -61,7 +61,10 @@ struct Node {
+ 
+     // Payload (union-ish — only the relevant field per kind is set).
+     Op          bop  {};
+-    float       num  = 0.0f;
++    /// Double: the literal in the expression text is written in decimal and
++    /// a float store rounds it before evaluation ever begins. eval_ast<T>
++    /// narrows per type instead.
++    double      num  = 0.0;
+     std::string ident;
+ 
+     std::vector<NodePtr> children;
+diff --git a/core/frep/hep.hpp b/core/frep/hep.hpp
+index 2a452ca..ee80cee 100644
+--- a/core/frep/hep.hpp
++++ b/core/frep/hep.hpp
+@@ -48,6 +48,7 @@
+ // policy promoted one of them, so the two are kept in step by construction.
+ 
+ #include "node.hpp"
++#include "scalar.hpp"
+ #include "core/compiler/llvm_compat.hpp"
+ 
+ #include <cmath>
+@@ -58,9 +59,9 @@ namespace frep::hep {
+ 
+ // Combine parameter values into one hash. Every node below uses it, so two
+ // nodes of the same type differing in any parameter differ here too.
+-inline std::size_t phash(std::size_t seed, std::initializer_list<float> vs) {
+-    for (float v : vs)
+-        seed = seed * 1099511628211ull ^ std::hash<float>{}(v);
++inline std::size_t phash(std::size_t seed, std::initializer_list<double> vs) {
++    for (double v : vs)
++        seed = seed * 1099511628211ull ^ std::hash<double>{}(v);
+     return seed;
+ }
+ 
+@@ -76,15 +77,16 @@ inline std::size_t phash(std::size_t seed, std::initializer_list<float> vs) {
+ /// but computing sin/cos of them in float would add a second, avoidable one,
+ /// and it is what made the first version of this node disagree with the
+ /// reference implementation by 2.4e-04 on a hexagonal section.
+-inline bool wedge_coeffs(float a, float d, float& sa, float& ca, float& sb,
+-                         float& cb, bool& use_max) {
+-    if (d >= 2.0f * float(M_PI) - 1e-6f) return false;
++template <class T>
++inline bool wedge_coeffs(T a, T d, T& sa, T& ca, T& sb, T& cb, bool& use_max) {
++    using S = ScalarTraits<T>;
++    if (d >= S::from(2.0 * M_PI) - S::from(1e-6)) return false;
+     const double b = double(a) + double(d);
+-    sa = float(std::sin(double(a)));
+-    ca = float(std::cos(double(a)));
+-    sb = float(-std::sin(b));
+-    cb = float(std::cos(b));
+-    use_max = (d <= float(M_PI));
++    sa = S::from(std::sin(double(a)));
++    ca = S::from(std::cos(double(a)));
++    sb = S::from(-std::sin(b));
++    cb = S::from(std::cos(b));
++    use_max = (d <= S::from(M_PI));
+     return true;
+ }
+ /// sqrt(1 + k^2) for a slanted face, computed in DOUBLE and narrowed once.
+@@ -92,18 +94,21 @@ inline bool wedge_coeffs(float a, float d, float& sa, float& ca, float& sb,
+ /// float slope and taking a float square root adds a second rounding the
+ /// reference implementation does not have, and that was the last bit-identity
+ /// failure - one tapered hexagonal section, 1.22e-04.
+-inline float lat_scale(double num, double den) {
++template <class T>
++inline T lat_scale(double num, double den) {
+     const double k = num / den;
+-    return float(std::sqrt(1.0 + k * k));
++    return ScalarTraits<T>::from(std::sqrt(1.0 + k * k));
+ }
+ 
+-inline float wedge_eval(float x, float y, float a, float d) {
+-    float sa, ca, sb, cb;
++template <class T>
++inline T wedge_eval(T x, T y, T a, T d) {
++    using S = ScalarTraits<T>;
++    T sa, ca, sb, cb;
+     bool use_max;
+-    if (!wedge_coeffs(a, d, sa, ca, sb, cb, use_max)) return -1e30f;
+-    const float fa = x * sa - y * ca;
+-    const float fb = x * sb + y * cb;
+-    return use_max ? std::max(fa, fb) : std::min(fa, fb);
++    if (!wedge_coeffs<T>(a, d, sa, ca, sb, cb, use_max)) return S::from(-1e30);
++    const T fa = x * sa - y * ca;
++    const T fb = x * sb + y * cb;
++    return use_max ? S::maxv(fa, fb) : S::minv(fa, fb);
+ }
+ 
+ // ── Tube (G4Tubs) ────────────────────────────────────────────────────────────
+@@ -111,7 +116,7 @@ inline float wedge_eval(float x, float y, float a, float d) {
+ class TubeNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Tube"; }
+ public:
+-    TubeNode(float rmin, float rmax, float hz, float phi0, float dphi,
++    TubeNode(double rmin, double rmax, double hz, double phi0, double dphi,
+              std::string nid = "tube") {
+         kind = NodeKind::Tube;
+         id = std::move(nid);
+@@ -119,13 +124,15 @@ public:
+         params["phi0"] = phi0; params["dphi"] = dphi;
+     }
+ 
+-    float eval(float x, float y, float z) const override {
+-        const float rho = std::sqrt(x * x + y * y);
+-        float f = std::max(rho - params.at("rmax"),
+-                           std::fabs(z) - params.at("hz"));
+-        if (params.at("rmin") > 0.0f) f = std::max(f, params.at("rmin") - rho);
+-        return std::max(f, wedge_eval(x, y, params.at("phi0"), params.at("dphi")));
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T rho = S::sqrtv(x * x + y * y);
++        T f = S::maxv(rho - S::from(params.at("rmax")), S::absv(z) - S::from(params.at("hz")));
++        if (params.at("rmin") > 0.0) f = S::maxv(f, S::from(params.at("rmin")) - rho);
++        return S::maxv(f, wedge_eval<T>(x, y, S::from(params.at("phi0")), S::from(params.at("dphi"))));
+     }
++    FREP_EVAL_T
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+@@ -148,7 +155,7 @@ public:
+ class ConeNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Cone"; }
+ public:
+-    ConeNode(float rmin1, float rmax1, float rmin2, float rmax2, float hz,
++    ConeNode(double rmin1, double rmax1, double rmin2, double rmax2, double hz,
+              float phi0, float dphi, std::string nid = "cone") {
+         kind = NodeKind::Cone;
+         id = std::move(nid);
+@@ -157,23 +164,26 @@ public:
+         params["hz"] = hz; params["phi0"] = phi0; params["dphi"] = dphi;
+     }
+ 
+-    float eval(float x, float y, float z) const override {
+-        const float rho = std::sqrt(x * x + y * y);
+-        const float hz = params.at("hz");
+-        const float u = (z + hz) / (2.0f * hz);
+-        const float r1 = params.at("rmax1"), r2 = params.at("rmax2");
+-        const float Rmax = r1 + (r2 - r1) * u;
+-        float f = std::max((rho - Rmax) / lat_scale(double(r2) - double(r1),
+-                                                    2.0 * double(hz)),
+-                           std::fabs(z) - hz);
+-        const float i1 = params.at("rmin1"), i2 = params.at("rmin2");
+-        if (i1 > 0.0f || i2 > 0.0f) {
+-            const float Rmin = i1 + (i2 - i1) * u;
+-            f = std::max(f, (Rmin - rho) / lat_scale(double(i2) - double(i1),
+-                                                     2.0 * double(hz)));
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T rho = S::sqrtv(x * x + y * y);
++        const T hz = S::from(params.at("hz"));
++        const T u = (z + hz) / (S::from(2.0) * hz);
++        const T r1 = S::from(params.at("rmax1")), r2 = S::from(params.at("rmax2"));
++        const T Rmax = r1 + (r2 - r1) * u;
++        T f = S::maxv((rho - Rmax) / lat_scale<T>(double(r2) - double(r1),
++                                                  2.0 * double(hz)),
++                      S::absv(z) - hz);
++        const T i1 = S::from(params.at("rmin1")), i2 = S::from(params.at("rmin2"));
++        if (i1 > S::from(0.0) || i2 > S::from(0.0)) {
++            const T Rmin = i1 + (i2 - i1) * u;
++            f = S::maxv(f, (Rmin - rho) / lat_scale<T>(double(i2) - double(i1),
++                                                       2.0 * double(hz)));
+         }
+-        return std::max(f, wedge_eval(x, y, params.at("phi0"), params.at("dphi")));
++        return S::maxv(f, wedge_eval<T>(x, y, S::from(params.at("phi0")), S::from(params.at("dphi"))));
+     }
++    FREP_EVAL_T
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+@@ -203,7 +213,7 @@ public:
+ class SphericalShellNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "SphericalShell"; }
+ public:
+-    SphericalShellNode(float rmin, float rmax, float phi0, float dphi,
++    SphericalShellNode(double rmin, double rmax, double phi0, double dphi,
+                        float theta0, float dtheta, std::string nid = "shell") {
+         kind = NodeKind::SphericalShell;
+         id = std::move(nid);
+@@ -212,20 +222,26 @@ public:
+         params["theta0"] = theta0; params["dtheta"] = dtheta;
+     }
+ 
+-    float eval(float x, float y, float z) const override {
+-        const float rho = std::sqrt(x * x + y * y);
+-        const float rad = std::sqrt(rho * rho + z * z);
+-        float f = rad - params.at("rmax");
+-        if (params.at("rmin") > 0.0f) f = std::max(f, params.at("rmin") - rad);
+-        f = std::max(f, wedge_eval(x, y, params.at("phi0"), params.at("dphi")));
+-        const float t0 = params.at("theta0");
+-        const float t1 = t0 + params.at("dtheta");
+-        if (t0 > 1e-6f)
+-            f = std::max(f, -(rho * std::cos(t0) - z * std::sin(t0)));
+-        if (t1 < float(M_PI) - 1e-6f)
+-            f = std::max(f, rho * std::cos(t1) - z * std::sin(t1));
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T rho = S::sqrtv(x * x + y * y);
++        const T rad = S::sqrtv(rho * rho + z * z);
++        T f = rad - S::from(params.at("rmax"));
++        if (params.at("rmin") > 0.0) f = S::maxv(f, S::from(params.at("rmin")) - rad);
++        f = S::maxv(f, wedge_eval<T>(x, y, S::from(params.at("phi0")), S::from(params.at("dphi"))));
++        const T t0 = S::from(params.at("theta0"));
++        const T t1 = t0 + S::from(params.at("dtheta"));
++        // cos/sin in double and narrowed once - see wedge_coeffs.
++        if (t0 > S::from(1e-6))
++            f = S::maxv(f, -(rho * S::from(std::cos(double(t0))) -
++                             z * S::from(std::sin(double(t0)))));
++        if (t1 < S::from(M_PI) - S::from(1e-6))
++            f = S::maxv(f, rho * S::from(std::cos(double(t1))) -
++                              z * S::from(std::sin(double(t1))));
+         return f;
+     }
++    FREP_EVAL_T
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+@@ -249,7 +265,7 @@ public:
+ class TrapezoidNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Trapezoid"; }
+ public:
+-    TrapezoidNode(float dx1, float dx2, float dy1, float dy2, float hz,
++    TrapezoidNode(double dx1, double dx2, double dy1, double dy2, double hz,
+                   std::string nid = "trd") {
+         kind = NodeKind::Trapezoid;
+         id = std::move(nid);
+@@ -258,18 +274,21 @@ public:
+         params["hz"] = hz;
+     }
+ 
+-    float eval(float x, float y, float z) const override {
+-        const float hz = params.at("hz");
+-        const float u = (z + hz) / (2.0f * hz);
+-        const float x1 = params.at("dx1"), x2 = params.at("dx2");
+-        const float y1 = params.at("dy1"), y2 = params.at("dy2");
+-        const float X = x1 + (x2 - x1) * u, Y = y1 + (y2 - y1) * u;
+-        const float fx = (std::fabs(x) - X) /
+-                         lat_scale(double(x2) - double(x1), 2.0 * double(hz));
+-        const float fy = (std::fabs(y) - Y) /
+-                         lat_scale(double(y2) - double(y1), 2.0 * double(hz));
+-        return std::max(std::max(fx, fy), std::fabs(z) - hz);
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T hz = S::from(params.at("hz"));
++        const T u = (z + hz) / (S::from(2.0) * hz);
++        const T x1 = S::from(params.at("dx1")), x2 = S::from(params.at("dx2"));
++        const T y1 = S::from(params.at("dy1")), y2 = S::from(params.at("dy2"));
++        const T X = x1 + (x2 - x1) * u, Y = y1 + (y2 - y1) * u;
++        const T fx = (S::absv(x) - X) /
++                     lat_scale<T>(double(x2) - double(x1), 2.0 * double(hz));
++        const T fy = (S::absv(y) - Y) /
++                     lat_scale<T>(double(y2) - double(y1), 2.0 * double(hz));
++        return S::maxv(S::maxv(fx, fy), S::absv(z) - hz);
+     }
++    FREP_EVAL_T
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+@@ -300,7 +319,7 @@ public:
+ class PolyhedronNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Polyhedron"; }
+ public:
+-    PolyhedronNode(float rmin1, float rmax1, float rmin2, float rmax2, float hz,
++    PolyhedronNode(double rmin1, double rmax1, double rmin2, double rmax2, double hz,
+                    float phi0, float dphi, int nside, std::string nid = "poly") {
+         kind = NodeKind::Polyhedron;
+         id = std::move(nid);
+@@ -316,9 +335,9 @@ public:
+     /// reference implementation - so they are cached, and the cache is keyed
+     /// on the three parameters it derives from so that editing one of them
+     /// cannot leave the field evaluating the old polygon.
+-    const std::vector<float>& faces() const {
+-        const float p0 = params.at("phi0"), dp = params.at("dphi"),
+-                    ns = params.at("nside");
++    const std::vector<double>& faces() const {
++        const double p0 = params.at("phi0"), dp = params.at("dphi"),
++                     ns = params.at("nside");
+         if (f_.size() != std::size_t(2 * int(ns)) || fp0_ != p0 || fdp_ != dp) {
+             const int n = int(ns);
+             f_.resize(std::size_t(2 * n));
+@@ -326,8 +345,8 @@ public:
+             const double w = double(dp) / double(n);
+             for (int j = 0; j < n; ++j) {
+                 const double ph = double(p0) + (double(j) + 0.5) * w;
+-                f_[std::size_t(2 * j)] = float(std::cos(ph));
+-                f_[std::size_t(2 * j + 1)] = float(std::sin(ph));
++                f_[std::size_t(2 * j)] = std::cos(ph);
++                f_[std::size_t(2 * j + 1)] = std::sin(ph);
+             }
+             fp0_ = p0;
+             fdp_ = dp;
+@@ -335,26 +354,29 @@ public:
+         return f_;
+     }
+ 
+-    float eval(float x, float y, float z) const override {
+-        const std::vector<float>& fc = faces();
+-        float r = -1e30f;
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const std::vector<double>& fc = faces();
++        T r = S::from(-1e30);
+         for (std::size_t j = 0; j + 1 < fc.size(); j += 2)
+-            r = std::max(r, x * fc[j] + y * fc[j + 1]);
+-        const float hz = params.at("hz");
+-        const float u = (z + hz) / (2.0f * hz);
+-        const float a1 = params.at("rmax1"), a2 = params.at("rmax2");
+-        const float Rmax = a1 + (a2 - a1) * u;
+-        float f = std::max((r - Rmax) / lat_scale(double(a2) - double(a1),
+-                                                  2.0 * double(hz)),
+-                           std::fabs(z) - hz);
+-        const float i1 = params.at("rmin1"), i2 = params.at("rmin2");
+-        if (i1 > 0.0f || i2 > 0.0f) {
+-            const float Rmin = i1 + (i2 - i1) * u;
+-            f = std::max(f, (Rmin - r) / lat_scale(double(i2) - double(i1),
+-                                                   2.0 * double(hz)));
++            r = S::maxv(r, x * S::from(fc[j]) + y * S::from(fc[j + 1]));
++        const T hz = S::from(params.at("hz"));
++        const T u = (z + hz) / (S::from(2.0) * hz);
++        const T a1 = S::from(params.at("rmax1")), a2 = S::from(params.at("rmax2"));
++        const T Rmax = a1 + (a2 - a1) * u;
++        T f = S::maxv((r - Rmax) / lat_scale<T>(double(a2) - double(a1),
++                                                2.0 * double(hz)),
++                      S::absv(z) - hz);
++        const T i1 = S::from(params.at("rmin1")), i2 = S::from(params.at("rmin2"));
++        if (i1 > S::from(0.0) || i2 > S::from(0.0)) {
++            const T Rmin = i1 + (i2 - i1) * u;
++            f = S::maxv(f, (Rmin - r) / lat_scale<T>(double(i2) - double(i1),
++                                                     2.0 * double(hz)));
+         }
+-        return std::max(f, wedge_eval(x, y, params.at("phi0"), params.at("dphi")));
++        return S::maxv(f, wedge_eval<T>(x, y, S::from(params.at("phi0")), S::from(params.at("dphi"))));
+     }
++    FREP_EVAL_T
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+@@ -379,8 +401,8 @@ public:
+     }
+ 
+ private:
+-    mutable std::vector<float> f_;
+-    mutable float fp0_ = 1e30f, fdp_ = 1e30f;
++    mutable std::vector<double> f_;
++    mutable double fp0_ = 1e30, fdp_ = 1e30;
+ };
+ 
+ // ── Frame: one rigid placement ───────────────────────────────────────────────
+@@ -390,7 +412,7 @@ private:
+ class FrameNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Frame"; }
+ public:
+-    FrameNode(Ptr child, const float r[9], float tx, float ty, float tz,
++    FrameNode(Ptr child, const double r[9], double tx, double ty, double tz,
+               std::string nid = "frame") {
+         kind = NodeKind::Frame;
+         id = std::move(nid);
+@@ -400,16 +422,18 @@ public:
+         params["tx"] = tx; params["ty"] = ty; params["tz"] = tz;
+     }
+ 
+-    float eval(float x, float y, float z) const override {
+-        const float dx = x - params.at("tx"), dy = y - params.at("ty"),
+-                    dz = z - params.at("tz");
+-        const float r0 = params.at("r0"), r1 = params.at("r1"), r2 = params.at("r2");
+-        const float r3 = params.at("r3"), r4 = params.at("r4"), r5 = params.at("r5");
+-        const float r6 = params.at("r6"), r7 = params.at("r7"), r8 = params.at("r8");
+-        return children[0]->eval(r0 * dx + r3 * dy + r6 * dz,
+-                                 r1 * dx + r4 * dy + r7 * dz,
+-                                 r2 * dx + r5 * dy + r8 * dz);
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T dx = x - S::from(params.at("tx")), dy = y - S::from(params.at("ty")), dz = z - S::from(params.at("tz"));
++        const T r0 = S::from(params.at("r0")), r1 = S::from(params.at("r1")), r2 = S::from(params.at("r2"));
++        const T r3 = S::from(params.at("r3")), r4 = S::from(params.at("r4")), r5 = S::from(params.at("r5"));
++        const T r6 = S::from(params.at("r6")), r7 = S::from(params.at("r7")), r8 = S::from(params.at("r8"));
++        return children[0]->eval_as<T>(r0 * dx + r3 * dy + r6 * dz,
++                                       r1 * dx + r4 * dy + r7 * dz,
++                                       r2 * dx + r5 * dy + r8 * dz);
+     }
++    FREP_EVAL_T
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+diff --git a/core/frep/hep_codegen.cpp b/core/frep/hep_codegen.cpp
+index 7c4834e..bd3d839 100644
+--- a/core/frep/hep_codegen.cpp
++++ b/core/frep/hep_codegen.cpp
+@@ -71,7 +71,7 @@ Value* TubeNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+         auto* rmin = c.param_value(id, "rmin", params.at("rmin"));
+         f = mx(c, f, b.CreateFSub(rmin, rho, "inner"));
+     }
+-    if (auto* w = wedge_(c, x, y, params.at("phi0"), params.at("dphi")))
++    if (auto* w = wedge_(c, x, y, float(params.at("phi0")), float(params.at("dphi"))))
+         f = mx(c, f, w);
+     return f;
+ }
+@@ -88,7 +88,7 @@ Value* ConeNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+     auto* rho = rho_(c, x, y);
+     Value* f = mx(c,
+                   b.CreateFDiv(b.CreateFSub(rho, Rmax, "dout"),
+-                               c.fc(lat_scale(double(a2) - double(a1), 2.0 * double(hzf))), "lat"),
++                               c.fc(lat_scale<float>(double(a2) - double(a1), 2.0 * double(hzf))), "lat"),
+                   zcap_(c, z, hz));
+     const float i1 = params.at("rmin1"), i2 = params.at("rmin2");
+     if (i1 > 0.0f || i2 > 0.0f) {
+@@ -96,9 +96,9 @@ Value* ConeNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+         auto* Rmin = b.CreateFAdd(q1, b.CreateFMul(c.fc(i2 - i1), u, "dri"), "Rmin");
+         f = mx(c, f,
+                b.CreateFDiv(b.CreateFSub(Rmin, rho, "din"),
+-                            c.fc(lat_scale(double(i2) - double(i1), 2.0 * double(hzf))), "lati"));
++                            c.fc(lat_scale<float>(double(i2) - double(i1), 2.0 * double(hzf))), "lati"));
+     }
+-    if (auto* w = wedge_(c, x, y, params.at("phi0"), params.at("dphi")))
++    if (auto* w = wedge_(c, x, y, float(params.at("phi0")), float(params.at("dphi"))))
+         f = mx(c, f, w);
+     return f;
+ }
+@@ -116,7 +116,7 @@ Value* SphericalShellNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const
+         auto* rmin = c.param_value(id, "rmin", params.at("rmin"));
+         f = mx(c, f, b.CreateFSub(rmin, rad, "inner"));
+     }
+-    if (auto* w = wedge_(c, x, y, params.at("phi0"), params.at("dphi")))
++    if (auto* w = wedge_(c, x, y, float(params.at("phi0")), float(params.at("dphi"))))
+         f = mx(c, f, w);
+     const float t0 = params.at("theta0");
+     const float t1 = t0 + params.at("dtheta");
+@@ -142,7 +142,7 @@ Value* TrapezoidNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+         auto* base = c.param_value(id, p0, v0);
+         auto* half = b.CreateFAdd(base, b.CreateFMul(c.fc(v1 - v0), u, "dh"), "half");
+         return b.CreateFDiv(b.CreateFSub(fabs_(c, coord), half, "d"),
+-                            c.fc(lat_scale(double(v1) - double(v0),
++                            c.fc(lat_scale<float>(double(v1) - double(v0),
+                                            2.0 * double(hzf))), "face");
+     };
+     auto* fx = face("dx1", x1, x2, x);
+@@ -153,13 +153,13 @@ Value* TrapezoidNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+ // ── Polyhedron ───────────────────────────────────────────────────────────────
+ Value* PolyhedronNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+     auto& b = c.b;
+-    const std::vector<float>& fc = faces();
++    const std::vector<double>& fc = faces();
+     // A max of linear functions: ns-1 maxima over compile-time constants, no
+     // branch, no transcendental. Emitted in the same order eval() takes them.
+     Value* r = nullptr;
+     for (std::size_t j = 0; j + 1 < fc.size(); j += 2) {
+-        auto* u = b.CreateFAdd(b.CreateFMul(x, c.fc(fc[j])),
+-                               b.CreateFMul(y, c.fc(fc[j + 1])), "face");
++        auto* u = b.CreateFAdd(b.CreateFMul(x, c.fc(float(fc[j]))),
++                               b.CreateFMul(y, c.fc(float(fc[j + 1]))), "face");
+         r = r ? mx(c, r, u) : u;
+     }
+     const float hzf = params.at("hz");
+@@ -170,7 +170,7 @@ Value* PolyhedronNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+     auto* Rmax = b.CreateFAdd(r1, b.CreateFMul(c.fc(a2 - a1), u, "dr"), "Rmax");
+     Value* f = mx(c,
+                   b.CreateFDiv(b.CreateFSub(r, Rmax, "dout"),
+-                               c.fc(lat_scale(double(a2) - double(a1), 2.0 * double(hzf))), "lat"),
++                               c.fc(lat_scale<float>(double(a2) - double(a1), 2.0 * double(hzf))), "lat"),
+                   zcap_(c, z, hz));
+     const float i1 = params.at("rmin1"), i2 = params.at("rmin2");
+     if (i1 > 0.0f || i2 > 0.0f) {
+@@ -178,9 +178,9 @@ Value* PolyhedronNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+         auto* Rmin = b.CreateFAdd(q1, b.CreateFMul(c.fc(i2 - i1), u, "dri"), "Rmin");
+         f = mx(c, f,
+                b.CreateFDiv(b.CreateFSub(Rmin, r, "din"),
+-                            c.fc(lat_scale(double(i2) - double(i1), 2.0 * double(hzf))), "lati"));
++                            c.fc(lat_scale<float>(double(i2) - double(i1), 2.0 * double(hzf))), "lati"));
+     }
+-    if (auto* w = wedge_(c, x, y, params.at("phi0"), params.at("dphi")))
++    if (auto* w = wedge_(c, x, y, float(params.at("phi0")), float(params.at("dphi"))))
+         f = mx(c, f, w);
+     return f;
+ }
+diff --git a/core/frep/instance.hpp b/core/frep/instance.hpp
+index 9d6f7d0..7ff7f23 100644
+--- a/core/frep/instance.hpp
++++ b/core/frep/instance.hpp
+@@ -20,6 +20,7 @@
+ // mutating it); resolve_instances() below rebinds children[0] from the scene.
+ #pragma once
+ #include "core/frep/node.hpp"
++#include "core/frep/scalar.hpp"
+ #include <string>
+ #include <utility>
+ 
+@@ -59,9 +60,12 @@ public:
+         }
+         return children[0]->codegen(c, x, y, z);       // Level 1 inline fallback
+     }
+-    float eval(float x, float y, float z) const override {
+-        return resolved() ? children[0]->eval(x, y, z) : 1e30f;
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        return resolved() ? children[0]->eval_as<T>(x, y, z)
++                          : ScalarTraits<T>::from(1e30);
+     }
++    FREP_EVAL_T
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override {
+         if (!resolved()) return FRepNode::codegen_grad(c, x, y, z);
+         // Level 2: shared gradient subprogram if the context provides it.
+diff --git a/core/frep/node.hpp b/core/frep/node.hpp
+index 04f40cb..589b58c 100644
+--- a/core/frep/node.hpp
++++ b/core/frep/node.hpp
+@@ -201,7 +201,16 @@ public:
+     NodeKind    kind;
+     std::string id;
+     std::vector<Ptr> children;
+-    std::unordered_map<std::string, float> params;
++    // Double, not float, and this is a STORAGE decision rather than a speed
++    // one. A radius arriving from a detector description is a double; putting
++    // it in a float map rounds it once, before any evaluation, and the ~1e-4
++    // mm that costs at 10 m cannot be recovered by evaluating carefully
++    // afterwards. scene_io already wrote these out as double, so the map was
++    // the only place the value was narrowed and a json round trip was losing
++    // precision the file on disk already held correctly.
++    //
++    // The EVALUATION type is a separate question - see eval / evalw below.
++    std::unordered_map<std::string, double> params;
+ 
+     // Generates LLVM IR — returns a float Value* (the SDF value at point x,y,z).
+     // Marked AlwaysInline → O3 inlines it directly into render_tile.
+@@ -227,6 +236,35 @@ public:
+             type_name() + "'");
+     }
+ 
++    // The same field in double. A node that has one implements eval and evalw
++    // from ONE templated body (see eval_t in primitives/operations/transforms
++    // and hep.hpp) so the two cannot drift - the same discipline codegen()
++    // already owes eval().
++    //
++    // The default forwards through float, which is CORRECT and NOT WIDE: the
++    // answer is a float answer with zeroes after it. That is deliberate. It
++    // keeps a node that has not been converted working, and it keeps the
++    // conversion incremental. What it must never do is be silent, because a
++    // scene evaluated "in double" that is really float somewhere is worse
++    // than one that is float everywhere - the error is in an unknown place.
++    // So wide_eval() reports it and MixedEval counts it, and a caller that
++    // needs the exact type asks before it believes the number.
++    virtual double evalw(double x, double y, double z) const {
++        return double(eval(float(x), float(y), float(z)));
++    }
++
++    /// True when evalw is genuinely evaluated in double rather than forwarded.
++    virtual bool wide_eval() const noexcept { return false; }
++
++    /// Dispatch by kind, for code that is generic over the scalar type.
++    template <class T>
++    T eval_as(T x, T y, T z) const {
++        if constexpr (sizeof(T) >= sizeof(double))
++            return T(evalw(double(x), double(y), double(z)));
++        else
++            return T(eval(float(x), float(y), float(z)));
++    }
++
+     // Generates LLVM IR for forward-mode AD: takes dual numbers
+     // (x.val, x.dot), (y.val, y.dot), (z.val, z.dot)
+     // and returns the dual {sdf_val, sdf_dot}.
+diff --git a/core/frep/operations.hpp b/core/frep/operations.hpp
+index eca1c63..66baf2c 100644
+--- a/core/frep/operations.hpp
++++ b/core/frep/operations.hpp
+@@ -13,6 +13,7 @@
+ //   SmoothUnion  = IQ smin(f1, f2, k)
+ 
+ #include "node.hpp"
++#include "scalar.hpp"
+ #include "core/compiler/llvm_compat.hpp"
+ #include <algorithm>
+ #include <cmath>
+@@ -38,9 +39,12 @@ public:
+ 
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+-    float eval(float x, float y, float z) const override {
+-        return std::min(children[0]->eval(x,y,z), children[1]->eval(x,y,z));
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        return ScalarTraits<T>::minv(children[0]->eval_as<T>(x,y,z),
++                                     children[1]->eval_as<T>(x,y,z));
+     }
++    FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return (children[0]->structural_hash() * 2654435761ull)
+              ^ (children[1]->structural_hash() * 40503ull)
+@@ -66,9 +70,12 @@ public:
+ 
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+-    float eval(float x, float y, float z) const override {
+-        return std::max(children[0]->eval(x,y,z), children[1]->eval(x,y,z));
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        return ScalarTraits<T>::maxv(children[0]->eval_as<T>(x,y,z),
++                                     children[1]->eval_as<T>(x,y,z));
+     }
++    FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return (children[0]->structural_hash() * 2654435761ull)
+              ^ (children[1]->structural_hash() * 40503ull)
+@@ -94,9 +101,12 @@ public:
+ 
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+-    float eval(float x, float y, float z) const override {
+-        return std::max(children[0]->eval(x,y,z), -children[1]->eval(x,y,z));
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        return ScalarTraits<T>::maxv(children[0]->eval_as<T>(x,y,z),
++                                     -children[1]->eval_as<T>(x,y,z));
+     }
++    FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return (children[0]->structural_hash() * 2654435761ull)
+              ^ (children[1]->structural_hash() * 40503ull)
+@@ -145,19 +155,23 @@ public:
+ 
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+-    float eval(float x, float y, float z) const override {
+-        float a = children[0]->eval(x,y,z);
+-        float b = children[1]->eval(x,y,z);
+-        float k = params.at("k");
+-        if (k <= 0.0f) return std::min(a, b);
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T a = children[0]->eval_as<T>(x,y,z);
++        const T b = children[1]->eval_as<T>(x,y,z);
++        const T k = S::from(params.at("k"));
++        const T z0 = S::from(0.0);
++        if (k <= z0) return S::minv(a, b);
+         // Cubic polynomial smin (must match codegen() exactly for parity).
+-        float kk = k * 2.0f;
+-        float h  = std::max(kk - std::fabs(a - b), 0.0f) / kk;
+-        return std::min(a, b) - h*h*h*kk*(1.0f/6.0f);
++        const T kk = k * S::from(2.0);
++        const T h  = S::maxv(kk - S::absv(a - b), z0) / kk;
++        return S::minv(a, b) - h*h*h*kk*S::from(1.0/6.0);
+     }
++    FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return (children[0]->structural_hash() * 2654435761ull)
+-             ^ std::hash<float>{}(params.at("k"))
++             ^ std::hash<double>{}(params.at("k"))
+              ^ 0x9900'AABBull;
+     }
+ };
+@@ -178,9 +192,9 @@ public:
+ 
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+-    float eval(float x, float y, float z) const override {
+-        return -children[0]->eval(x,y,z);
+-    }
++    template <class T>
++    T eval_t(T x, T y, T z) const { return -children[0]->eval_as<T>(x,y,z); }
++    FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return children[0]->structural_hash() ^ 0xDEAD'BEEFull;
+     }
+diff --git a/core/frep/primitives.hpp b/core/frep/primitives.hpp
+index 54ead0e..7151c02 100644
+--- a/core/frep/primitives.hpp
++++ b/core/frep/primitives.hpp
+@@ -2,6 +2,7 @@
+ // core/frep/primitives.hpp
+ 
+ #include "node.hpp"
++#include "scalar.hpp"
+ #include "core/compiler/llvm_compat.hpp"
+ #include <cmath>
+ #include <functional>
+@@ -15,7 +16,7 @@ namespace frep {
+ class SphereNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Sphere"; }
+ public:
+-    explicit SphereNode(float r, std::string nid = "sphere") {
++    explicit SphereNode(double r, std::string nid = "sphere") {
+         kind = NodeKind::Sphere; id = std::move(nid);
+         params["r"] = r;
+     }
+@@ -37,12 +38,15 @@ public:
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+ 
+-    float eval(float x, float y, float z) const override {
+-        return std::sqrt(x*x + y*y + z*z) - params.at("r");
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        return S::sqrtv(x*x + y*y + z*z) - S::from(params.at("r"));
+     }
++    FREP_EVAL_T
+ 
+     std::size_t structural_hash() const noexcept override {
+-        return std::hash<float>{}(params.at("r")) ^ 0xF5E8'A1C3ull;
++        return std::hash<double>{}(params.at("r")) ^ 0xF5E8'A1C3ull;
+     }
+ };
+ 
+@@ -51,7 +55,7 @@ public:
+ class BoxNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Box"; }
+ public:
+-    BoxNode(float hx, float hy, float hz, std::string nid = "box") {
++    BoxNode(double hx, double hy, double hz, std::string nid = "box") {
+         kind = NodeKind::Box; id = std::move(nid);
+         params["hx"] = hx; params["hy"] = hy; params["hz"] = hz;
+     }
+@@ -84,32 +88,27 @@ public:
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+ 
+-    float eval(float x, float y, float z) const override {
+-        // True Euclidean box SDF (Inigo Quilez). The old version returned
+-        // max(dx,dy,dz) — the Chebyshev (L∞) distance — which is correct
+-        // inside and on-axis but UNDER-estimates the distance to a far
+-        // corner (a point off the diagonal is sqrt-farther than its
+-        // largest single-axis gap). That under-estimate breaks the BVH's
+-        // pruning invariant (an object's AABB distance must be a lower
+-        // bound on its SDF) and also makes sphere-tracing take smaller
+-        // steps than necessary. The exact form: outside distance is the
+-        // length of the positive part of (|p|-half); inside distance is
+-        // the (negative) largest gap.
+-        const float dx = std::abs(x) - params.at("hx");
+-        const float dy = std::abs(y) - params.at("hy");
+-        const float dz = std::abs(z) - params.at("hz");
+-        const float ox = std::max(dx, 0.0f);
+-        const float oy = std::max(dy, 0.0f);
+-        const float oz = std::max(dz, 0.0f);
+-        const float outside = std::sqrt(ox*ox + oy*oy + oz*oz);
+-        const float inside  = std::min(std::max(dx, std::max(dy, dz)), 0.0f);
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        // True Euclidean box SDF (Inigo Quilez). The Chebyshev form max(dx,
++        // dy,dz) under-estimates the distance to a far corner, which breaks
++        // the BVH's pruning invariant and shortens every sphere-tracing step.
++        const T dx = S::absv(x) - S::from(params.at("hx"));
++        const T dy = S::absv(y) - S::from(params.at("hy"));
++        const T dz = S::absv(z) - S::from(params.at("hz"));
++        const T z0 = S::from(0.0);
++        const T ox = S::maxv(dx, z0), oy = S::maxv(dy, z0), oz = S::maxv(dz, z0);
++        const T outside = S::sqrtv(ox*ox + oy*oy + oz*oz);
++        const T inside  = S::minv(S::maxv(dx, S::maxv(dy, dz)), z0);
+         return outside + inside;
+     }
++    FREP_EVAL_T
+ 
+     std::size_t structural_hash() const noexcept override {
+         std::size_t h = 0xBBB2;
+         for (auto& [k, v] : params)
+-            h ^= std::hash<float>{}(v) + 0x9e37'79b9ull + (h << 6) + (h >> 2);
++            h ^= std::hash<double>{}(v) + 0x9e37'79b9ull + (h << 6) + (h >> 2);
+         return h;
+     }
+ };
+@@ -119,7 +118,7 @@ public:
+ class PlaneNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Plane"; }
+ public:
+-    PlaneNode(float nx, float ny, float nz, float d, std::string nid = "plane") {
++    PlaneNode(double nx, double ny, double nz, double d, std::string nid = "plane") {
+         kind = NodeKind::Plane; id = std::move(nid);
+         params["nx"] = nx; params["ny"] = ny; params["nz"] = nz; params["d"] = d;
+     }
+@@ -137,15 +136,17 @@ public:
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     // PlaneNode does not override aabb() — the plane is infinite.
+ 
+-    float eval(float x, float y, float z) const override {
+-        return params.at("nx")*x + params.at("ny")*y + params.at("nz")*z
+-             + params.at("d");
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        return S::from(params.at("nx"))*x + S::from(params.at("ny"))*y + S::from(params.at("nz"))*z + S::from(params.at("d"));
+     }
++    FREP_EVAL_T
+ 
+     std::size_t structural_hash() const noexcept override {
+         std::size_t h = 0xF1A7;
+         for (auto& [k, v] : params)
+-            h ^= std::hash<float>{}(v) + 0x9e37'79b9ull + (h << 6) + (h >> 2);
++            h ^= std::hash<double>{}(v) + 0x9e37'79b9ull + (h << 6) + (h >> 2);
+         return h;
+     }
+ };
+diff --git a/core/frep/scalar.hpp b/core/frep/scalar.hpp
+new file mode 100644
+index 0000000..156820e
+--- /dev/null
++++ b/core/frep/scalar.hpp
+@@ -0,0 +1,115 @@
++// core/frep/scalar.hpp
++//
++// The arithmetic type as a parameter, not a typedef.
++//
++// FD4 evaluates in float everywhere: FRepNode::eval is float, params is a map
++// of float, CgCtx::f32 is the only constant maker. That is the right default -
++// a render tile wants f32 and a GPU wants f32 - but it is a CEILING, and three
++// separate things sit under it:
++//
++//   1. THE PARAMETERS. A radius read from a detector description is a double.
++//      Storing it in a float map costs ~1e-4 mm at 10 m BEFORE any evaluation
++//      happens, and no amount of careful arithmetic gets it back. This is why
++//      params is a map of double: the type of the STORED value and the type of
++//      the EVALUATION are different questions, and only the second one is a
++//      speed/accuracy trade.
++//
++//   2. THE SURFACE BAND. A tolerance is a statement about a type. f32 spacing
++//      at 1e4 mm is 9.8e-4 mm, so a 1e-9 band is empty there and every query
++//      reads either "on the surface" or nothing does. tol() carries the band
++//      the type can support, so a caller is told rather than silently
++//      mis-served.
++//
++//   3. WHAT MAY BE REPORTED. A cheap type answers "can this be rejected?" It
++//      does not answer "how far is the surface?" Those are different
++//      questions and only the second needs the exact type. A pipeline is
++//      therefore assembled from a cheap type for rejection and an exact one
++//      for the root - see MixedEval - rather than one type for everything.
++//
++// Required of a specialisation:
++//   type       V (the value type), W (a wider accumulator, may equal V)
++//   convert    from(double), to(V)
++//   arithmetic operator + - * / on V, plus sqrtv, absv, minv, maxv
++//   rounding   up(V), down(V)      - one-ulp outward, identity when exact
++//   limits     eps(), tol(), maxFinite(), exactAdditive(), name()
++//
++// The set matches G4-FRep's include/frep/core/scalar.hh so a type that works
++// there works here. f16 and fixed point are defined there and deliberately not
++// here: FD4 has no executor that can carry them yet, and a traits block with
++// no executor behind it is a promise, not a capability.
++
++#pragma once
++
++#include <cmath>
++#include <limits>
++
++namespace frep {
++
++template <class T>
++struct ScalarTraits;
++
++template <>
++struct ScalarTraits<double> {
++    using V = double;
++    using W = double;
++    static V from(double d) noexcept { return d; }
++    static double to(V v) noexcept { return v; }
++    static V sqrtv(V v) noexcept { return std::sqrt(v); }
++    static V absv(V v) noexcept { return std::fabs(v); }
++    static V minv(V a, V b) noexcept { return a < b ? a : b; }
++    static V maxv(V a, V b) noexcept { return a > b ? a : b; }
++    static V up(V v) noexcept {
++        return std::nextafter(v, std::numeric_limits<V>::infinity());
++    }
++    static V down(V v) noexcept {
++        return std::nextafter(v, -std::numeric_limits<V>::infinity());
++    }
++    static V eps() noexcept { return 2.22e-16; }
++    static V tol() noexcept { return 1e-9; }        // Geant4's kCarTolerance
++    static V maxFinite() noexcept { return 1.79e308; }
++    static bool exactAdditive() noexcept { return false; }
++    static const char* name() noexcept { return "f64"; }
++};
++
++template <>
++struct ScalarTraits<float> {
++    using V = float;
++    using W = float;
++    static V from(double d) noexcept { return float(d); }
++    static double to(V v) noexcept { return double(v); }
++    static V sqrtv(V v) noexcept { return std::sqrt(v); }
++    static V absv(V v) noexcept { return std::fabs(v); }
++    static V minv(V a, V b) noexcept { return a < b ? a : b; }
++    static V maxv(V a, V b) noexcept { return a > b ? a : b; }
++    static V up(V v) noexcept {
++        return std::nextafterf(v, std::numeric_limits<V>::infinity());
++    }
++    static V down(V v) noexcept {
++        return std::nextafterf(v, -std::numeric_limits<V>::infinity());
++    }
++    static V eps() noexcept { return 1.19e-7f; }
++    // f32 spacing at 1e4 mm is 9.8e-4 mm; a 1e-9 band is meaningless here.
++    static V tol() noexcept { return 1e-3f; }
++    static V maxFinite() noexcept { return 3.4e38f; }
++    static bool exactAdditive() noexcept { return false; }
++    static const char* name() noexcept { return "f32"; }
++};
++
++// Which of a node's two evaluators a caller is asking for. Kept as a type
++// rather than a bool so a third one does not have to change every signature.
++enum class ScalarKind { F32, F64 };
++
++}  // namespace frep
++
++/// The three lines every converted node carries. eval and evalw are generated
++/// from ONE templated body, so the float path and the double path cannot
++/// drift - the same discipline codegen() already owes eval(). wide_eval says
++/// the double one is real rather than a forward through float.
++#define FREP_EVAL_T                                                           \
++    float eval(float x, float y, float z) const override {                    \
++        return eval_t<float>(x, y, z);                                        \
++    }                                                                         \
++    double evalw(double x, double y, double z) const override {               \
++        return eval_t<double>(x, y, z);                                       \
++    }                                                                         \
++    bool wide_eval() const noexcept override { return true; }
+diff --git a/core/frep/scene.hpp b/core/frep/scene.hpp
+index e177c5b..ab75d06 100644
+--- a/core/frep/scene.hpp
++++ b/core/frep/scene.hpp
+@@ -182,7 +182,8 @@ public:
+         if (it == objects_.end()) return {0, 0, 0};
+         const FRepNode* g = it->second.geometry.get();
+         if (g && std::string(g->type_name()) == "Translate") {
+-            return { g->params.at("tx"), g->params.at("ty"), g->params.at("tz") };
++            return { float(g->params.at("tx")), float(g->params.at("ty")),
++                     float(g->params.at("tz")) };
+         }
+         return {0, 0, 0};
+     }
+diff --git a/core/frep/transforms.hpp b/core/frep/transforms.hpp
+index d545503..55a9cb5 100644
+--- a/core/frep/transforms.hpp
++++ b/core/frep/transforms.hpp
+@@ -5,6 +5,7 @@
+ // passing them to the child node (the standard F-Rep approach).
+ 
+ #include "node.hpp"
++#include "scalar.hpp"
+ #include <cmath>
+ 
+ namespace frep {
+@@ -32,15 +33,16 @@ public:
+ 
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+-    float eval(float x, float y, float z) const override {
+-        return children[0]->eval(x - params.at("tx"),
+-                                 y - params.at("ty"),
+-                                 z - params.at("tz"));
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        return children[0]->eval_as<T>(x - S::from(params.at("tx")), y - S::from(params.at("ty")), z - S::from(params.at("tz")));
+     }
++    FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         std::size_t h = children[0]->structural_hash() ^ 0x7788'99AAull;
+         for (auto& [k, v] : params)
+-            h ^= std::hash<float>{}(v) + 0x9e37'79b9ull + (h << 6) + (h >> 2);
++            h ^= std::hash<double>{}(v) + 0x9e37'79b9ull + (h << 6) + (h >> 2);
+         return h;
+     }
+ };
+@@ -81,16 +83,19 @@ public:
+ 
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+-    float eval(float x, float y, float z) const override {
+-        float sx=params.at("sx"), sy=params.at("sy"), sz=params.at("sz");
+-        float mn = std::min(sx, std::min(sy, sz));
+-        return children[0]->eval(x/sx, y/sy, z/sz) * mn;
+-    }
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T sx = S::from(params.at("sx")), sy = S::from(params.at("sy")), sz = S::from(params.at("sz"));
++        const T mn = S::minv(sx, S::minv(sy, sz));
++        return children[0]->eval_as<T>(x/sx, y/sy, z/sz) * mn;
++    }
++    FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return children[0]->structural_hash()
+-             ^ std::hash<float>{}(params.at("sx"))
+-             ^ (std::hash<float>{}(params.at("sy")) << 1)
+-             ^ (std::hash<float>{}(params.at("sz")) << 2)
++             ^ std::hash<double>{}(params.at("sx"))
++             ^ (std::hash<double>{}(params.at("sy")) << 1)
++             ^ (std::hash<double>{}(params.at("sz")) << 2)
+              ^ 0x9900'1122ull;
+     }
+ };
+@@ -124,14 +129,19 @@ public:
+ 
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+-    float eval(float x, float y, float z) const override {
+-        float a = params.at("a");
+-        float ca = std::cos(a), sa = std::sin(a);
+-        return children[0]->eval(ca*x + sa*z, y, ca*z - sa*x);
+-    }
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T a = S::from(params.at("a"));
++        // std::cos of a T: cosf for float, cos for double. The float path
++        // therefore keeps exactly the bits codegen emits (llvm.cos.f32).
++        const T ca = std::cos(a), sa = std::sin(a);
++        return children[0]->eval_as<T>(ca*x + sa*z, y, ca*z - sa*x);
++    }
++    FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return children[0]->structural_hash()
+-             ^ std::hash<float>{}(params.at("a"))
++             ^ std::hash<double>{}(params.at("a"))
+              ^ 0xAA11'BB22ull;
+     }
+ };
+@@ -156,14 +166,19 @@ public:
+     }
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+-    float eval(float x, float y, float z) const override {
+-        float a = params.at("a");
+-        float ca = std::cos(a), sa = std::sin(a);
+-        return children[0]->eval(x, ca*y + sa*z, ca*z - sa*y);
+-    }
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T a = S::from(params.at("a"));
++        // std::cos of a T: cosf for float, cos for double. The float path
++        // therefore keeps exactly the bits codegen emits (llvm.cos.f32).
++        const T ca = std::cos(a), sa = std::sin(a);
++        return children[0]->eval_as<T>(x, ca*y + sa*z, ca*z - sa*y);
++    }
++    FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return children[0]->structural_hash()
+-             ^ std::hash<float>{}(params.at("a"))
++             ^ std::hash<double>{}(params.at("a"))
+              ^ 0xBB22'CC33ull;
+     }
+ };
+@@ -188,14 +203,19 @@ public:
+     }
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+     AABB aabb() const override;
+-    float eval(float x, float y, float z) const override {
+-        float a = params.at("a");
+-        float ca = std::cos(a), sa = std::sin(a);
+-        return children[0]->eval(ca*x + sa*y, ca*y - sa*x, z);
+-    }
++    template <class T>
++    T eval_t(T x, T y, T z) const {
++        using S = ScalarTraits<T>;
++        const T a = S::from(params.at("a"));
++        // std::cos of a T: cosf for float, cos for double. The float path
++        // therefore keeps exactly the bits codegen emits (llvm.cos.f32).
++        const T ca = std::cos(a), sa = std::sin(a);
++        return children[0]->eval_as<T>(ca*x + sa*y, ca*y - sa*x, z);
++    }
++    FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return children[0]->structural_hash()
+-             ^ std::hash<float>{}(params.at("a"))
++             ^ std::hash<double>{}(params.at("a"))
+              ^ 0xCC33'DD44ull;
+     }
+ };
+diff --git a/core/io/scene_io.cpp b/core/io/scene_io.cpp
+index 8447669..d50bb08 100644
+--- a/core/io/scene_io.cpp
++++ b/core/io/scene_io.cpp
+@@ -256,10 +256,13 @@ std::string serialize_scene(const SceneGraph& scene,
+ // ─────────────────────────────────────────────────────────────────────────────
+ namespace {
+ 
+-float param_or(const Object& p, const std::string& key, float def) {
++/// Double, not float: the json on disk already holds the full value (the
++/// writer casts to double), so narrowing here was discarding precision the
++/// file had written correctly. See FRepNode::params.
++double param_or(const Object& p, const std::string& key, double def) {
+     auto it = p.find(key);
+     if (it == p.end()) return def;
+-    return it->second.as_float();
++    return it->second.as_number();
+ }
+ 
+ struct NodeDeserializer {
+@@ -344,7 +347,7 @@ struct NodeDeserializer {
+         }
+         if (type == "Frame") {
+             if (kids.size() != 1) throw std::runtime_error("Frame needs 1 child");
+-            float r[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
++            double r[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+             for (int k = 0; k < 9; ++k)
+                 r[k] = param_or(params, "r" + std::to_string(k), r[k]);
+             return std::make_shared<hep::FrameNode>(
+diff --git a/tests/test_scalar_type.cpp b/tests/test_scalar_type.cpp
+new file mode 100644
+index 0000000..428230c
+--- /dev/null
++++ b/tests/test_scalar_type.cpp
+@@ -0,0 +1,190 @@
++// tests/test_scalar_type.cpp
++//
++// The scalar type is a parameter of evaluation, not of the tree. Three things
++// have to hold for that to be worth anything:
++//
++//   A  The double path is REAL where a node says it is. Against an analytic
++//      reference the f64 answer must be orders better than the f32 one -
++//      asserted on the MAXIMUM over many points, never point by point,
++//      because two approximations of the same number cross over constantly
++//      and a per-point ordering is a coin flip dressed as an invariant.
++//
++//   B  The float path is UNCHANGED. eval and evalw come from one templated
++//      body, and the whole point of routing every parameter through
++//      ScalarTraits<T>::from() is that instantiating it at float reproduces
++//      the arithmetic that was there before. Checked against closed forms
++//      that are exact in float, so the test states a value rather than a
++//      diff against yesterday's binary.
++//
++//   C  A node that has NOT been converted says so. evalw falls back to float
++//      and returns a correct number; what must never happen is that it
++//      returns that number while claiming to be double, because then the
++//      error is real and in an unknown place.
++
++#include "core/frep/primitives.hpp"
++#include "core/frep/operations.hpp"
++#include "core/frep/transforms.hpp"
++#include "core/frep/hep.hpp"
++#include "core/frep/scalar.hpp"
++
++#include <gtest/gtest.h>
++
++#include <cmath>
++#include <memory>
++#include <random>
++#include <vector>
++
++using namespace frep;
++
++namespace {
++
++std::vector<std::array<double, 3>> points(int n, double ext) {
++    std::mt19937_64 rng(20260920);
++    std::uniform_real_distribution<double> U(-ext, ext);
++    std::vector<std::array<double, 3>> p;
++    p.reserve(std::size_t(n));
++    for (int i = 0; i < n; ++i) p.push_back({U(rng), U(rng), U(rng)});
++    return p;
++}
++
++/// Worst |eval - ref| and worst |evalw - ref| over the same points.
++struct Err { double f32 = 0.0, f64 = 0.0; };
++
++template <class Ref>
++Err sweep(const FRepNode& n, double ext, Ref ref, int np = 4000) {
++    Err e;
++    for (const auto& p : points(np, ext)) {
++        const double r = ref(p[0], p[1], p[2]);
++        e.f32 = std::max(e.f32, std::fabs(double(n.eval(float(p[0]), float(p[1]),
++                                                        float(p[2]))) - r));
++        e.f64 = std::max(e.f64, std::fabs(n.evalw(p[0], p[1], p[2]) - r));
++    }
++    return e;
++}
++
++}  // namespace
++
++// ── A. the double path is real ───────────────────────────────────────────────
++
++TEST(ScalarType, SphereIsOrdersMoreAccurateInDouble) {
++    // A radius no float can hold: the error starts in the PARAMETER, before
++    // any arithmetic, which is why params is a map of double.
++    const double R = 8425.123456789012;
++    SphereNode s(R);
++    const Err e = sweep(s, 10000.0, [&](double x, double y, double z) {
++        return std::sqrt(x * x + y * y + z * z) - R;
++    });
++    EXPECT_GT(e.f32, 1e-4) << "f32 is expected to be coarse at 10 m";
++    EXPECT_LT(e.f64, 1e-9);
++    EXPECT_LT(e.f64 * 1e5, e.f32);
++}
++
++TEST(ScalarType, TubeIsOrdersMoreAccurateInDouble) {
++    const double rmin = 1010.10101010101, rmax = 4321.098765432109,
++                 hz = 7777.777777777777;
++    hep::TubeNode t(rmin, rmax, hz, 0.0, 7.0);   // dphi > 2pi: no wedge
++    const Err e = sweep(t, 9000.0, [&](double x, double y, double z) {
++        const double rho = std::sqrt(x * x + y * y);
++        return std::max(std::max(rho - rmax, std::fabs(z) - hz), rmin - rho);
++    });
++    EXPECT_GT(e.f32, 1e-4);
++    EXPECT_LT(e.f64, 1e-9);
++    EXPECT_LT(e.f64 * 1e5, e.f32);
++}
++
++TEST(ScalarType, CompositesCarryTheTypeThroughChildren) {
++    // The interesting part is not the leaf but the path: Frame -> Difference
++    // -> Box/Sphere has to hand T down through eval_as at every level, and a
++    // single node falling back to float would show up here.
++    const double r[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
++    const double hx = 3333.333333333333, rr = 2222.222222222222;
++    auto inner = std::make_shared<DifferenceNode>(
++        std::make_shared<BoxNode>(hx, hx, hx), std::make_shared<SphereNode>(rr));
++    hep::FrameNode f(inner, r, 0.0, 0.0, 0.0);
++    const Err e = sweep(f, 6000.0, [&](double x, double y, double z) {
++        const double dx = std::fabs(x) - hx, dy = std::fabs(y) - hx,
++                     dz = std::fabs(z) - hx;
++        const double ox = std::max(dx, 0.0), oy = std::max(dy, 0.0),
++                     oz = std::max(dz, 0.0);
++        const double box = std::sqrt(ox * ox + oy * oy + oz * oz) +
++                           std::min(std::max(dx, std::max(dy, dz)), 0.0);
++        return std::max(box, -(std::sqrt(x * x + y * y + z * z) - rr));
++    });
++    EXPECT_GT(e.f32, 1e-4);
++    EXPECT_LT(e.f64, 1e-9);
++    EXPECT_LT(e.f64 * 1e5, e.f32);
++}
++
++// ── B. the float path is unchanged ───────────────────────────────────────────
++
++TEST(ScalarType, FloatPathKeepsItsExactValues) {
++    // Every parameter and coordinate here is a dyadic rational, so the answer
++    // is exact in float and the expected value can be WRITTEN DOWN rather
++    // than compared against a previous build.
++    SphereNode s(100.0);
++    EXPECT_EQ(s.eval(60.0f, 80.0f, 0.0f), 0.0f);      // 3-4-5 scaled
++    EXPECT_EQ(s.eval(30.0f, 40.0f, 0.0f), -50.0f);
++
++    BoxNode b(4.0, 8.0, 16.0);
++    EXPECT_EQ(b.eval(0.0f, 0.0f, 0.0f), -4.0f);       // nearest face
++    EXPECT_EQ(b.eval(7.0f, 12.0f, 16.0f), 5.0f);      // 3-4-0 outside corner
++
++    hep::TubeNode t(0.0, 8.0, 3.0, 0.0, 7.0);
++    EXPECT_EQ(t.eval(6.0f, 8.0f, 0.0f), 2.0f);        // rho = 10
++    EXPECT_EQ(t.eval(0.0f, 0.0f, 5.0f), 2.0f);        // the z cap wins
++
++    DifferenceNode d(std::make_shared<BoxNode>(4.0, 4.0, 4.0),
++                     std::make_shared<SphereNode>(2.0));
++    EXPECT_EQ(d.eval(0.0f, 0.0f, 0.0f), 2.0f);        // inside the hole
++}
++
++TEST(ScalarType, FloatAndDoubleAgreeWhereFloatCanHoldTheAnswer) {
++    // Points chosen so the answer is EXACT in float: either the branch has no
++    // square root at all (inside a box is a max of differences), or its
++    // argument is a perfect square. Anywhere else the two types differ by
++    // construction and equality would be the wrong assertion - sqrt(2) is not
++    // a float. This is what "one body" buys: where float can hold the answer,
++    // the two paths produce the same bits.
++    BoxNode b(4.0, 8.0, 16.0);
++    const double bp[][3] = {{0, 0, 0}, {2, 0, 0}, {0, 7, 0}, {3, 6, 15},
++                            {10, 0, 0}, {7, 12, 16}, {-10, 0, 0}};
++    for (const auto& p : bp)
++        EXPECT_EQ(double(b.eval(float(p[0]), float(p[1]), float(p[2]))),
++                  b.evalw(p[0], p[1], p[2]))
++            << "at " << p[0] << "," << p[1] << "," << p[2];
++
++    hep::TubeNode t(0.0, 8.0, 3.0, 0.0, 7.0);
++    const double tp[][3] = {{6, 8, 0}, {0, 0, 5}, {3, 4, 1}, {0, 0, 0}};
++    for (const auto& p : tp)
++        EXPECT_EQ(double(t.eval(float(p[0]), float(p[1]), float(p[2]))),
++                  t.evalw(p[0], p[1], p[2]))
++            << "at " << p[0] << "," << p[1] << "," << p[2];
++}
++
++// ── C. an unconverted node says so ───────────────────────────────────────────
++
++TEST(ScalarType, ConvertedNodesDeclareTheirWideEval) {
++    EXPECT_TRUE(SphereNode(1.0).wide_eval());
++    EXPECT_TRUE(BoxNode(1.0, 1.0, 1.0).wide_eval());
++    EXPECT_TRUE(hep::TubeNode(0.0, 1.0, 1.0, 0.0, 7.0).wide_eval());
++    EXPECT_TRUE(UnionNode(std::make_shared<SphereNode>(1.0),
++                          std::make_shared<SphereNode>(2.0))
++                    .wide_eval());
++    EXPECT_TRUE(TranslateNode(std::make_shared<SphereNode>(1.0), 1.0, 2.0, 3.0)
++                    .wide_eval());
++}
++
++TEST(ScalarType, TraitsCarryTheBandTheTypeCanSupport) {
++    // A tolerance is a statement about a type. Geant4's 1e-9 mm is a
++    // statement about f64 and is empty in f32, where the spacing at 1e4 mm
++    // is already 1e-3 mm.
++    EXPECT_LT(ScalarTraits<double>::tol(), 1e-6);
++    EXPECT_GT(ScalarTraits<float>::tol(), 1e-4f);
++    EXPECT_GT(std::nextafterf(1e4f, 2e4f) - 1e4f, ScalarTraits<double>::tol());
++    EXPECT_STREQ(ScalarTraits<float>::name(), "f32");
++    EXPECT_STREQ(ScalarTraits<double>::name(), "f64");
++    // up/down widen outward by one ulp and nothing more.
++    EXPECT_GT(ScalarTraits<float>::up(1.0f), 1.0f);
++    EXPECT_LT(ScalarTraits<float>::down(1.0f), 1.0f);
++    EXPECT_EQ(ScalarTraits<float>::up(1.0f), std::nextafterf(1.0f, 2.0f));
++}
+-- 
+2.43.0
+

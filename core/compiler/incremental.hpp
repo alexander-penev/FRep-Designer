@@ -190,8 +190,9 @@ private:
         std::unordered_map<std::string, float> live;
         std::function<void(const FRepNode*)> walk = [&](const FRepNode* n) {
             if (!n) return;
-            for (const auto& [k, v] : n->params)
-                live[n->id + "::" + k] = v;
+            for (std::size_t i = 0; i < n->params.size(); ++i)
+                live[n->id + "::" + n->params.name(i)] =
+                    float(n->params.value(i));
             for (const auto& c : n->children) walk(c.get());
         };
         for (const auto& [id, obj] : scene.objects())

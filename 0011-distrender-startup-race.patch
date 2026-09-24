@@ -1,0 +1,82 @@
+From 673c6083d08e8fcd0c3fa14211ed17c04395ec85 Mon Sep 17 00:00:00 2001
+From: Alexander Penev <alexander.p.penev@gmail.com>
+Date: Thu, 24 Sep 2026 17:22:25 +0300
+Subject: [PATCH] tests: the DistRender startup race, diagnosed and closed
+
+DistRender.PushSchedulerCoversFrame timed out at 60 s under ctest -j16 on a
+2-core box - one run in six - and took 0.07 s on its own. gdb on the hung
+process settled what it was:
+
+    Thread 2  Master::run -> TcpListener::accept -> poll(timeout=200)
+    Thread 1  main, in std::thread::join()
+    (both worker threads already exited)
+
+So both workers had finished while the master was still waiting to accept
+one. The master binds on its own thread and the test starts the workers
+immediately; starved of CPU, a worker reaches connect() before the listener
+exists. With retry_secs at its default 0 that connect fails at once, run()
+returns the error, the test DISCARDED it, the worker exited - and the master
+waited forever for a connection nobody would make.
+
+The library already has the fix and the two later tests in this same file
+already use it: WorkerConfig::retry_secs, whose comment reads "retry connect
+for N s (LAN startup race)". The two older tests simply never set it. Both
+now do, and neither discards w.run() any more - a worker that gives up
+should read as a connect failure, not as a ctest timeout.
+
+Verified where it failed: 30 runs of all DistRender tests under 8x CPU
+oversubscription, then six full ctest -j16 passes. No hang, no failure.
+
+Worth keeping: nothing here was a wall-clock assertion, and the earlier
+guesses (TIME_WAIT, a port collision between tests) were both wrong -
+SO_REUSEADDR is set and every test in the file has its own port. A
+backtrace from the hung process cost less than any of the reasoning that
+preceded it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5ALyYbzrXTGtc7LqRPGCz
+---
+ tests/test_dist_render.cpp | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/tests/test_dist_render.cpp b/tests/test_dist_render.cpp
+index 25041e1..38cca47 100644
+--- a/tests/test_dist_render.cpp
++++ b/tests/test_dist_render.cpp
+@@ -73,8 +73,21 @@ TEST(DistRender, PullSchedulerMatchesWholeFrame) {
+         WorkerConfig wc;
+         wc.host = "127.0.0.1"; wc.port = port; wc.width = W; wc.height = H;
+         wc.verbose = false;
++        // retry_secs, as in the two tests below. The master binds on its own
++        // thread and the workers start immediately, so on a loaded machine a
++        // worker can reach connect() before the listener exists. With no
++        // retry that connect fails, run() returns an error the test then
++        // DISCARDS, the worker exits - and the master sits in accept()
++        // waiting for a connection that will never come, so the final join()
++        // never returns. Caught under ctest -j16 on a 2-core box: hung 1 run
++        // in 6, gdb showing Master::run in TcpListener::accept with both
++        // worker threads already gone.
++        wc.retry_secs = 8;
+         Worker w(wc, [] { return std::make_unique<CpuIrExecutor>(); });
+-        (void)w.run();
++        // Not discarded: a worker that gives up used to leave the master
++        // blocked in accept(), which reads as a 60 s ctest timeout rather
++        // than as the connect failure it is.
++        EXPECT_TRUE(w.run().has_value());
+     };
+     std::thread w1(run_worker), w2(run_worker);
+ 
+@@ -122,8 +135,9 @@ TEST(DistRender, PushSchedulerCoversFrame) {
+     std::thread mt([&] { mres = master.run(); });
+     auto run_worker = [&] {
+         WorkerConfig wc; wc.port = port; wc.width = W; wc.height = H; wc.verbose = false;
++        wc.retry_secs = 8;   // the startup race - see the note above
+         Worker w(wc, [] { return std::make_unique<CpuIrExecutor>(); });
+-        (void)w.run();
++        EXPECT_TRUE(w.run().has_value());
+     };
+     std::thread w1(run_worker), w2(run_worker);
+     w1.join(); w2.join(); mt.join();
+-- 
+2.43.0
+

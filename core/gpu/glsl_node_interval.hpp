@@ -42,9 +42,9 @@ public:
     // with runtime bindings can override before emit().
     std::function<std::string(const FRepNode&, const std::string&, float)> param =
         [](const FRepNode& n, const std::string& name, float def) {
-            auto it = n.params.find(name);
+            const double* it = n.params.get(name);
             std::ostringstream s; s.precision(9);
-            s << std::fixed << (it != n.params.end() ? it->second : def);
+            s << std::fixed << (it ? float(*it) : def);
             return s.str();
         };
 
@@ -238,7 +238,7 @@ private:
         // ks=k (clamped); th=ks*x; r=1/ks + y; x'=r*sin(th); y'=r*cos(th)-1/ks;
         // recurse on (x',y',z); result = child / max(1, |ks*r|). cos/sin of an
         // interval -> sound but loose, like the twist.
-        float kc = 1.0f; { auto it=n.params.find("k"); if (it!=n.params.end()) kc=it->second; }
+        const float kc = float(n.params.value_or("k", 1.0));
         float ks = std::fabs(kc) < 1e-6f ? 1e-6f : kc;
         std::ostringstream ss; ss.precision(9); ss << std::fixed << ks;
         std::string ksS = ss.str();

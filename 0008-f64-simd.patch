@@ -1,0 +1,398 @@
+From 0534b05312024abdf3d6d887860d4a619ddb98ca Mon Sep 17 00:00:00 2001
+From: Alexander Penev <alexander.p.penev@gmail.com>
+Date: Thu, 24 Sep 2026 12:02:33 +0300
+Subject: [PATCH] compiler: f64 SIMD lanes, and the answer to where the cheap
+ type pays
+
+compile_scene_sdf_simd_f64 emits the vector path in double lanes. One
+emitter serves both types - detail::emit_simd differs only in CgCtx::scalar
+and the element type - so the two vector paths cannot describe different
+solids, the same reason emit_scene_sdf_f64 shares a walk with its f32 twin.
+
+THE OPEN QUESTION IS NOW CLOSED. mixed_eval.hpp said f32 buys no speed on
+this CPU and that GPU/SIMD was where it should pay but had not been
+measured. Measured, on AVX-512 with 16 float lanes:
+
+    f32 x16   0.73 ns/point
+    f64 x8    1.57 ns/point   same register bytes   f32 2.03-2.14x
+    f64 x16   1.73 ns/point   same lane count       f32 2.23-2.35x
+
+Register-for-register is the comparison that means something - f32 at 8
+lanes against f64 at 8 lanes would be comparing how much work a call does,
+not the types - and it is the one that lands on the factor the mechanism
+predicts. Four runs, 2.03-2.14x.
+
+So the whole picture, three paths measured:
+
+    interpreted        f32 1.13-1.78x SLOWER  (double store narrows per access)
+    compiled scalar    equal within variance  (0.81-1.01x over nine runs)
+    compiled SIMD      f32 2.03-2.14x FASTER
+
+The rule is not "f32 is cheap" or "f32 is not cheap": f32 pays exactly where
+it buys LANES and nowhere else. Scalar code puts one value in a register
+whatever its width, which is why both the interpreter and the scalar JIT see
+nothing. That is what makes Lo = float right for a vector cull and
+Hi = double right for a reported distance - the split MixedEval exists to
+express, now with a measurement behind each half.
+
+Also corrected: the previous commit quoted the scalar band as 0.97-0.99x
+from three runs. Nine runs give 0.81-1.01x. Same conclusion, honest width.
+
+Accuracy carries over unchanged: the f32 lanes match the f32 interpreter to
+4.9e-04 mm and the f64 lanes match evalw to 9.1e-13 mm, each to what its own
+type supports rather than to a shared number.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5ALyYbzrXTGtc7LqRPGCz
+---
+ CMakeLists.txt                  |   1 +
+ core/compiler/compile_sdf.hpp   |  63 ++++++++++--
+ core/frep/mixed_eval.hpp        |  34 ++++---
+ tests/test_simd_scalar_type.cpp | 167 ++++++++++++++++++++++++++++++++
+ 4 files changed, 243 insertions(+), 22 deletions(-)
+ create mode 100644 tests/test_simd_scalar_type.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3adfff1..1da2da9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -620,6 +620,7 @@ add_executable(frep_tests
+     tests/test_param_schema.cpp
+     tests/test_mixed_eval.cpp
+     tests/test_codegen_f64.cpp
++    tests/test_simd_scalar_type.cpp
+     tests/test_expr_backends.cpp
+     tests/test_plugin_runtime.cpp
+     tests/test_scene_set_geometry.cpp
+diff --git a/core/compiler/compile_sdf.hpp b/core/compiler/compile_sdf.hpp
+index 866a08d..1a71b69 100644
+--- a/core/compiler/compile_sdf.hpp
++++ b/core/compiler/compile_sdf.hpp
+@@ -15,7 +15,9 @@
+ #include <expected>
+ #include <memory>
+ #include <vector>
++#include <algorithm>
+ #include <cmath>
++#include <utility>
+ #include <string>
+ namespace frep::jit {
+ 
+@@ -59,6 +61,8 @@ inline unsigned native_simd_width() {
+ }
+ 
+ using SceneSdfSimdFn = void (*)(const float*, const float*, const float*, float*);
++using SceneSdfSimdFn64 = void (*)(const double*, const double*, const double*,
++                                  double*);
+ 
+ struct CompiledSdfSimd {
+     SceneSdfSimdFn             fn = nullptr;
+@@ -66,9 +70,24 @@ struct CompiledSdfSimd {
+     std::unique_ptr<JitEngine> engine;
+ };
+ 
+-inline std::expected<CompiledSdfSimd, std::string>
+-compile_scene_sdf_simd(const SceneGraph& scene, unsigned width = 0) {
+-    if (width == 0) width = native_simd_width();
++struct CompiledSdfSimd64 {
++    SceneSdfSimdFn64           fn = nullptr;
++    unsigned                   width = 0;
++    std::unique_ptr<JitEngine> engine;
++};
++
++namespace detail {
++
++/// One emitter for both lane types. The f32 and f64 vector paths differ only
++/// in CgCtx::scalar and the element type, so writing them twice would let
++/// them describe different solids; this way they cannot.
++///
++/// `width` is the LANE COUNT, not the register width. Comparing the types
++/// fairly means equal REGISTER bytes - f32 at 8 lanes against f64 at 4 - so
++/// the caller picks, and the benchmark in tests/test_simd_scalar_type.cpp
++/// says which comparison it is making.
++inline std::expected<std::pair<void*, std::unique_ptr<JitEngine>>, std::string>
++emit_simd(const SceneGraph& scene, unsigned width, ScalarKind sk) {
+     std::vector<FRepNode::Ptr> geoms;
+     for (auto& [id, obj] : scene.objects())
+         if (obj.visible) geoms.push_back(obj.geometry);
+@@ -78,7 +97,9 @@ compile_scene_sdf_simd(const SceneGraph& scene, unsigned width = 0) {
+     auto ctx = std::make_unique<llvm::LLVMContext>();
+     auto mod = std::make_unique<llvm::Module>("bench_simd", *ctx);
+     auto& C = *ctx;
+-    auto* vt  = llvm::VectorType::get(llvm::Type::getFloatTy(C), width, false);
++    const bool wide = (sk == ScalarKind::F64);
++    auto* et  = wide ? llvm::Type::getDoubleTy(C) : llvm::Type::getFloatTy(C);
++    auto* vt  = llvm::VectorType::get(et, width, false);
+     auto* pf  = llvm::PointerType::getUnqual(C);
+     auto* fty = llvm::FunctionType::get(llvm::Type::getVoidTy(C), {pf,pf,pf,pf}, false);
+     auto* fn  = llvm::Function::Create(fty, llvm::Function::ExternalLinkage,
+@@ -88,19 +109,43 @@ compile_scene_sdf_simd(const SceneGraph& scene, unsigned width = 0) {
+     llvm::Value *pX=&*it++, *pY=&*it++, *pZ=&*it++, *pO=&*it++;
+     auto* bb = llvm::BasicBlock::Create(C, "entry", fn);
+     llvm::IRBuilder<> b(bb);
+-    auto ld = [&](llvm::Value* p){ return b.CreateAlignedLoad(vt, p, llvm::MaybeAlign(4)); };
+-    CgCtx cg{C, *mod, b}; cg.width = width;
++    const unsigned al = wide ? 8u : 4u;
++    auto ld = [&](llvm::Value* p){ return b.CreateAlignedLoad(vt, p, llvm::MaybeAlign(al)); };
++    CgCtx cg{C, *mod, b}; cg.width = width; cg.scalar = sk;
+     auto r = root->codegen(cg, ld(pX), ld(pY), ld(pZ));
+     if (!r) return std::unexpected("codegen failed");
+-    b.CreateAlignedStore(r, pO, llvm::MaybeAlign(4));
++    b.CreateAlignedStore(r, pO, llvm::MaybeAlign(al));
+     b.CreateRetVoid();
+     if (llvm::verifyFunction(*fn, &llvm::errs()))
+         return std::unexpected("verify failed");
+ 
+     auto eng = std::make_unique<JitEngine>();
+-    auto jf = eng->load_as<SceneSdfSimdFn>(std::move(mod), std::move(ctx), "scene_sdf_simd");
++    auto jf = eng->load_as<void*>(std::move(mod), std::move(ctx), "scene_sdf_simd");
+     if (!jf) return std::unexpected(jf.error());
+-    return CompiledSdfSimd{*jf, width, std::move(eng)};
++    return std::make_pair(reinterpret_cast<void*>(*jf), std::move(eng));
++}
++
++}  // namespace detail
++
++inline std::expected<CompiledSdfSimd, std::string>
++compile_scene_sdf_simd(const SceneGraph& scene, unsigned width = 0) {
++    if (width == 0) width = native_simd_width();
++    auto r = detail::emit_simd(scene, width, ScalarKind::F32);
++    if (!r) return std::unexpected(r.error());
++    return CompiledSdfSimd{reinterpret_cast<SceneSdfSimdFn>(r->first), width,
++                           std::move(r->second)};
++}
++
++/// The same, in double lanes. Default width is HALF the native float width,
++/// so the vector register holds the same number of bytes and the comparison
++/// is register-for-register rather than lane-for-lane.
++inline std::expected<CompiledSdfSimd64, std::string>
++compile_scene_sdf_simd_f64(const SceneGraph& scene, unsigned width = 0) {
++    if (width == 0) width = std::max(2u, native_simd_width() / 2u);
++    auto r = detail::emit_simd(scene, width, ScalarKind::F64);
++    if (!r) return std::unexpected(r.error());
++    return CompiledSdfSimd64{reinterpret_cast<SceneSdfSimdFn64>(r->first), width,
++                             std::move(r->second)};
+ }
+ 
+ // Interval SDF (single CustomExprNode). fn(B[6],O[2]) with B=[xlo,xhi,...],
+diff --git a/core/frep/mixed_eval.hpp b/core/frep/mixed_eval.hpp
+index 60989e1..fab5b4c 100644
+--- a/core/frep/mixed_eval.hpp
++++ b/core/frep/mixed_eval.hpp
+@@ -50,19 +50,27 @@
+ // store: it holds double, so eval_t<float> narrows every parameter on the
+ // way in and scalar SSE returns nothing for it.
+ //
+-// COMPILED, the two are EQUAL: 4.4 vs 4.5 ns, 0.97-0.99x over three runs
+-// (tests/test_codegen_f64.cpp). The JIT folds the parameters into constants
+-// of the right type, so the conversions the interpreter pays simply are not
+-// there. The slowness is a property of the INTERPRETER, not of f32 - worth
+-// stating precisely, because the first version of this comment said
+-// "structural rather than incidental" and that was too strong.
+-//
+-// Either way the conclusion for this class is the same and the reason is
+-// scalar code: one value per register, so halving the width buys no lanes
+-// and no traffic. Lo = float therefore buys ACCURACY CONTROL here, not
+-// speed - hi() is the only value anyone reports and refine() says where the
+-// exact type is needed. Where f32 should pay is GPU and SIMD, where it does
+-// double the lane count; that has NOT been measured and is not claimed.
++// COMPILED AND SCALAR, the two are EQUAL within run-to-run variance:
++// 0.81-1.01x over nine runs, mostly 0.93-1.01 (tests/test_codegen_f64.cpp).
++// The JIT folds the parameters into constants of the right type, so the
++// conversions the interpreter pays are simply not there. The interpreter's
++// slowness is a property of the INTERPRETER, not of f32 - worth stating
++// precisely, because the first version of this comment said "structural
++// rather than incidental" and that was too strong.
++//
++// COMPILED AND VECTORISED, f32 finally pays, and by the factor the mechanism
++// predicts (tests/test_simd_scalar_type.cpp, AVX-512, 16 float lanes):
++//
++//     f32 x16   0.73 ns/point
++//     f64 x8    1.57 ns/point   same register bytes   -> f32 2.03-2.14x
++//     f64 x16   1.73 ns/point   same lane count       -> f32 2.23-2.35x
++//
++// So the rule is not "f32 is cheap" or "f32 is not cheap" - it is that f32
++// pays exactly where it buys LANES, and nowhere else. Scalar code puts one
++// value in a register whatever its width, which is why both the interpreter
++// and the scalar JIT see nothing. That makes Lo = float right for a vector
++// cull and Hi = double right for a reported distance, which is the split
++// this class exists to express.
+ //
+ // (The benchmark that produced the compiled numbers got them wrong first:
+ // it converted points inside the timed loop, so every f32 call paid three
+diff --git a/tests/test_simd_scalar_type.cpp b/tests/test_simd_scalar_type.cpp
+new file mode 100644
+index 0000000..fe994bd
+--- /dev/null
++++ b/tests/test_simd_scalar_type.cpp
+@@ -0,0 +1,167 @@
++// tests/test_simd_scalar_type.cpp
++//
++// The question mixed_eval.hpp left open, answered here.
++//
++// Scalar f32 buys nothing on this CPU: interpreted it is slower (the
++// parameter store is double and narrows on the way in), compiled it is
++// equal. Both because scalar code puts one value in a register, so halving
++// the width buys no lanes. SIMD is the first place where it should - the
++// register holds twice as many f32 as f64 - and that is a hypothesis until
++// it is measured, which is what this file does.
++//
++// THE COMPARISON HAS TO BE REGISTER-FOR-REGISTER. f32 at 8 lanes against f64
++// at 8 lanes is not a comparison of types, it is a comparison of how much
++// work each call does; the f32 one would be using half the registers. The
++// fair pairing is equal REGISTER BYTES - f32 at W against f64 at W/2 - and
++// then the interesting number is time per POINT, not per call.
++//
++// Both are reported. A lane-for-lane figure is printed too, because it
++// answers a different and also real question: what an existing f32 kernel
++// would cost if its accuracy had to be raised without changing its shape.
++
++#include "core/compiler/compile_sdf.hpp"
++#include "core/frep/hep.hpp"
++#include "core/frep/operations.hpp"
++#include "core/frep/primitives.hpp"
++
++#include <gtest/gtest.h>
++#include <llvm/Support/TargetSelect.h>
++
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <memory>
++#include <random>
++#include <vector>
++
++using namespace frep;
++
++namespace {
++
++class LLVMInitSimd : public ::testing::Environment {
++public:
++    void SetUp() override {
++        llvm::InitializeNativeTarget();
++        llvm::InitializeNativeTargetAsmPrinter();
++    }
++};
++[[maybe_unused]] auto* g_simd_env =
++    ::testing::AddGlobalTestEnvironment(new LLVMInitSimd);
++
++SceneGraph scene() {
++    SceneGraph s;
++    s.add_object(std::make_shared<DifferenceNode>(
++        std::make_shared<hep::TubeNode>(0.0, 2950.625, 3100.875, 0.0, 7.0),
++        std::make_shared<hep::TubeNode>(0.0, 1210.125, 4000.25, 0.0, 7.0)));
++    return s;
++}
++
++/// Points laid out per lane, in the lane type.
++template <class T>
++struct Pts {
++    std::vector<T> x, y, z, o;
++    std::size_t blocks = 0;
++};
++
++template <class T>
++Pts<T> make(unsigned lanes, std::size_t blocks, std::uint64_t seed) {
++    std::mt19937_64 rng(seed);
++    std::uniform_real_distribution<double> U(-4500.0, 4500.0);
++    Pts<T> p;
++    p.blocks = blocks;
++    const std::size_t n = blocks * lanes;
++    p.x.resize(n); p.y.resize(n); p.z.resize(n); p.o.resize(n);
++    for (std::size_t i = 0; i < n; ++i) {
++        p.x[i] = T(U(rng)); p.y[i] = T(U(rng)); p.z[i] = T(U(rng));
++    }
++    return p;
++}
++
++/// Nanoseconds per POINT, not per call.
++template <class Fn, class T>
++double run(Fn fn, Pts<T>& p, unsigned lanes, int reps) {
++    const auto t0 = std::chrono::steady_clock::now();
++    for (int r = 0; r < reps; ++r)
++        for (std::size_t bIdx = 0; bIdx < p.blocks; ++bIdx) {
++            const std::size_t i = bIdx * lanes;
++            fn(&p.x[i], &p.y[i], &p.z[i], &p.o[i]);
++        }
++    const auto t1 = std::chrono::steady_clock::now();
++    return std::chrono::duration<double, std::nano>(t1 - t0).count() /
++           (double(reps) * double(p.blocks) * double(lanes));
++}
++
++}  // namespace
++
++TEST(SimdScalarType, RegisterForRegisterAndLaneForLane) {
++    const auto sg = scene();
++    const unsigned W = jit::native_simd_width();
++
++    auto f32 = jit::compile_scene_sdf_simd(sg, W);
++    ASSERT_TRUE(f32.has_value()) << (f32 ? "" : f32.error());
++    auto f64_half = jit::compile_scene_sdf_simd_f64(sg, W / 2);
++    ASSERT_TRUE(f64_half.has_value()) << (f64_half ? "" : f64_half.error());
++    auto f64_same = jit::compile_scene_sdf_simd_f64(sg, W);
++    ASSERT_TRUE(f64_same.has_value()) << (f64_same ? "" : f64_same.error());
++
++    const std::size_t B = 4096;
++    const int R = 60;
++    auto p32 = make<float>(W, B, 0x51D);
++    auto p64h = make<double>(W / 2, B, 0x51D);
++    auto p64s = make<double>(W, B, 0x51D);
++
++    const double a = run(f32->fn, p32, W, R);
++    const double b = run(f64_half->fn, p64h, W / 2, R);
++    const double c = run(f64_same->fn, p64s, W, R);
++
++    std::printf("  native float width %u\n", W);
++    std::printf("  f32 x%-2u  %6.3f ns/point\n", W, a);
++    std::printf("  f64 x%-2u  %6.3f ns/point   (same register bytes) "
++                "f32 is %.2fx\n", W / 2, b, b / a);
++    std::printf("  f64 x%-2u  %6.3f ns/point   (same lane count)     "
++                "f32 is %.2fx\n", W, c, c / a);
++
++    // Printed, not asserted - a wall-clock ratio is not an invariant. What IS
++    // asserted is that all three produce the same field, below.
++    EXPECT_GT(a, 0.0);
++    EXPECT_GT(b, 0.0);
++    EXPECT_GT(c, 0.0);
++}
++
++TEST(SimdScalarType, AllThreeVectorPathsAgreeWithTheInterpreter) {
++    const auto sg = scene();
++    const unsigned W = jit::native_simd_width();
++    auto f32 = jit::compile_scene_sdf_simd(sg, W);
++    auto f64h = jit::compile_scene_sdf_simd_f64(sg, W / 2);
++    ASSERT_TRUE(f32.has_value());
++    ASSERT_TRUE(f64h.has_value());
++
++    // The scene's own root, for the reference.
++    FRepNode::Ptr root;
++    for (auto& [id, obj] : sg.objects()) root = obj.geometry;
++    ASSERT_NE(root, nullptr);
++
++    const std::size_t B = 256;
++    auto p32 = make<float>(W, B, 0xA11);
++    auto p64 = make<double>(W / 2, B, 0xA11);
++    for (std::size_t i = 0; i < B; ++i)
++        f32->fn(&p32.x[i * W], &p32.y[i * W], &p32.z[i * W], &p32.o[i * W]);
++    for (std::size_t i = 0; i < B; ++i)
++        f64h->fn(&p64.x[i * (W / 2)], &p64.y[i * (W / 2)],
++                 &p64.z[i * (W / 2)], &p64.o[i * (W / 2)]);
++
++    double w32 = 0.0, w64 = 0.0;
++    for (std::size_t i = 0; i < p32.x.size(); ++i)
++        w32 = std::max(w32, std::fabs(double(p32.o[i]) -
++                                      double(root->eval(p32.x[i], p32.y[i],
++                                                        p32.z[i]))));
++    for (std::size_t i = 0; i < p64.x.size(); ++i)
++        w64 = std::max(w64, std::fabs(p64.o[i] - root->evalw(p64.x[i], p64.y[i],
++                                                             p64.z[i])));
++    std::printf("  worst |vector - interpreter|: f32 %.3g mm, f64 %.3g mm\n",
++                w32, w64);
++    // f32 lanes against the f32 interpreter, f64 lanes against the f64 one:
++    // each to the tolerance its own type supports, not to a shared number.
++    EXPECT_LT(w32, 1e-2);
++    EXPECT_LT(w64, 1e-9);
++}
+-- 
+2.43.0
+

@@ -1,0 +1,512 @@
+From f0d1a4a473e79f83c71bddacb550ec14a3b86e13 Mon Sep 17 00:00:00 2001
+From: Alexander Penev <alexander.p.penev@gmail.com>
+Date: Thu, 24 Sep 2026 11:33:36 +0300
+Subject: [PATCH] compiler: emit the field in double, from the same codegen
+
+CgCtx carries a ScalarKind and an fty(); the node bodies already went
+through c.fc() and the type-following llvm_compat intrinsics, so they emit
+f64 unchanged. emit_scene_sdf_f64 is the same walk as emit_scene_sdf with
+one field different, which is the point - a second emitter could describe a
+different solid, this cannot.
+
+Measured against an analytic hollow cylinder at detector scale:
+
+    worst |IR - analytic|    f32  6.73e-04 mm
+                             f64  9.09e-13 mm
+
+and against the interpreter, the f64 IR differs from evalw() on 1299 of
+20000 points by at most 9.09e-13 mm. Not asserted bit-identical on purpose:
+LLVM may contract a multiply and an add into one fma, which is a different
+and better result than the interpreter's two roundings, and asserting
+equality would be asserting that no optimiser ever improves the arithmetic.
+
+The runtime parameter buffer stays float* - its ABI is shared with the
+OpenCL and CUDA kernels - and an F64 emission widens what it loads. That
+recovers nothing the buffer discarded, which is why the comment says so: a
+runtime slot is f32-accurate by construction and an exact parameter must be
+baked.
+
+f64_blockers() names the nodes that cannot emit wide (MeshSdf's grid,
+CustomExpr's own builder) before emission, using the same wide_eval() flag
+eval/evalw use, rather than letting the IR verifier fail on a type mismatch.
+
+AND A CORRECTION TO THE PREVIOUS COMMIT. It said scalar f32's slowness was
+"structural rather than incidental". Compiled, f32 and f64 are EQUAL - 4.4
+vs 4.5 ns, 0.97-0.99x over three runs - because the JIT folds parameters
+into constants of the right type and the conversions the interpreter pays
+are simply not there. The slowness is a property of the interpreter, not of
+the type, and mixed_eval.hpp now says that.
+
+That correction cost its own defect: the first version of this benchmark
+converted points inside the timed loop, so every f32 call paid three
+narrowings belonging to the harness and read as 1.29x SLOWER, which would
+have confirmed the overstated claim. Each type now gets its points in its
+own type. Fifth instance in this project of a benchmark measuring the
+harness rather than the thing.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5ALyYbzrXTGtc7LqRPGCz
+---
+ CMakeLists.txt             |   1 +
+ core/compiler/codegen.cpp  |  46 ++++++++
+ core/compiler/codegen.hpp  |  19 +++
+ core/frep/mixed_eval.hpp   |  38 +++---
+ core/frep/node.hpp         |  28 ++++-
+ tests/test_codegen_f64.cpp | 234 +++++++++++++++++++++++++++++++++++++
+ 6 files changed, 348 insertions(+), 18 deletions(-)
+ create mode 100644 tests/test_codegen_f64.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 196feae..3adfff1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -619,6 +619,7 @@ add_executable(frep_tests
+     tests/test_scalar_type.cpp
+     tests/test_param_schema.cpp
+     tests/test_mixed_eval.cpp
++    tests/test_codegen_f64.cpp
+     tests/test_expr_backends.cpp
+     tests/test_plugin_runtime.cpp
+     tests/test_scene_set_geometry.cpp
+diff --git a/core/compiler/codegen.cpp b/core/compiler/codegen.cpp
+index 82bd26a..5b74139 100644
+--- a/core/compiler/codegen.cpp
++++ b/core/compiler/codegen.cpp
+@@ -231,6 +231,52 @@ llvm::Function* SceneCodegen::emit_scene_sdf(const FRepNode& root) {
+     return fn;
+ }
+ 
++// ─────────────────────────────────────────────────────────────────────────────
++// emit_scene_sdf_f64
++// double scene_sdf_f64(double x, double y, double z, float* params)
++// ─────────────────────────────────────────────────────────────────────────────
++std::vector<std::string> SceneCodegen::f64_blockers(const FRepNode& root) {
++    std::vector<std::string> out;
++    std::function<void(const FRepNode&)> walk = [&](const FRepNode& n) {
++        // The same flag eval/evalw use: a node that cannot evaluate wide
++        // cannot emit wide either, because in both cases the reason is a
++        // float-shaped payload (a grid, a separate builder) rather than the
++        // arithmetic.
++        if (!n.wide_eval()) out.emplace_back(n.type_name());
++        for (const auto& c : n.children)
++            if (c) walk(*c);
++    };
++    walk(root);
++    return out;
++}
++
++llvm::Function* SceneCodegen::emit_scene_sdf_f64(const FRepNode& root) {
++    auto* f64 = llvm::Type::getDoubleTy(ctx_);
++    auto* fty = llvm::FunctionType::get(f64, {f64, f64, f64, fptr()}, false);
++    auto* fn  = llvm::Function::Create(fty, llvm::Function::ExternalLinkage,
++                                       "scene_sdf_f64", mod_.get());
++    fn->addFnAttr(llvm::Attribute::AlwaysInline);
++    fn->addFnAttr(llvm::Attribute::NoUnwind);
++    fn->addFnAttr(llvm::Attribute::WillReturn);
++
++    auto* bb = llvm::BasicBlock::Create(ctx_, "entry", fn);
++    llvm::IRBuilder<> b(bb);
++
++    auto it = fn->arg_begin();
++    auto* x  = &*it++; x->setName("x");
++    auto* y  = &*it++; y->setName("y");
++    auto* z  = &*it++; z->setName("z");
++    auto* pb = &*it++; pb->setName("params");
++
++    CgCtx cctx = make_cgctx(b, pb);
++    cctx.scalar = ScalarKind::F64;
++    auto* result = root.codegen(cctx, x, y, z);
++    b.CreateRet(result);
++
++    verify_fn(fn);
++    return fn;
++}
++
+ // Diagnostic / scalability variant — see header. Each object becomes a
+ // standalone non-inlined function obj_sdf_N(x,y,z,params)->float; scene_sdf
+ // calls them in sequence and folds with min(). The point is that LLVM
+diff --git a/core/compiler/codegen.hpp b/core/compiler/codegen.hpp
+index 0e7310c..2552da1 100644
+--- a/core/compiler/codegen.hpp
++++ b/core/compiler/codegen.hpp
+@@ -236,6 +236,25 @@ public:
+     // Access to individual steps (for tests).
+     llvm::Function* emit_scene_sdf      (const FRepNode& root);
+ 
++    // The same field emitted in DOUBLE:
++    //   double scene_sdf_f64(double x, double y, double z, float* params)
++    //
++    // Not a faster path - scalar f32 is the slower of the two on this CPU,
++    // measured in core/frep/mixed_eval.hpp. This exists because a REPORTED
++    // distance has to be exact: the render path wants f32 for its buffers
++    // and its GPU ABI, while a navigator asking "how far is the surface"
++    // wants the type the answer is quoted in. The two now come from the same
++    // codegen, so they cannot describe different solids.
++    //
++    // A node whose codegen hardcodes float (MeshSdf's grid, CustomExpr's own
++    // builder) cannot take part; f64_emittable() names them rather than
++    // letting the IR verifier fail on a type mismatch.
++    llvm::Function* emit_scene_sdf_f64  (const FRepNode& root);
++
++    /// Nodes in `root` that cannot be emitted in f64, by type name. Empty
++    /// means emit_scene_sdf_f64 will succeed.
++    static std::vector<std::string> f64_blockers(const FRepNode& root);
++
+     // Diagnostic / scalability variant of emit_scene_sdf. Instead of
+     // inlining the whole object tree into one function, it emits each
+     // top-level object as its own *non*-inlined function and makes
+diff --git a/core/frep/mixed_eval.hpp b/core/frep/mixed_eval.hpp
+index 3f9b18a..60989e1 100644
+--- a/core/frep/mixed_eval.hpp
++++ b/core/frep/mixed_eval.hpp
+@@ -41,25 +41,33 @@
+ // counts it, and exact() is false unless every node carries a real wide
+ // evaluation.
+ //
+-// THE CHEAP TYPE IS NOT CHEAP ON THE CPU. MEASURED, SO SAY IT PLAINLY.
++// THE CHEAP TYPE BUYS NO SPEED ON THIS CPU. MEASURED THREE WAYS.
+ //
+-// Scalar f32 evaluation of these nodes is SLOWER than f64, on every kind:
++// INTERPRETED, f32 is SLOWER than f64 on every node kind - sphere 1.34x,
++// box 1.43x, tube 1.13x, cone 1.48x, poly 1.67x, frame 1.78x - and on a real
++// sphere trace the mixed path never beat plain f64 at any tolerance (27.3 vs
++// 29.8 ns/step at 1 mm; 22.4 vs 26.1 at 1e-3 mm). The cause is the parameter
++// store: it holds double, so eval_t<float> narrows every parameter on the
++// way in and scalar SSE returns nothing for it.
+ //
+-//     sphere 1.34x   box 1.43x   tube 1.13x
+-//     cone   1.48x   poly 1.67x  frame 1.78x        (f32 time / f64 time)
++// COMPILED, the two are EQUAL: 4.4 vs 4.5 ns, 0.97-0.99x over three runs
++// (tests/test_codegen_f64.cpp). The JIT folds the parameters into constants
++// of the right type, so the conversions the interpreter pays simply are not
++// there. The slowness is a property of the INTERPRETER, not of f32 - worth
++// stating precisely, because the first version of this comment said
++// "structural rather than incidental" and that was too strong.
+ //
+-// and on a real sphere trace of the test scene the mixed path never beat
+-// plain f64 at any tolerance (27.3 vs 29.8 ns/step at 1 mm; 22.4 vs 26.1 at
+-// 1e-3 mm). The reason is structural rather than incidental: the parameters
+-// are stored as double, so the f32 path converts every one of them on the
+-// way in, and scalar SSE gives f32 no advantage in return - no extra lanes,
+-// no less traffic, because the source data is double either way.
++// Either way the conclusion for this class is the same and the reason is
++// scalar code: one value per register, so halving the width buys no lanes
++// and no traffic. Lo = float therefore buys ACCURACY CONTROL here, not
++// speed - hi() is the only value anyone reports and refine() says where the
++// exact type is needed. Where f32 should pay is GPU and SIMD, where it does
++// double the lane count; that has NOT been measured and is not claimed.
+ //
+-// So Lo = float buys ACCURACY CONTROL here, not speed. It is worth having
+-// because hi() is then the only value anyone reports and refine() says where
+-// the exact type is actually needed. Where f32 should pay is the GPU and the
+-// SIMD paths, where it doubles the lane count and halves the buffer - that
+-// has NOT been measured here and is not claimed.
++// (The benchmark that produced the compiled numbers got them wrong first:
++// it converted points inside the timed loop, so every f32 call paid three
++// narrowings belonging to the harness and read as 1.29x slower. Each type
++// now gets its points in its own type.)
+ //
+ // The CPU speed in this area came from the data structure, not the type:
+ // moving parameters from a string-keyed hash map to an ordered vector was
+diff --git a/core/frep/node.hpp b/core/frep/node.hpp
+index 34acbfb..01976b0 100644
+--- a/core/frep/node.hpp
++++ b/core/frep/node.hpp
+@@ -8,6 +8,7 @@
+ 
+ #include "core/frep/node_kind.hpp"
+ #include "core/frep/param_store.hpp"
++#include "core/frep/scalar.hpp"
+ 
+ #include <llvm/IR/IRBuilder.h>
+ #include <llvm/IR/LLVMContext.h>
+@@ -40,11 +41,24 @@ struct CgCtx {
+         return width > 1 ? b.CreateVectorSplat(width, s) : s;
+     }
+ 
++    // The scalar type this emission computes in. F32 is the render path and
++    // the GPU ABI; F64 is for a REPORTED distance, where the measurement in
++    // mixed_eval.hpp says the type has to be exact rather than cheap. It is
++    // not a speed knob - scalar f32 is the slower of the two on this CPU.
++    ScalarKind scalar = ScalarKind::F32;
++
++    /// The type the node bodies compute in. Use this, not f32(), anywhere
++    /// the value is part of the field rather than part of the pipeline.
++    llvm::Type* fty() const {
++        return scalar == ScalarKind::F64 ? llvm::Type::getDoubleTy(lc)
++                                         : llvm::Type::getFloatTy(lc);
++    }
++
+     llvm::Type*  f32()  const { return llvm::Type::getFloatTy(lc); }
+     llvm::Type*  i32()  const { return llvm::Type::getInt32Ty(lc); }
+     llvm::Type*  vd()   const { return llvm::Type::getVoidTy(lc); }
+-    llvm::Value* fc(float v)  const {
+-        auto* s = llvm::ConstantFP::get(llvm::Type::getFloatTy(lc), v);
++    llvm::Value* fc(double v)  const {
++        auto* s = llvm::ConstantFP::get(fty(), v);
+         return width > 1 ? b.CreateVectorSplat(width, s) : s;
+     }
+     llvm::Value* ic(int v)    const { return llvm::ConstantInt::get(llvm::Type::getInt32Ty(lc), v, true); }
+@@ -104,10 +118,18 @@ struct CgCtx {
+                                       param_class);
+             if (slot >= 0) {
+                 auto* idx = ic(slot);
++                // The runtime buffer stays float*: its ABI is shared with
++                // the OpenCL and CUDA kernels. In an F64 emission the loaded
++                // value is widened, which recovers nothing the buffer threw
++                // away - a runtime slot is f32-accurate by construction, and
++                // a caller that needs an exact parameter must bake it.
+                 auto* gep = b.CreateGEP(f32(), params_buffer, idx,
+                                         node_id + "." + param_name + "_addr");
+-                auto* ld = b.CreateLoad(f32(), gep,
++                llvm::Value* ld = b.CreateLoad(f32(), gep,
+                                     node_id + "." + param_name);
++                if (scalar == ScalarKind::F64)
++                    ld = b.CreateFPExt(ld, llvm::Type::getDoubleTy(lc),
++                                       node_id + "." + param_name + "_w");
+                 return vsplat(ld);
+             }
+         }
+diff --git a/tests/test_codegen_f64.cpp b/tests/test_codegen_f64.cpp
+new file mode 100644
+index 0000000..f2a1727
+--- /dev/null
++++ b/tests/test_codegen_f64.cpp
+@@ -0,0 +1,234 @@
++// tests/test_codegen_f64.cpp
++//
++// The compiled field in double, against the interpreted one.
++//
++// emit_scene_sdf and emit_scene_sdf_f64 walk the SAME codegen, with only
++// CgCtx::scalar different, so the two cannot describe different solids - the
++// point of routing the type through the context rather than writing a second
++// emitter. What the tests check is that the claim survives the JIT:
++//
++//   A  the f64 IR agrees with evalw() to the last bits it can;
++//   B  the f32 IR still agrees with eval() exactly as before, so adding the
++//      wide path changed nothing on the narrow one;
++//   C  the f64 answer is far closer to an analytic reference than the f32
++//      answer, which is the only reason to have it - it is NOT faster, see
++//      core/frep/mixed_eval.hpp;
++//   D  a node that cannot emit wide is NAMED before emission rather than
++//      crashing the IR verifier.
++
++#include "core/compiler/codegen.hpp"
++#include "core/compiler/jit_engine.hpp"
++#include "core/frep/hep.hpp"
++#include "core/frep/operations.hpp"
++#include "core/frep/primitives.hpp"
++#include "core/frep/transforms.hpp"
++#include "tests/test_support.hpp"
++
++#include <gtest/gtest.h>
++#include <llvm/Support/TargetSelect.h>
++
++#include <chrono>
++#include <cmath>
++#include <memory>
++#include <random>
++
++using namespace frep;
++
++namespace {
++
++using F32Fn = float (*)(float, float, float);
++using F64Fn = double (*)(double, double, double);
++
++/// Emit `root` at the given scalar type and JIT it behind a "render_tile"
++/// wrapper, which is the name JitEngine::load looks up.
++void* jit_at(const FRepNode& root, bool wide) {
++    auto ctx = std::make_unique<llvm::LLVMContext>();
++    SceneCodegen cg(*ctx);
++    if (wide) cg.emit_scene_sdf_f64(root);
++    else cg.emit_scene_sdf(root);
++
++    auto& mod = *cg.module();
++    auto* sdf = mod.getFunction(wide ? "scene_sdf_f64" : "scene_sdf");
++    if (!sdf) return nullptr;
++
++    auto* t = wide ? llvm::Type::getDoubleTy(*ctx) : llvm::Type::getFloatTy(*ctx);
++    auto* fty = llvm::FunctionType::get(t, {t, t, t}, false);
++    auto* wrapper = llvm::Function::Create(fty, llvm::Function::ExternalLinkage,
++                                           "render_tile", &mod);
++    auto* bb = llvm::BasicBlock::Create(*ctx, "entry", wrapper);
++    llvm::IRBuilder<> b(bb);
++    auto it = wrapper->arg_begin();
++    auto* x = &*it++;
++    auto* y = &*it++;
++    auto* z = &*it++;
++    std::vector<llvm::Value*> args{x, y, z};
++    // The params buffer is unused in Constant mode and DCE-ed by O3.
++    if (sdf->arg_size() == 4)
++        args.push_back(llvm::ConstantPointerNull::get(
++            llvm::PointerType::getUnqual(*ctx)));
++    b.CreateRet(b.CreateCall(sdf, args));
++
++    auto mod_ptr = cg.take_module();
++    test::jit_pool().emplace_back(std::make_unique<JitEngine>());
++    auto fn_or = test::jit_pool().back()->load(std::move(mod_ptr), std::move(ctx));
++    return fn_or ? reinterpret_cast<void*>(*fn_or) : nullptr;
++}
++
++/// A detector-scale solid: a hollow cylinder, where f32 is visibly coarse.
++FRepNode::Ptr scene() {
++    return std::make_shared<DifferenceNode>(
++        std::make_shared<hep::TubeNode>(0.0, 2950.625, 3100.875, 0.0, 7.0),
++        std::make_shared<hep::TubeNode>(0.0, 1210.125, 4000.25, 0.0, 7.0));
++}
++
++std::vector<std::array<double, 3>> pts(int n, double ext, std::uint64_t seed) {
++    std::mt19937_64 rng(seed);
++    std::uniform_real_distribution<double> U(-ext, ext);
++    std::vector<std::array<double, 3>> p;
++    for (int i = 0; i < n; ++i) p.push_back({U(rng), U(rng), U(rng)});
++    return p;
++}
++
++class LLVMInit : public ::testing::Environment {
++public:
++    void SetUp() override {
++        llvm::InitializeNativeTarget();
++        llvm::InitializeNativeTargetAsmPrinter();
++    }
++};
++[[maybe_unused]] auto* g_env = ::testing::AddGlobalTestEnvironment(new LLVMInit);
++
++}  // namespace
++
++TEST(CodegenF64, TheWideIrAgreesWithTheWideInterpreter) {
++    const auto n = scene();
++    auto* f = reinterpret_cast<F64Fn>(jit_at(*n, true));
++    ASSERT_NE(f, nullptr);
++    double worst = 0.0;
++    long differ = 0;
++    for (const auto& p : pts(20000, 4500.0, 0xC0DE)) {
++        const double a = f(p[0], p[1], p[2]);
++        const double b = n->evalw(p[0], p[1], p[2]);
++        if (a != b) {
++            ++differ;
++            worst = std::max(worst, std::fabs(a - b));
++        }
++    }
++    // Not asserted bit-identical: LLVM may contract a multiply and an add
++    // into one fma, which is a DIFFERENT and slightly better result than the
++    // interpreter's two roundings. Asserting equality here would be
++    // asserting that no optimiser ever improves the arithmetic.
++    EXPECT_LT(worst, 1e-9) << differ << " of 20000 differ";
++    std::printf("  f64 IR vs evalw: %ld of 20000 differ, worst %.3g mm\n",
++                differ, worst);
++}
++
++TEST(CodegenF64, TheNarrowIrIsUnchangedByTheWidePathExisting) {
++    const auto n = scene();
++    auto* f = reinterpret_cast<F32Fn>(jit_at(*n, false));
++    ASSERT_NE(f, nullptr);
++    double worst = 0.0;
++    for (const auto& p : pts(20000, 4500.0, 0xC0DE)) {
++        const float a = f(float(p[0]), float(p[1]), float(p[2]));
++        const float b = n->eval(float(p[0]), float(p[1]), float(p[2]));
++        worst = std::max(worst, std::fabs(double(a) - double(b)));
++    }
++    EXPECT_LT(worst, 1e-3) << "worst " << worst;
++    std::printf("  f32 IR vs eval:  worst %.3g mm\n", worst);
++}
++
++TEST(CodegenF64, TheWideIrIsOrdersCloserToTheAnalyticField) {
++    const auto n = scene();
++    auto* f32 = reinterpret_cast<F32Fn>(jit_at(*n, false));
++    auto* f64 = reinterpret_cast<F64Fn>(jit_at(*n, true));
++    ASSERT_NE(f32, nullptr);
++    ASSERT_NE(f64, nullptr);
++    const double Ro = 2950.625, Ho = 3100.875, Ri = 1210.125, Hi_ = 4000.25;
++    double e32 = 0.0, e64 = 0.0;
++    for (const auto& p : pts(20000, 4500.0, 0xFACE)) {
++        const double rho = std::sqrt(p[0] * p[0] + p[1] * p[1]);
++        const double outer =
++            std::max(rho - Ro, std::fabs(p[2]) - Ho);
++        const double inner =
++            std::max(rho - Ri, std::fabs(p[2]) - Hi_);
++        const double ref = std::max(outer, -inner);
++        e32 = std::max(e32, std::fabs(double(f32(float(p[0]), float(p[1]),
++                                                 float(p[2]))) - ref));
++        e64 = std::max(e64, std::fabs(f64(p[0], p[1], p[2]) - ref));
++    }
++    EXPECT_GT(e32, 1e-4);
++    EXPECT_LT(e64, 1e-9);
++    EXPECT_LT(e64 * 1e4, e32);
++    std::printf("  worst |IR - analytic|: f32 %.3g mm, f64 %.3g mm\n", e32, e64);
++}
++
++TEST(CodegenF64, ANodeThatCannotEmitWideIsNamedNotCrashed) {
++    const auto n = scene();
++    EXPECT_TRUE(SceneCodegen::f64_blockers(*n).empty());
++
++    struct NoWide final : FRepNode {
++        const char* type_name() const noexcept override { return "NoWide"; }
++        llvm::Value* codegen(CgCtx& c, llvm::Value*, llvm::Value*,
++                             llvm::Value*) const override {
++            return c.fc(1.0);
++        }
++        float eval(float, float, float) const override { return 1.0f; }
++        std::size_t structural_hash() const noexcept override { return 1; }
++    };
++    auto mixed = std::make_shared<UnionNode>(std::make_shared<SphereNode>(1.0),
++                                             std::make_shared<NoWide>());
++    const auto blockers = SceneCodegen::f64_blockers(*mixed);
++    ASSERT_EQ(blockers.size(), 1u);
++    EXPECT_EQ(blockers[0], "NoWide");
++}
++
++TEST(CodegenF64, CompiledF32AgainstCompiledF64) {
++    // mixed_eval.hpp measures scalar f32 as SLOWER than f64 in the
++    // INTERPRETER, because the parameters are stored as double and the f32
++    // path converts every one on the way in. The compiled path folds those
++    // constants, so the question has to be asked again here rather than
++    // inherited.
++    //
++    // The first version of this benchmark answered it wrongly: it passed
++    // float(p[0]) inside the timed loop and accumulated into a double, so
++    // every f32 call paid three narrowings and one widening that belong to
++    // the harness. Each type now gets its points in its own type, converted
++    // once, and accumulates in its own type.
++    const auto n = scene();
++    auto* f32 = reinterpret_cast<F32Fn>(jit_at(*n, false));
++    auto* f64 = reinterpret_cast<F64Fn>(jit_at(*n, true));
++    ASSERT_NE(f32, nullptr);
++    ASSERT_NE(f64, nullptr);
++
++    const auto pd = pts(4000, 4500.0, 0x5A5A);
++    std::vector<std::array<float, 3>> pf;
++    pf.reserve(pd.size());
++    for (const auto& p : pd)
++        pf.push_back({float(p[0]), float(p[1]), float(p[2])});
++
++    const int R = 400;
++    const double nq = double(R) * double(pd.size());
++
++    volatile float sf = 0.0f;
++    auto t0 = std::chrono::steady_clock::now();
++    for (int r = 0; r < R; ++r)
++        for (const auto& p : pf) sf = sf + f32(p[0], p[1], p[2]);
++    auto t1 = std::chrono::steady_clock::now();
++    const double a =
++        std::chrono::duration<double, std::nano>(t1 - t0).count() / nq;
++
++    volatile double sd = 0.0;
++    t0 = std::chrono::steady_clock::now();
++    for (int r = 0; r < R; ++r)
++        for (const auto& p : pd) sd = sd + f64(p[0], p[1], p[2]);
++    t1 = std::chrono::steady_clock::now();
++    const double b =
++        std::chrono::duration<double, std::nano>(t1 - t0).count() / nq;
++
++    // PRINTED, not asserted: a wall-clock ratio is not an invariant, and
++    // this project has demoted four assertions that pretended otherwise.
++    std::printf("  compiled: f32 %.2f ns, f64 %.2f ns, f32/f64 %.2fx\n", a, b,
++                a / b);
++    EXPECT_GT(a, 0.0);
++    EXPECT_GT(b, 0.0);
++}
+-- 
+2.43.0
+

@@ -20,6 +20,7 @@
 // mutating it); resolve_instances() below rebinds children[0] from the scene.
 #pragma once
 #include "core/frep/node.hpp"
+#include "core/frep/scalar.hpp"
 #include <string>
 #include <utility>
 
@@ -59,9 +60,12 @@ public:
         }
         return children[0]->codegen(c, x, y, z);       // Level 1 inline fallback
     }
-    float eval(float x, float y, float z) const override {
-        return resolved() ? children[0]->eval(x, y, z) : 1e30f;
+    template <class T>
+    T eval_t(T x, T y, T z) const {
+        return resolved() ? children[0]->eval_as<T>(x, y, z)
+                          : ScalarTraits<T>::from(1e30);
     }
+    FREP_EVAL_T
     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override {
         if (!resolved()) return FRepNode::codegen_grad(c, x, y, z);
         // Level 2: shared gradient subprogram if the context provides it.

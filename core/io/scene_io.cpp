@@ -5,6 +5,7 @@
 
 #include "core/frep/custom_expr.hpp"
 #include "core/frep/deformations.hpp"
+#include "core/frep/hep.hpp"
 #include "core/frep/operations.hpp"
 #include "core/frep/instance.hpp"
 #include "core/frep/primitives.hpp"
@@ -122,8 +123,8 @@ static Value node_to_json(const FRepNode& node) {
 
     // params
     Object params;
-    for (const auto& [k, v] : node.params)
-        params[k] = static_cast<double>(v);
+    for (std::size_t i = 0; i < node.params.size(); ++i)
+        params[node.params.name(i)] = node.params.value(i);
     o["params"] = std::move(params);
 
     // An Instance references another object's geometry by id — it must NOT
@@ -255,10 +256,13 @@ std::string serialize_scene(const SceneGraph& scene,
 // ─────────────────────────────────────────────────────────────────────────────
 namespace {
 
-float param_or(const Object& p, const std::string& key, float def) {
+/// Double, not float: the json on disk already holds the full value (the
+/// writer casts to double), so narrowing here was discarding precision the
+/// file had written correctly. See FRepNode::params.
+double param_or(const Object& p, const std::string& key, double def) {
     auto it = p.find(key);
     if (it == p.end()) return def;
-    return it->second.as_float();
+    return it->second.as_number();
 }
 
 struct NodeDeserializer {
@@ -299,6 +303,56 @@ struct NodeDeserializer {
                 param_or(params, "ny", 1.0f),
                 param_or(params, "nz", 0.0f),
                 param_or(params, "d",  0.0f), id);
+        }
+
+        // ── HEP primitives (core/frep/hep.hpp) ────────────────────────────────
+        // Written generically by node_to_json - type_name plus the whole
+        // params map - so only the read side needs a branch. Parameter order
+        // here is the G4 solid's own, which is what makes a converted
+        // geometry a parameter copy rather than a translation.
+        if (type == "Tube") {
+            return std::make_shared<hep::TubeNode>(
+                param_or(params, "rmin", 0.0f), param_or(params, "rmax", 1.0f),
+                param_or(params, "hz", 1.0f), param_or(params, "phi0", 0.0f),
+                param_or(params, "dphi", 6.283185307179586f), id);
+        }
+        if (type == "Cone") {
+            return std::make_shared<hep::ConeNode>(
+                param_or(params, "rmin1", 0.0f), param_or(params, "rmax1", 1.0f),
+                param_or(params, "rmin2", 0.0f), param_or(params, "rmax2", 1.0f),
+                param_or(params, "hz", 1.0f), param_or(params, "phi0", 0.0f),
+                param_or(params, "dphi", 6.283185307179586f), id);
+        }
+        if (type == "SphericalShell") {
+            return std::make_shared<hep::SphericalShellNode>(
+                param_or(params, "rmin", 0.0f), param_or(params, "rmax", 1.0f),
+                param_or(params, "phi0", 0.0f),
+                param_or(params, "dphi", 6.283185307179586f),
+                param_or(params, "theta0", 0.0f),
+                param_or(params, "dtheta", 3.141592653589793f), id);
+        }
+        if (type == "Trapezoid") {
+            return std::make_shared<hep::TrapezoidNode>(
+                param_or(params, "dx1", 1.0f), param_or(params, "dx2", 1.0f),
+                param_or(params, "dy1", 1.0f), param_or(params, "dy2", 1.0f),
+                param_or(params, "hz", 1.0f), id);
+        }
+        if (type == "Polyhedron") {
+            return std::make_shared<hep::PolyhedronNode>(
+                param_or(params, "rmin1", 0.0f), param_or(params, "rmax1", 1.0f),
+                param_or(params, "rmin2", 0.0f), param_or(params, "rmax2", 1.0f),
+                param_or(params, "hz", 1.0f), param_or(params, "phi0", 0.0f),
+                param_or(params, "dphi", 6.283185307179586f),
+                int(param_or(params, "nside", 6.0f)), id);
+        }
+        if (type == "Frame") {
+            if (kids.size() != 1) throw std::runtime_error("Frame needs 1 child");
+            double r[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+            for (int k = 0; k < 9; ++k)
+                r[k] = param_or(params, "r" + std::to_string(k), r[k]);
+            return std::make_shared<hep::FrameNode>(
+                kids[0], r, param_or(params, "tx", 0.0f),
+                param_or(params, "ty", 0.0f), param_or(params, "tz", 0.0f), id);
         }
 
         // ── Operations ────────────────────────────────────────────────────────

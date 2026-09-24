@@ -13,6 +13,7 @@
 //   SmoothUnion  = IQ smin(f1, f2, k)
 
 #include "node.hpp"
+#include "scalar.hpp"
 #include "core/compiler/llvm_compat.hpp"
 #include <algorithm>
 #include <cmath>
@@ -38,9 +39,12 @@ public:
 
     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
     AABB aabb() const override;
-    float eval(float x, float y, float z) const override {
-        return std::min(children[0]->eval(x,y,z), children[1]->eval(x,y,z));
+    template <class T>
+    T eval_t(T x, T y, T z) const {
+        return ScalarTraits<T>::minv(children[0]->eval_as<T>(x,y,z),
+                                     children[1]->eval_as<T>(x,y,z));
     }
+    FREP_EVAL_T
     std::size_t structural_hash() const noexcept override {
         return (children[0]->structural_hash() * 2654435761ull)
              ^ (children[1]->structural_hash() * 40503ull)
@@ -66,9 +70,12 @@ public:
 
     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
     AABB aabb() const override;
-    float eval(float x, float y, float z) const override {
-        return std::max(children[0]->eval(x,y,z), children[1]->eval(x,y,z));
+    template <class T>
+    T eval_t(T x, T y, T z) const {
+        return ScalarTraits<T>::maxv(children[0]->eval_as<T>(x,y,z),
+                                     children[1]->eval_as<T>(x,y,z));
     }
+    FREP_EVAL_T
     std::size_t structural_hash() const noexcept override {
         return (children[0]->structural_hash() * 2654435761ull)
              ^ (children[1]->structural_hash() * 40503ull)
@@ -94,9 +101,12 @@ public:
 
     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
     AABB aabb() const override;
-    float eval(float x, float y, float z) const override {
-        return std::max(children[0]->eval(x,y,z), -children[1]->eval(x,y,z));
+    template <class T>
+    T eval_t(T x, T y, T z) const {
+        return ScalarTraits<T>::maxv(children[0]->eval_as<T>(x,y,z),
+                                     -children[1]->eval_as<T>(x,y,z));
     }
+    FREP_EVAL_T
     std::size_t structural_hash() const noexcept override {
         return (children[0]->structural_hash() * 2654435761ull)
              ^ (children[1]->structural_hash() * 40503ull)
@@ -109,15 +119,16 @@ public:
 class SmoothUnionNode final : public FRepNode {
     const char* type_name() const noexcept override { return "SmoothUnion"; }
 public:
+    enum : int { K };
     SmoothUnionNode(FRepNode::Ptr a, FRepNode::Ptr b, float k, std::string nid = "smin") {
         kind = NodeKind::SmoothUnion; id = std::move(nid);
-        params["k"] = k;
+        params.init({"k"}, {k});
         children = {std::move(a), std::move(b)};
     }
 
     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
         auto& b = c.b;
-        float kv = params.at("k");
+        float kv = params[K];
         auto  da = children[0]->codegen(c, x, y, z);
         auto  db = children[1]->codegen(c, x, y, z);
 
@@ -145,19 +156,23 @@ public:
 
     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
     AABB aabb() const override;
-    float eval(float x, float y, float z) const override {
-        float a = children[0]->eval(x,y,z);
-        float b = children[1]->eval(x,y,z);
-        float k = params.at("k");
-        if (k <= 0.0f) return std::min(a, b);
+    template <class T>
+    T eval_t(T x, T y, T z) const {
+        using S = ScalarTraits<T>;
+        const T a = children[0]->eval_as<T>(x,y,z);
+        const T b = children[1]->eval_as<T>(x,y,z);
+        const T k = S::from(params[K]);
+        const T z0 = S::from(0.0);
+        if (k <= z0) return S::minv(a, b);
         // Cubic polynomial smin (must match codegen() exactly for parity).
-        float kk = k * 2.0f;
-        float h  = std::max(kk - std::fabs(a - b), 0.0f) / kk;
-        return std::min(a, b) - h*h*h*kk*(1.0f/6.0f);
+        const T kk = k * S::from(2.0);
+        const T h  = S::maxv(kk - S::absv(a - b), z0) / kk;
+        return S::minv(a, b) - h*h*h*kk*S::from(1.0/6.0);
     }
+    FREP_EVAL_T
     std::size_t structural_hash() const noexcept override {
         return (children[0]->structural_hash() * 2654435761ull)
-             ^ std::hash<float>{}(params.at("k"))
+             ^ std::hash<double>{}(params[K])
              ^ 0x9900'AABBull;
     }
 };
@@ -178,9 +193,9 @@ public:
 
     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
     AABB aabb() const override;
-    float eval(float x, float y, float z) const override {
-        return -children[0]->eval(x,y,z);
-    }
+    template <class T>
+    T eval_t(T x, T y, T z) const { return -children[0]->eval_as<T>(x,y,z); }
+    FREP_EVAL_T
     std::size_t structural_hash() const noexcept override {
         return children[0]->structural_hash() ^ 0xDEAD'BEEFull;
     }

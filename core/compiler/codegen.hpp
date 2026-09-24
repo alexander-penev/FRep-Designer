@@ -236,6 +236,25 @@ public:
     // Access to individual steps (for tests).
     llvm::Function* emit_scene_sdf      (const FRepNode& root);
 
+    // The same field emitted in DOUBLE:
+    //   double scene_sdf_f64(double x, double y, double z, float* params)
+    //
+    // Not a faster path - scalar f32 is the slower of the two on this CPU,
+    // measured in core/frep/mixed_eval.hpp. This exists because a REPORTED
+    // distance has to be exact: the render path wants f32 for its buffers
+    // and its GPU ABI, while a navigator asking "how far is the surface"
+    // wants the type the answer is quoted in. The two now come from the same
+    // codegen, so they cannot describe different solids.
+    //
+    // A node whose codegen hardcodes float (MeshSdf's grid, CustomExpr's own
+    // builder) cannot take part; f64_emittable() names them rather than
+    // letting the IR verifier fail on a type mismatch.
+    llvm::Function* emit_scene_sdf_f64  (const FRepNode& root);
+
+    /// Nodes in `root` that cannot be emitted in f64, by type name. Empty
+    /// means emit_scene_sdf_f64 will succeed.
+    static std::vector<std::string> f64_blockers(const FRepNode& root);
+
     // Diagnostic / scalability variant of emit_scene_sdf. Instead of
     // inlining the whole object tree into one function, it emits each
     // top-level object as its own *non*-inlined function and makes

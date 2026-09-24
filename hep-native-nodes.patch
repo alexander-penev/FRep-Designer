@@ -1,0 +1,1044 @@
+From f7d7e7ad5b4d34aa8d6b237f4fd2fc09ff23a7fb Mon Sep 17 00:00:00 2001
+From: Alexander Penev <alexander.p.penev@gmail.com>
+Date: Thu, 24 Sep 2026 03:34:57 +0300
+Subject: [PATCH 1/2] core: six native HEP node types (Tube, Cone,
+ SphericalShell, Trapezoid, Polyhedron, Frame)
+
+A Geant4 detector geometry is made almost entirely of tubes, cones,
+trapezoids and polyhedra placed by arbitrary rotations. Converted into a
+scene it had to arrive as CustomExpr leaves, which work on every compute
+path - a CustomExpr compiles to LLVM IR and to GLSL like any other node -
+but CustomExprNode does not override aabb() and so inherits
+AABB::infinite(). A converted detector is one object whose geometry is the
+whole tree, so ONE expression leaf makes the whole scene's box infinite,
+and core/accel/bvh.hpp, core/exec/rtx_executor.hpp and marching_cubes all
+read that box.
+
+The six types are 1:1 with their G4 solids, parameter for parameter and in
+the same order, so a conversion is a parameter copy rather than a
+translation - and a converter that mirrors its source can be checked
+against that source.
+
+  Tube            G4Tubs        rmin rmax hz phi0 dphi
+  Cone            G4Cons        rmin1 rmax1 rmin2 rmax2 hz phi0 dphi
+  SphericalShell  G4Sphere      rmin rmax phi0 dphi theta0 dtheta
+  Trapezoid       G4Trd         dx1 dx2 dy1 dy2 hz
+  Polyhedron      G4Polyhedra   rmin1 rmax1 rmin2 rmax2 hz phi0 dphi nside
+  Frame           a rigid 3x4   r0..r8 tx ty tz
+
+A polycone needs no node: it is a union of Cone sections, which is what
+both Geant4 and the converter already make it.
+
+Frame exists because three successive single-axis rotations cannot
+reproduce one stored 3x3 to the bit - the angles come out of an atan2/asin
+extraction and each rotation rounds again. Measured at 3.41e-13 mm, in
+double, before float enters. It also collapses up to four nodes into one,
+and a detector has one placement per volume.
+
+Numerical detail that took three iterations to get right: every
+trigonometric value and every slanted-face divisor sqrt(1+k^2) is computed
+in DOUBLE and narrowed once. The parameters are float, and that narrowing
+is a loss the export owns, but computing sin/cos or the divisor IN float
+adds a second, avoidable one. With them in float the nodes disagreed with
+the reference implementation by up to 2.44e-04 on a hexagonal section and
+1.22e-04 on a tapered one; in double they agree bit for bit.
+
+Verified against the G4-FRep converter (test/llvm/fd4_native_check.cc
+there, built when FD4_DIR points here): on nine primitives across
+prims.gdml, polyhedra_world.gdml and calib_world.gdml - hollow tube,
+hollow cone, sphere with phi and theta cuts, trapezoid, polycone sections,
+polyhedra - the native node's float eval() is BIT-IDENTICAL to the
+CustomExpr it replaces, which is itself certified against that project's
+double field. On models with no rotated frame the two whole graphs are
+bit-identical. Every scene box is finite and contains the solid.
+
+node_to_json is generic (type_name plus the whole params map), so only the
+read side of scene_io needed the six branches.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5ALyYbzrXTGtc7LqRPGCz
+---
+ CMakeLists.txt            |   1 +
+ core/frep/hep.hpp         | 450 ++++++++++++++++++++++++++++++++++++++
+ core/frep/hep_codegen.cpp | 205 +++++++++++++++++
+ core/frep/node.hpp        |   6 +
+ core/io/scene_io.cpp      |  51 +++++
+ 5 files changed, 713 insertions(+)
+ create mode 100644 core/frep/hep.hpp
+ create mode 100644 core/frep/hep_codegen.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c038424..ea31b7b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -134,6 +134,7 @@ add_library(frep_core STATIC
+     core/frep/operations_ad.cpp
+     core/frep/deformations_ad.cpp
+     core/frep/aabb.cpp
++    core/frep/hep_codegen.cpp
+     core/frep/scene.cpp
+     core/frep/mesh_sdf.cpp
+     core/accel/guard_calibration.cpp
+diff --git a/core/frep/hep.hpp b/core/frep/hep.hpp
+new file mode 100644
+index 0000000..2a452ca
+--- /dev/null
++++ b/core/frep/hep.hpp
+@@ -0,0 +1,450 @@
++#pragma once
++// core/frep/hep.hpp
++//
++// The six node types a high-energy-physics detector geometry needs and the
++// built-in set does not have. They exist because a Geant4 / GDML detector is
++// made almost entirely of tubes, cones, trapezoids and polyhedra placed by
++// arbitrary rotations, and without them a converted detector arrives as
++// CustomExpr leaves - which work on every compute path but have NO aabb()
++// override, so one of them makes the whole scene's box infinite and the BVH,
++// the RTX proxy (core/exec/rtx_executor.hpp) and marching cubes all lose it.
++//
++// EACH NODE IS 1:1 WITH ITS G4 SOLID, parameter for parameter and in the same
++// order. That is deliberate: a converter that mirrors its source can be
++// checked against that source, and one that "improves" on it cannot. The
++// fields below are the same arithmetic, written in the same order, as the
++// reference implementation in the G4-FRep converter - not merely the same
++// value. Reordering a sum here would change the last bits and break the
++// bit-identity check that certifies the conversion.
++//
++//   Tube            G4Tubs        rmin rmax hz phi0 dphi
++//   Cone            G4Cons        rmin1 rmax1 rmin2 rmax2 hz phi0 dphi
++//   SphericalShell  G4Sphere      rmin rmax phi0 dphi theta0 dtheta
++//   Trapezoid       G4Trd         dx1 dx2 dy1 dy2 hz
++//   Polyhedron      G4Polyhedra   rmin1 rmax1 rmin2 rmax2 hz phi0 dphi nside
++//   Frame           a rigid 3x4   r0..r8 tx ty tz
++//
++// A POLYCONE NEEDS NO NODE: it is a union of Cone sections, which is what
++// both Geant4 and the converter already make it.
++//
++// WHY Frame, when Translate and RotateX/Y/Z exist. Three successive
++// single-axis rotations cannot reproduce one stored 3x3 to the bit - the
++// angles come out of an atan2/asin extraction and each rotation rounds again.
++// Measured on the converter's own models: 3.41e-13 mm, in DOUBLE, before
++// float ever enters. Frame also collapses up to four nodes into one, and a
++// detector has one placement per volume: calib_world is 25 nodes as a tree
++// and 43 once its frames are expanded into single-axis rotations.
++//
++// SLANTED FACES ARE DIVIDED BY sqrt(1+k^2). That factor is what makes a cone's
++// or a trapezoid's field the true distance to the slanted plane rather than a
++// radial difference, which is what keeps the max() of the pieces 1-Lipschitz
++// and therefore safe for sphere tracing.
++//
++// ANGULAR PARAMETERS STAY CONSTANT IN THE INCREMENTAL PATH. phi0, dphi,
++// theta0, dtheta and nside enter the IR through sines and cosines folded at
++// compile time; the radii, half-lengths and frame entries go through
++// param_value and can be runtime slots. A sin() of a loaded value would be
++// possible but it would also make eval() and codegen() disagree the moment a
++// policy promoted one of them, so the two are kept in step by construction.
++
++#include "node.hpp"
++#include "core/compiler/llvm_compat.hpp"
++
++#include <cmath>
++#include <functional>
++#include <vector>
++
++namespace frep::hep {
++
++// Combine parameter values into one hash. Every node below uses it, so two
++// nodes of the same type differing in any parameter differ here too.
++inline std::size_t phash(std::size_t seed, std::initializer_list<float> vs) {
++    for (float v : vs)
++        seed = seed * 1099511628211ull ^ std::hash<float>{}(v);
++    return seed;
++}
++
++/// The angular sector [a, a+d] as two half-planes through the z axis. Exact
++/// signed distance to each, so the result is 1-Lipschitz; the reflex case
++/// (d > pi) is a union of the two half-spaces, hence the min.
++///
++/// Returns false when there is no cut at all, in which case the caller omits
++/// the term entirely - max(f, -inf) is f, so omitting is value-identical and
++/// saves the node an instruction.
++/// The trigonometry is done in DOUBLE and narrowed once. The parameters are
++/// float - that narrowing is the export's own loss and is measured elsewhere -
++/// but computing sin/cos of them in float would add a second, avoidable one,
++/// and it is what made the first version of this node disagree with the
++/// reference implementation by 2.4e-04 on a hexagonal section.
++inline bool wedge_coeffs(float a, float d, float& sa, float& ca, float& sb,
++                         float& cb, bool& use_max) {
++    if (d >= 2.0f * float(M_PI) - 1e-6f) return false;
++    const double b = double(a) + double(d);
++    sa = float(std::sin(double(a)));
++    ca = float(std::cos(double(a)));
++    sb = float(-std::sin(b));
++    cb = float(std::cos(b));
++    use_max = (d <= float(M_PI));
++    return true;
++}
++/// sqrt(1 + k^2) for a slanted face, computed in DOUBLE and narrowed once.
++/// The same reason as wedge_coeffs: the parameters are float, but squaring a
++/// float slope and taking a float square root adds a second rounding the
++/// reference implementation does not have, and that was the last bit-identity
++/// failure - one tapered hexagonal section, 1.22e-04.
++inline float lat_scale(double num, double den) {
++    const double k = num / den;
++    return float(std::sqrt(1.0 + k * k));
++}
++
++inline float wedge_eval(float x, float y, float a, float d) {
++    float sa, ca, sb, cb;
++    bool use_max;
++    if (!wedge_coeffs(a, d, sa, ca, sb, cb, use_max)) return -1e30f;
++    const float fa = x * sa - y * ca;
++    const float fb = x * sb + y * cb;
++    return use_max ? std::max(fa, fb) : std::min(fa, fb);
++}
++
++// ── Tube (G4Tubs) ────────────────────────────────────────────────────────────
++// f = max( rho - rmax, |z| - hz [, rmin - rho] [, wedge] )
++class TubeNode final : public FRepNode {
++    const char* type_name() const noexcept override { return "Tube"; }
++public:
++    TubeNode(float rmin, float rmax, float hz, float phi0, float dphi,
++             std::string nid = "tube") {
++        kind = NodeKind::Tube;
++        id = std::move(nid);
++        params["rmin"] = rmin; params["rmax"] = rmax; params["hz"] = hz;
++        params["phi0"] = phi0; params["dphi"] = dphi;
++    }
++
++    float eval(float x, float y, float z) const override {
++        const float rho = std::sqrt(x * x + y * y);
++        float f = std::max(rho - params.at("rmax"),
++                           std::fabs(z) - params.at("hz"));
++        if (params.at("rmin") > 0.0f) f = std::max(f, params.at("rmin") - rho);
++        return std::max(f, wedge_eval(x, y, params.at("phi0"), params.at("dphi")));
++    }
++
++    llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
++                         llvm::Value* z) const override;
++
++    AABB aabb() const override {
++        const float r = params.at("rmax"), h = params.at("hz");
++        return {-r, -r, -h, r, r, h};
++    }
++
++    std::size_t structural_hash() const noexcept override {
++        return phash(0x7C0B'E101ull,
++                     {params.at("rmin"), params.at("rmax"), params.at("hz"),
++                      params.at("phi0"), params.at("dphi")});
++    }
++};
++
++// ── Cone (G4Cons) ────────────────────────────────────────────────────────────
++// A frustum: the radii vary linearly with z, and each slanted face is divided
++// by sqrt(1+k^2) so the value is the distance to the face, not a radial gap.
++class ConeNode final : public FRepNode {
++    const char* type_name() const noexcept override { return "Cone"; }
++public:
++    ConeNode(float rmin1, float rmax1, float rmin2, float rmax2, float hz,
++             float phi0, float dphi, std::string nid = "cone") {
++        kind = NodeKind::Cone;
++        id = std::move(nid);
++        params["rmin1"] = rmin1; params["rmax1"] = rmax1;
++        params["rmin2"] = rmin2; params["rmax2"] = rmax2;
++        params["hz"] = hz; params["phi0"] = phi0; params["dphi"] = dphi;
++    }
++
++    float eval(float x, float y, float z) const override {
++        const float rho = std::sqrt(x * x + y * y);
++        const float hz = params.at("hz");
++        const float u = (z + hz) / (2.0f * hz);
++        const float r1 = params.at("rmax1"), r2 = params.at("rmax2");
++        const float Rmax = r1 + (r2 - r1) * u;
++        float f = std::max((rho - Rmax) / lat_scale(double(r2) - double(r1),
++                                                    2.0 * double(hz)),
++                           std::fabs(z) - hz);
++        const float i1 = params.at("rmin1"), i2 = params.at("rmin2");
++        if (i1 > 0.0f || i2 > 0.0f) {
++            const float Rmin = i1 + (i2 - i1) * u;
++            f = std::max(f, (Rmin - rho) / lat_scale(double(i2) - double(i1),
++                                                     2.0 * double(hz)));
++        }
++        return std::max(f, wedge_eval(x, y, params.at("phi0"), params.at("dphi")));
++    }
++
++    llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
++                         llvm::Value* z) const override;
++
++    AABB aabb() const override {
++        const float r = std::max(params.at("rmax1"), params.at("rmax2"));
++        const float h = params.at("hz");
++        return {-r, -r, -h, r, r, h};
++    }
++
++    std::size_t structural_hash() const noexcept override {
++        return phash(0x7C0B'E102ull,
++                     {params.at("rmin1"), params.at("rmax1"), params.at("rmin2"),
++                      params.at("rmax2"), params.at("hz"), params.at("phi0"),
++                      params.at("dphi")});
++    }
++};
++
++// ── SphericalShell (G4Sphere) ────────────────────────────────────────────────
++// A shell between two radii, optionally cut by a phi wedge and by two theta
++// cones through the origin. rho*cos(t) - z*sin(t) is the exact signed distance
++// to the cone of half-angle t.
++//
++// rad is sqrt(rho*rho + z*z) with rho ALREADY a square root - not
++// sqrt(x*x+y*y+z*z). The two are not the same float, and the reference
++// implementation computes the former.
++class SphericalShellNode final : public FRepNode {
++    const char* type_name() const noexcept override { return "SphericalShell"; }
++public:
++    SphericalShellNode(float rmin, float rmax, float phi0, float dphi,
++                       float theta0, float dtheta, std::string nid = "shell") {
++        kind = NodeKind::SphericalShell;
++        id = std::move(nid);
++        params["rmin"] = rmin; params["rmax"] = rmax;
++        params["phi0"] = phi0; params["dphi"] = dphi;
++        params["theta0"] = theta0; params["dtheta"] = dtheta;
++    }
++
++    float eval(float x, float y, float z) const override {
++        const float rho = std::sqrt(x * x + y * y);
++        const float rad = std::sqrt(rho * rho + z * z);
++        float f = rad - params.at("rmax");
++        if (params.at("rmin") > 0.0f) f = std::max(f, params.at("rmin") - rad);
++        f = std::max(f, wedge_eval(x, y, params.at("phi0"), params.at("dphi")));
++        const float t0 = params.at("theta0");
++        const float t1 = t0 + params.at("dtheta");
++        if (t0 > 1e-6f)
++            f = std::max(f, -(rho * std::cos(t0) - z * std::sin(t0)));
++        if (t1 < float(M_PI) - 1e-6f)
++            f = std::max(f, rho * std::cos(t1) - z * std::sin(t1));
++        return f;
++    }
++
++    llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
++                         llvm::Value* z) const override;
++
++    AABB aabb() const override {
++        const float r = params.at("rmax");
++        return {-r, -r, -r, r, r, r};
++    }
++
++    std::size_t structural_hash() const noexcept override {
++        return phash(0x7C0B'E103ull,
++                     {params.at("rmin"), params.at("rmax"), params.at("phi0"),
++                      params.at("dphi"), params.at("theta0"),
++                      params.at("dtheta")});
++    }
++};
++
++// ── Trapezoid (G4Trd) ────────────────────────────────────────────────────────
++// Six planar faces; the four slanted ones are divided by their own
++// sqrt(1+k^2). No curvature anywhere in this solid.
++class TrapezoidNode final : public FRepNode {
++    const char* type_name() const noexcept override { return "Trapezoid"; }
++public:
++    TrapezoidNode(float dx1, float dx2, float dy1, float dy2, float hz,
++                  std::string nid = "trd") {
++        kind = NodeKind::Trapezoid;
++        id = std::move(nid);
++        params["dx1"] = dx1; params["dx2"] = dx2;
++        params["dy1"] = dy1; params["dy2"] = dy2;
++        params["hz"] = hz;
++    }
++
++    float eval(float x, float y, float z) const override {
++        const float hz = params.at("hz");
++        const float u = (z + hz) / (2.0f * hz);
++        const float x1 = params.at("dx1"), x2 = params.at("dx2");
++        const float y1 = params.at("dy1"), y2 = params.at("dy2");
++        const float X = x1 + (x2 - x1) * u, Y = y1 + (y2 - y1) * u;
++        const float fx = (std::fabs(x) - X) /
++                         lat_scale(double(x2) - double(x1), 2.0 * double(hz));
++        const float fy = (std::fabs(y) - Y) /
++                         lat_scale(double(y2) - double(y1), 2.0 * double(hz));
++        return std::max(std::max(fx, fy), std::fabs(z) - hz);
++    }
++
++    llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
++                         llvm::Value* z) const override;
++
++    AABB aabb() const override {
++        const float ax = std::max(params.at("dx1"), params.at("dx2"));
++        const float ay = std::max(params.at("dy1"), params.at("dy2"));
++        const float h = params.at("hz");
++        return {-ax, -ay, -h, ax, ay, h};
++    }
++
++    std::size_t structural_hash() const noexcept override {
++        return phash(0x7C0B'E104ull,
++                     {params.at("dx1"), params.at("dx2"), params.at("dy1"),
++                      params.at("dy2"), params.at("hz")});
++    }
++};
++
++// ── Polyhedron (one G4Polyhedra section) ─────────────────────────────────────
++// A cone whose radial coordinate is measured to the nearest FLAT face instead
++// of to the axis. rmin/rmax are TANGENT distances to those faces, which is
++// G4Polyhedra's own convention and what GDML passes through.
++//
++// The face coordinate is written as a MAX OF LINEAR FUNCTIONS, not as an
++// atan2 plus a sector lookup. A max of linear functions is continuous
++// everywhere; a lookup needs a branch cut, and wherever that cut lands the
++// field jumps. It is also branch-free, which every GPU backend wants.
++class PolyhedronNode final : public FRepNode {
++    const char* type_name() const noexcept override { return "Polyhedron"; }
++public:
++    PolyhedronNode(float rmin1, float rmax1, float rmin2, float rmax2, float hz,
++                   float phi0, float dphi, int nside, std::string nid = "poly") {
++        kind = NodeKind::Polyhedron;
++        id = std::move(nid);
++        params["rmin1"] = rmin1; params["rmax1"] = rmax1;
++        params["rmin2"] = rmin2; params["rmax2"] = rmax2;
++        params["hz"] = hz; params["phi0"] = phi0; params["dphi"] = dphi;
++        params["nside"] = float(nside);
++    }
++
++    /// The face normals, derived from phi0, dphi and nside. Recomputing the
++    /// cos/sin per face per evaluation costs more than the whole rest of the
++    /// primitive - 315 ns against 39 ns for a six-sided section in the
++    /// reference implementation - so they are cached, and the cache is keyed
++    /// on the three parameters it derives from so that editing one of them
++    /// cannot leave the field evaluating the old polygon.
++    const std::vector<float>& faces() const {
++        const float p0 = params.at("phi0"), dp = params.at("dphi"),
++                    ns = params.at("nside");
++        if (f_.size() != std::size_t(2 * int(ns)) || fp0_ != p0 || fdp_ != dp) {
++            const int n = int(ns);
++            f_.resize(std::size_t(2 * n));
++            // In double, narrowed once - see wedge_coeffs.
++            const double w = double(dp) / double(n);
++            for (int j = 0; j < n; ++j) {
++                const double ph = double(p0) + (double(j) + 0.5) * w;
++                f_[std::size_t(2 * j)] = float(std::cos(ph));
++                f_[std::size_t(2 * j + 1)] = float(std::sin(ph));
++            }
++            fp0_ = p0;
++            fdp_ = dp;
++        }
++        return f_;
++    }
++
++    float eval(float x, float y, float z) const override {
++        const std::vector<float>& fc = faces();
++        float r = -1e30f;
++        for (std::size_t j = 0; j + 1 < fc.size(); j += 2)
++            r = std::max(r, x * fc[j] + y * fc[j + 1]);
++        const float hz = params.at("hz");
++        const float u = (z + hz) / (2.0f * hz);
++        const float a1 = params.at("rmax1"), a2 = params.at("rmax2");
++        const float Rmax = a1 + (a2 - a1) * u;
++        float f = std::max((r - Rmax) / lat_scale(double(a2) - double(a1),
++                                                  2.0 * double(hz)),
++                           std::fabs(z) - hz);
++        const float i1 = params.at("rmin1"), i2 = params.at("rmin2");
++        if (i1 > 0.0f || i2 > 0.0f) {
++            const float Rmin = i1 + (i2 - i1) * u;
++            f = std::max(f, (Rmin - r) / lat_scale(double(i2) - double(i1),
++                                                   2.0 * double(hz)));
++        }
++        return std::max(f, wedge_eval(x, y, params.at("phi0"), params.at("dphi")));
++    }
++
++    llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
++                         llvm::Value* z) const override;
++
++    /// rmax is the distance to a FACE, so the corner radius is larger by
++    /// 1/cos(w/2). Using rmax directly would cut the corners off the box and
++    /// make the BVH drop rays that really do hit the solid.
++    AABB aabb() const override {
++        const float n = params.at("nside");
++        const float w = params.at("dphi") / (n > 0.0f ? n : 1.0f);
++        const float r = std::max(params.at("rmax1"), params.at("rmax2")) /
++                        std::cos(0.5f * w);
++        const float h = params.at("hz");
++        return {-r, -r, -h, r, r, h};
++    }
++
++    std::size_t structural_hash() const noexcept override {
++        return phash(0x7C0B'E105ull,
++                     {params.at("rmin1"), params.at("rmax1"), params.at("rmin2"),
++                      params.at("rmax2"), params.at("hz"), params.at("phi0"),
++                      params.at("dphi"), params.at("nside")});
++    }
++
++private:
++    mutable std::vector<float> f_;
++    mutable float fp0_ = 1e30f, fdp_ = 1e30f;
++};
++
++// ── Frame: one rigid placement ───────────────────────────────────────────────
++// The child sees q = R^T (p - t), with R row-major in r0..r8. This is the same
++// convention the G4-FRep converter stores, so a placement copies across
++// verbatim - no angle extraction, no re-composition, no rounding.
++class FrameNode final : public FRepNode {
++    const char* type_name() const noexcept override { return "Frame"; }
++public:
++    FrameNode(Ptr child, const float r[9], float tx, float ty, float tz,
++              std::string nid = "frame") {
++        kind = NodeKind::Frame;
++        id = std::move(nid);
++        children.push_back(std::move(child));
++        for (int i = 0; i < 9; ++i)
++            params["r" + std::to_string(i)] = r[i];
++        params["tx"] = tx; params["ty"] = ty; params["tz"] = tz;
++    }
++
++    float eval(float x, float y, float z) const override {
++        const float dx = x - params.at("tx"), dy = y - params.at("ty"),
++                    dz = z - params.at("tz");
++        const float r0 = params.at("r0"), r1 = params.at("r1"), r2 = params.at("r2");
++        const float r3 = params.at("r3"), r4 = params.at("r4"), r5 = params.at("r5");
++        const float r6 = params.at("r6"), r7 = params.at("r7"), r8 = params.at("r8");
++        return children[0]->eval(r0 * dx + r3 * dy + r6 * dz,
++                                 r1 * dx + r4 * dy + r7 * dz,
++                                 r2 * dx + r5 * dy + r8 * dz);
++    }
++
++    llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
++                         llvm::Value* z) const override;
++
++    /// The child's box mapped forward (p = R q + t) and re-boxed. The AABB of
++    /// a transformed AABB is conservative, which is the safe direction.
++    AABB aabb() const override {
++        const AABB a = children[0]->aabb();
++        const float r0 = params.at("r0"), r1 = params.at("r1"), r2 = params.at("r2");
++        const float r3 = params.at("r3"), r4 = params.at("r4"), r5 = params.at("r5");
++        const float r6 = params.at("r6"), r7 = params.at("r7"), r8 = params.at("r8");
++        const float tx = params.at("tx"), ty = params.at("ty"), tz = params.at("tz");
++        AABB o{1e30f, 1e30f, 1e30f, -1e30f, -1e30f, -1e30f};
++        for (int k = 0; k < 8; ++k) {
++            const float qx = (k & 1) ? a.max_x : a.min_x;
++            const float qy = (k & 2) ? a.max_y : a.min_y;
++            const float qz = (k & 4) ? a.max_z : a.min_z;
++            const float px = r0 * qx + r1 * qy + r2 * qz + tx;
++            const float py = r3 * qx + r4 * qy + r5 * qz + ty;
++            const float pz = r6 * qx + r7 * qy + r8 * qz + tz;
++            o.min_x = std::min(o.min_x, px); o.max_x = std::max(o.max_x, px);
++            o.min_y = std::min(o.min_y, py); o.max_y = std::max(o.max_y, py);
++            o.min_z = std::min(o.min_z, pz); o.max_z = std::max(o.max_z, pz);
++        }
++        return o;
++    }
++
++    std::size_t structural_hash() const noexcept override {
++        std::size_t h = phash(0x7C0B'E106ull,
++                              {params.at("r0"), params.at("r1"), params.at("r2"),
++                               params.at("r3"), params.at("r4"), params.at("r5"),
++                               params.at("r6"), params.at("r7"), params.at("r8"),
++                               params.at("tx"), params.at("ty"), params.at("tz")});
++        return h * 1099511628211ull ^ children[0]->structural_hash();
++    }
++};
++
++}  // namespace frep::hep
+diff --git a/core/frep/hep_codegen.cpp b/core/frep/hep_codegen.cpp
+new file mode 100644
+index 0000000..7c4834e
+--- /dev/null
++++ b/core/frep/hep_codegen.cpp
+@@ -0,0 +1,205 @@
++// core/frep/hep_codegen.cpp
++//
++// LLVM IR for the six HEP node types. Each function mirrors the matching
++// eval() in hep.hpp expression for expression and in the same order - the two
++// are checked against each other, and a reordering that looks harmless changes
++// the last bits and breaks that check.
++//
++// Radii, half-lengths and frame entries go through c.param_value() so a policy
++// can promote them to runtime slots. Angles do not: they enter as folded sines
++// and cosines, because a sin() of a loaded value would make eval() and
++// codegen() disagree the moment one was promoted. See hep.hpp's header.
++
++#include "hep.hpp"
++
++namespace frep::hep {
++
++namespace {
++
++using llvm::Value;
++
++Value* fabs_(CgCtx& c, Value* v) {
++    return llvm_compat::unary_intrinsic(c.b, llvm::Intrinsic::fabs, v, "abs");
++}
++Value* sqrt_(CgCtx& c, Value* v) {
++    return llvm_compat::unary_intrinsic(c.b, llvm::Intrinsic::sqrt, v, "sqrt");
++}
++Value* mx(CgCtx& c, Value* a, Value* b) { return llvm_compat::max_num(c.b, a, b, "mx"); }
++Value* mn(CgCtx& c, Value* a, Value* b) { return llvm_compat::min_num(c.b, a, b, "mn"); }
++
++/// rho = sqrt(x*x + y*y)
++Value* rho_(CgCtx& c, Value* x, Value* y) {
++    auto& b = c.b;
++    return sqrt_(c, b.CreateFAdd(b.CreateFMul(x, x, "x2"),
++                                 b.CreateFMul(y, y, "y2"), "rho2"));
++}
++
++/// The phi wedge, or null when there is no cut - in which case the caller
++/// omits the term, exactly as eval() does.
++Value* wedge_(CgCtx& c, Value* x, Value* y, float a, float d) {
++    float sa, ca, sb, cb;
++    bool use_max = true;
++    if (!wedge_coeffs(a, d, sa, ca, sb, cb, use_max)) return nullptr;
++    auto& b = c.b;
++    auto* fa = b.CreateFSub(b.CreateFMul(x, c.fc(sa)), b.CreateFMul(y, c.fc(ca)), "wa");
++    auto* fb = b.CreateFAdd(b.CreateFMul(x, c.fc(sb)), b.CreateFMul(y, c.fc(cb)), "wb");
++    return use_max ? mx(c, fa, fb) : mn(c, fa, fb);
++}
++
++/// |z| - hz
++Value* zcap_(CgCtx& c, Value* z, Value* hz) {
++    return c.b.CreateFSub(fabs_(c, z), hz, "cap");
++}
++
++/// The linear interpolation a frustum's radii need: u = (z + hz) / (2 hz).
++Value* uof_(CgCtx& c, Value* z, Value* hz) {
++    auto& b = c.b;
++    return b.CreateFDiv(b.CreateFAdd(z, hz, "zph"),
++                        b.CreateFMul(c.fc(2.0f), hz, "2hz"), "u");
++}
++
++}  // namespace
++
++// ── Tube ─────────────────────────────────────────────────────────────────────
++Value* TubeNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
++    auto& b = c.b;
++    auto* rmax = c.param_value(id, "rmax", params.at("rmax"));
++    auto* hz = c.param_value(id, "hz", params.at("hz"));
++    auto* rho = rho_(c, x, y);
++    Value* f = mx(c, b.CreateFSub(rho, rmax, "outer"), zcap_(c, z, hz));
++    if (params.at("rmin") > 0.0f) {
++        auto* rmin = c.param_value(id, "rmin", params.at("rmin"));
++        f = mx(c, f, b.CreateFSub(rmin, rho, "inner"));
++    }
++    if (auto* w = wedge_(c, x, y, params.at("phi0"), params.at("dphi")))
++        f = mx(c, f, w);
++    return f;
++}
++
++// ── Cone ─────────────────────────────────────────────────────────────────────
++Value* ConeNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
++    auto& b = c.b;
++    const float hzf = params.at("hz");
++    const float a1 = params.at("rmax1"), a2 = params.at("rmax2");
++        auto* hz = c.param_value(id, "hz", hzf);
++    auto* r1 = c.param_value(id, "rmax1", a1);
++    auto* u = uof_(c, z, hz);
++    auto* Rmax = b.CreateFAdd(r1, b.CreateFMul(c.fc(a2 - a1), u, "dr"), "Rmax");
++    auto* rho = rho_(c, x, y);
++    Value* f = mx(c,
++                  b.CreateFDiv(b.CreateFSub(rho, Rmax, "dout"),
++                               c.fc(lat_scale(double(a2) - double(a1), 2.0 * double(hzf))), "lat"),
++                  zcap_(c, z, hz));
++    const float i1 = params.at("rmin1"), i2 = params.at("rmin2");
++    if (i1 > 0.0f || i2 > 0.0f) {
++                auto* q1 = c.param_value(id, "rmin1", i1);
++        auto* Rmin = b.CreateFAdd(q1, b.CreateFMul(c.fc(i2 - i1), u, "dri"), "Rmin");
++        f = mx(c, f,
++               b.CreateFDiv(b.CreateFSub(Rmin, rho, "din"),
++                            c.fc(lat_scale(double(i2) - double(i1), 2.0 * double(hzf))), "lati"));
++    }
++    if (auto* w = wedge_(c, x, y, params.at("phi0"), params.at("dphi")))
++        f = mx(c, f, w);
++    return f;
++}
++
++// ── SphericalShell ───────────────────────────────────────────────────────────
++Value* SphericalShellNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
++    auto& b = c.b;
++    auto* rho = rho_(c, x, y);
++    // rad from rho, not from x,y,z - see hep.hpp.
++    auto* rad = sqrt_(c, b.CreateFAdd(b.CreateFMul(rho, rho, "rho2"),
++                                      b.CreateFMul(z, z, "z2"), "rad2"));
++    auto* rmax = c.param_value(id, "rmax", params.at("rmax"));
++    Value* f = b.CreateFSub(rad, rmax, "outer");
++    if (params.at("rmin") > 0.0f) {
++        auto* rmin = c.param_value(id, "rmin", params.at("rmin"));
++        f = mx(c, f, b.CreateFSub(rmin, rad, "inner"));
++    }
++    if (auto* w = wedge_(c, x, y, params.at("phi0"), params.at("dphi")))
++        f = mx(c, f, w);
++    const float t0 = params.at("theta0");
++    const float t1 = t0 + params.at("dtheta");
++    auto cone = [&](float ct, float st, bool neg) {
++        auto* v = b.CreateFSub(b.CreateFMul(rho, c.fc(ct)),
++                               b.CreateFMul(z, c.fc(st)), "cone");
++        return neg ? b.CreateFNeg(v, "ncone") : v;
++    };
++    if (t0 > 1e-6f) f = mx(c, f, cone(std::cos(t0), std::sin(t0), true));
++    if (t1 < float(M_PI) - 1e-6f) f = mx(c, f, cone(std::cos(t1), std::sin(t1), false));
++    return f;
++}
++
++// ── Trapezoid ────────────────────────────────────────────────────────────────
++Value* TrapezoidNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
++    auto& b = c.b;
++    const float hzf = params.at("hz");
++    const float x1 = params.at("dx1"), x2 = params.at("dx2");
++    const float y1 = params.at("dy1"), y2 = params.at("dy2");
++        auto* hz = c.param_value(id, "hz", hzf);
++    auto* u = uof_(c, z, hz);
++    auto face = [&](const char* p0, float v0, float v1, Value* coord) {
++        auto* base = c.param_value(id, p0, v0);
++        auto* half = b.CreateFAdd(base, b.CreateFMul(c.fc(v1 - v0), u, "dh"), "half");
++        return b.CreateFDiv(b.CreateFSub(fabs_(c, coord), half, "d"),
++                            c.fc(lat_scale(double(v1) - double(v0),
++                                           2.0 * double(hzf))), "face");
++    };
++    auto* fx = face("dx1", x1, x2, x);
++    auto* fy = face("dy1", y1, y2, y);
++    return mx(c, mx(c, fx, fy), zcap_(c, z, hz));
++}
++
++// ── Polyhedron ───────────────────────────────────────────────────────────────
++Value* PolyhedronNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
++    auto& b = c.b;
++    const std::vector<float>& fc = faces();
++    // A max of linear functions: ns-1 maxima over compile-time constants, no
++    // branch, no transcendental. Emitted in the same order eval() takes them.
++    Value* r = nullptr;
++    for (std::size_t j = 0; j + 1 < fc.size(); j += 2) {
++        auto* u = b.CreateFAdd(b.CreateFMul(x, c.fc(fc[j])),
++                               b.CreateFMul(y, c.fc(fc[j + 1])), "face");
++        r = r ? mx(c, r, u) : u;
++    }
++    const float hzf = params.at("hz");
++    const float a1 = params.at("rmax1"), a2 = params.at("rmax2");
++        auto* hz = c.param_value(id, "hz", hzf);
++    auto* r1 = c.param_value(id, "rmax1", a1);
++    auto* u = uof_(c, z, hz);
++    auto* Rmax = b.CreateFAdd(r1, b.CreateFMul(c.fc(a2 - a1), u, "dr"), "Rmax");
++    Value* f = mx(c,
++                  b.CreateFDiv(b.CreateFSub(r, Rmax, "dout"),
++                               c.fc(lat_scale(double(a2) - double(a1), 2.0 * double(hzf))), "lat"),
++                  zcap_(c, z, hz));
++    const float i1 = params.at("rmin1"), i2 = params.at("rmin2");
++    if (i1 > 0.0f || i2 > 0.0f) {
++                auto* q1 = c.param_value(id, "rmin1", i1);
++        auto* Rmin = b.CreateFAdd(q1, b.CreateFMul(c.fc(i2 - i1), u, "dri"), "Rmin");
++        f = mx(c, f,
++               b.CreateFDiv(b.CreateFSub(Rmin, r, "din"),
++                            c.fc(lat_scale(double(i2) - double(i1), 2.0 * double(hzf))), "lati"));
++    }
++    if (auto* w = wedge_(c, x, y, params.at("phi0"), params.at("dphi")))
++        f = mx(c, f, w);
++    return f;
++}
++
++// ── Frame ────────────────────────────────────────────────────────────────────
++Value* FrameNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
++    auto& b = c.b;
++    auto P = [&](const char* n) { return c.param_value(id, n, params.at(n)); };
++    auto* dx = b.CreateFSub(x, P("tx"), "dx");
++    auto* dy = b.CreateFSub(y, P("ty"), "dy");
++    auto* dz = b.CreateFSub(z, P("tz"), "dz");
++    auto row = [&](const char* a, const char* d, const char* g) {
++        return b.CreateFAdd(
++            b.CreateFAdd(b.CreateFMul(P(a), dx), b.CreateFMul(P(d), dy)),
++            b.CreateFMul(P(g), dz), "q");
++    };
++    // q = R^T (p - t), with R row-major in r0..r8.
++    return children[0]->codegen(c, row("r0", "r3", "r6"), row("r1", "r4", "r7"),
++                                row("r2", "r5", "r8"));
++}
++
++}  // namespace frep::hep
+diff --git a/core/frep/node.hpp b/core/frep/node.hpp
+index c739462..04f40cb 100644
+--- a/core/frep/node.hpp
++++ b/core/frep/node.hpp
+@@ -31,6 +31,12 @@ enum class NodeKind {
+     TwistY, BendXY, TaperY,
+     Scene,
+     Instance,
++    // High-energy-physics primitives (core/frep/hep.hpp), 1:1 with the Geant4
++    // solids a detector geometry is made of, plus one general rigid frame.
++    // Native rather than plugin because aabb() is not optional: a node
++    // without one is infinite, and one infinite leaf takes the BVH, the RTX
++    // proxy and marching cubes with it.
++    Tube, Cone, SphericalShell, Trapezoid, Polyhedron, Frame,
+     // Plugin-defined nodes — emit goes through the FRepNode::emit_glsl
+     // virtual fallback rather than the built-in switch table. Plugin
+     // authors should set `kind = NodeKind::Plugin` in their node ctor.
+diff --git a/core/io/scene_io.cpp b/core/io/scene_io.cpp
+index 6eb2f98..8447669 100644
+--- a/core/io/scene_io.cpp
++++ b/core/io/scene_io.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "core/frep/custom_expr.hpp"
+ #include "core/frep/deformations.hpp"
++#include "core/frep/hep.hpp"
+ #include "core/frep/operations.hpp"
+ #include "core/frep/instance.hpp"
+ #include "core/frep/primitives.hpp"
+@@ -301,6 +302,56 @@ struct NodeDeserializer {
+                 param_or(params, "d",  0.0f), id);
+         }
+ 
++        // ── HEP primitives (core/frep/hep.hpp) ────────────────────────────────
++        // Written generically by node_to_json - type_name plus the whole
++        // params map - so only the read side needs a branch. Parameter order
++        // here is the G4 solid's own, which is what makes a converted
++        // geometry a parameter copy rather than a translation.
++        if (type == "Tube") {
++            return std::make_shared<hep::TubeNode>(
++                param_or(params, "rmin", 0.0f), param_or(params, "rmax", 1.0f),
++                param_or(params, "hz", 1.0f), param_or(params, "phi0", 0.0f),
++                param_or(params, "dphi", 6.283185307179586f), id);
++        }
++        if (type == "Cone") {
++            return std::make_shared<hep::ConeNode>(
++                param_or(params, "rmin1", 0.0f), param_or(params, "rmax1", 1.0f),
++                param_or(params, "rmin2", 0.0f), param_or(params, "rmax2", 1.0f),
++                param_or(params, "hz", 1.0f), param_or(params, "phi0", 0.0f),
++                param_or(params, "dphi", 6.283185307179586f), id);
++        }
++        if (type == "SphericalShell") {
++            return std::make_shared<hep::SphericalShellNode>(
++                param_or(params, "rmin", 0.0f), param_or(params, "rmax", 1.0f),
++                param_or(params, "phi0", 0.0f),
++                param_or(params, "dphi", 6.283185307179586f),
++                param_or(params, "theta0", 0.0f),
++                param_or(params, "dtheta", 3.141592653589793f), id);
++        }
++        if (type == "Trapezoid") {
++            return std::make_shared<hep::TrapezoidNode>(
++                param_or(params, "dx1", 1.0f), param_or(params, "dx2", 1.0f),
++                param_or(params, "dy1", 1.0f), param_or(params, "dy2", 1.0f),
++                param_or(params, "hz", 1.0f), id);
++        }
++        if (type == "Polyhedron") {
++            return std::make_shared<hep::PolyhedronNode>(
++                param_or(params, "rmin1", 0.0f), param_or(params, "rmax1", 1.0f),
++                param_or(params, "rmin2", 0.0f), param_or(params, "rmax2", 1.0f),
++                param_or(params, "hz", 1.0f), param_or(params, "phi0", 0.0f),
++                param_or(params, "dphi", 6.283185307179586f),
++                int(param_or(params, "nside", 6.0f)), id);
++        }
++        if (type == "Frame") {
++            if (kids.size() != 1) throw std::runtime_error("Frame needs 1 child");
++            float r[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
++            for (int k = 0; k < 9; ++k)
++                r[k] = param_or(params, "r" + std::to_string(k), r[k]);
++            return std::make_shared<hep::FrameNode>(
++                kids[0], r, param_or(params, "tx", 0.0f),
++                param_or(params, "ty", 0.0f), param_or(params, "tz", 0.0f), id);
++        }
++
+         // ── Operations ────────────────────────────────────────────────────────
+         if (type == "Union") {
+             if (kids.size() != 2) throw std::runtime_error("Union needs 2 children");
+-- 
+2.43.0
+
+
+From 159477c7a1c8929e88a22156d1b24eb93de0af3b Mon Sep 17 00:00:00 2001
+From: Alexander Penev <alexander.p.penev@gmail.com>
+Date: Thu, 24 Sep 2026 08:23:37 +0300
+Subject: [PATCH 2/2] compiler: build against the LLVM the CMakeLists already
+ requires
+
+CMakeLists.txt asks for LLVM 22+ and the code did not compile against it.
+LLVM 20 renamed Intrinsic::getDeclaration to getOrInsertDeclaration and
+LLVM 22 removed the old spelling: 28 call sites in custom_expr.cpp, one
+error each, and nothing else in the tree.
+
+Absorbed in llvm_compat.hpp, which exists for exactly this, beside the
+minnum/maxnum and unary/binary-intrinsic wrappers that already carry a
+LLVM_VERSION_MAJOR >= 22 arm.
+
+Verified on LLVM 22.1.8 with clang 22: the library builds, and the
+GoogleTest suite runs 351 tests from 75 suites with 342 passed and 9
+skipped (the skips are the SPIR-V external translator and the RTX path,
+absent in this container). With -DFREP_BUILD_DYNAMIC_PLUGINS=OFF one
+PluginRuntime test fails for want of the .so it looks for; with plugins on,
+all five pass.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5ALyYbzrXTGtc7LqRPGCz
+---
+ core/compiler/llvm_compat.hpp | 14 +++++++++
+ core/frep/custom_expr.cpp     | 56 +++++++++++++++++------------------
+ 2 files changed, 42 insertions(+), 28 deletions(-)
+
+diff --git a/core/compiler/llvm_compat.hpp b/core/compiler/llvm_compat.hpp
+index c675576..71bfeeb 100644
+--- a/core/compiler/llvm_compat.hpp
++++ b/core/compiler/llvm_compat.hpp
+@@ -66,6 +66,20 @@ inline llvm::Value* unary_intrinsic(llvm::IRBuilder<>& b,
+ #endif
+ }
+ 
++// Intrinsic declaration lookup. LLVM 20 renamed Intrinsic::getDeclaration to
++// getOrInsertDeclaration and LLVM 22 removed the old spelling, which is what
++// stopped this project building against the very version its CMakeLists
++// requires ("LLVM 22+"): 28 call sites in custom_expr.cpp, one error each.
++// Absorbing it here is what this header is for.
++inline llvm::Function* get_declaration(llvm::Module* m, llvm::Intrinsic::ID id,
++                                       llvm::ArrayRef<llvm::Type*> tys = {}) {
++#if LLVM_VERSION_MAJOR >= 20
++    return llvm::Intrinsic::getOrInsertDeclaration(m, id, tys);
++#else
++    return llvm::Intrinsic::getDeclaration(m, id, tys);
++#endif
++}
++
+ // Binary intrinsic call (e.g. minnum, maxnum) with an optional result name.
+ inline llvm::Value* binary_intrinsic(llvm::IRBuilder<>& b,
+                                      llvm::Intrinsic::ID id,
+diff --git a/core/frep/custom_expr.cpp b/core/frep/custom_expr.cpp
+index 00ab519..b934af0 100644
+--- a/core/frep/custom_expr.cpp
++++ b/core/frep/custom_expr.cpp
+@@ -96,9 +96,9 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
+     if (name == "sqrt") {
+         // Domain-safe: sqrt of a negative (from imported expressions that assume
+         // clamped domains) would be NaN. Clamp the argument at 0 like libfive.
+-        auto* mx0 = llvm::Intrinsic::getDeclaration(
++        auto* mx0 = frep::llvm_compat::get_declaration(
+             mod_, llvm::Intrinsic::maxnum, {b.getFloatTy()});
+-        auto* S = llvm::Intrinsic::getDeclaration(
++        auto* S = frep::llvm_compat::get_declaration(
+             mod_, llvm::Intrinsic::sqrt, {b.getFloatTy()});
+         return b.CreateCall(S, {b.CreateCall(mx0,
+             {args[0], llvm::ConstantFP::get(b.getFloatTy(), 0.0f)})});
+@@ -120,9 +120,9 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
+         // case is unchanged. The extra fabs/copysign cost is negligible next to
+         // the pow itself; scenes with hundreds of pow calls (gears) are expensive
+         // to compile regardless, because of their sheer expression size.
+-        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {b.getFloatTy()});
+-        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {b.getFloatTy()});
+-        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {b.getFloatTy()});
++        auto* P  = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::pow, {b.getFloatTy()});
++        auto* fa = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::fabs, {b.getFloatTy()});
++        auto* cs = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::copysign, {b.getFloatTy()});
+         auto* mag = b.CreateCall(P, {b.CreateCall(fa, {args[0]}), args[1]});
+         return b.CreateCall(cs, {mag, args[0]});
+     }
+@@ -131,9 +131,9 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
+         // This is what libfive's OP_NTH_ROOT does; the converter emits it (rather
+         // than pow(a,1/b), which is NaN for a negative base). Plain pow stays the
+         // raw fast intrinsic — only genuine nth-roots pay for the sign handling.
+-        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {b.getFloatTy()});
+-        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {b.getFloatTy()});
+-        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {b.getFloatTy()});
++        auto* P  = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::pow, {b.getFloatTy()});
++        auto* fa = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::fabs, {b.getFloatTy()});
++        auto* cs = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::copysign, {b.getFloatTy()});
+         auto* inv = b.CreateFDiv(llvm::ConstantFP::get(b.getFloatTy(), 1.0f), args[1]);
+         auto* mag = b.CreateCall(P, {b.CreateCall(fa, {args[0]}), inv});
+         return b.CreateCall(cs, {mag, args[0]});
+@@ -151,8 +151,8 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
+     };
+     // clamp helper for inverse-trig domain [-1, 1]
+     auto clamp_unit = [&](llvm::Value* v) {
+-        auto* mn = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::minnum, {b.getFloatTy()});
+-        auto* mx = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::maxnum, {b.getFloatTy()});
++        auto* mn = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::minnum, {b.getFloatTy()});
++        auto* mx = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::maxnum, {b.getFloatTy()});
+         auto* lo = b.CreateCall(mx, {v, llvm::ConstantFP::get(b.getFloatTy(), -1.0f)});
+         return b.CreateCall(mn, {lo, llvm::ConstantFP::get(b.getFloatTy(), 1.0f)});
+     };
+@@ -229,9 +229,9 @@ CustomExprCompiler::gen_ival(const expr::Node& n) {
+     auto& b = *b_;
+     auto k = [&](float v){ return fc(v); };
+     auto mn = [&](llvm::Value* a, llvm::Value* c){
+-        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::minnum,{b.getFloatTy()}),{a,c}); };
++        return b.CreateCall(frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::minnum,{b.getFloatTy()}),{a,c}); };
+     auto mx = [&](llvm::Value* a, llvm::Value* c){
+-        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::maxnum,{b.getFloatTy()}),{a,c}); };
++        return b.CreateCall(frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::maxnum,{b.getFloatTy()}),{a,c}); };
+     std::pair<llvm::Value*,llvm::Value*> out{nullptr,nullptr};
+     switch (n.kind) {
+         case Kind::Number: out = {k(n.num), k(n.num)}; break;
+@@ -284,11 +284,11 @@ CustomExprCompiler::gen_call_ival(const expr::Node& n) {
+     auto& b = *b_;
+     const auto& nm = n.ident;
+     auto I=[&](llvm::Intrinsic::ID id,llvm::Value* v){
+-        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,id,{b.getFloatTy()}),{v}); };
++        return b.CreateCall(frep::llvm_compat::get_declaration(mod_,id,{b.getFloatTy()}),{v}); };
+     auto mn=[&](llvm::Value* a,llvm::Value* c){
+-        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::minnum,{b.getFloatTy()}),{a,c}); };
++        return b.CreateCall(frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::minnum,{b.getFloatTy()}),{a,c}); };
+     auto mx=[&](llvm::Value* a,llvm::Value* c){
+-        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::maxnum,{b.getFloatTy()}),{a,c}); };
++        return b.CreateCall(frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::maxnum,{b.getFloatTy()}),{a,c}); };
+     std::vector<std::pair<llvm::Value*,llvm::Value*>> a;
+     for (auto& c:n.children){ auto p=gen_ival(*c); if(!p.first) return {}; a.push_back(p); }
+     if (nm=="sqrt"){ auto lo=mx(a[0].first, fc(0.0f));
+@@ -300,13 +300,13 @@ CustomExprCompiler::gen_call_ival(const expr::Node& n) {
+     if (nm=="min") return {mn(a[0].first,a[1].first), mn(a[0].second,a[1].second)};
+     if (nm=="max") return {mx(a[0].first,a[1].first), mx(a[0].second,a[1].second)};
+     if (nm=="pow"){ // constant exponent, non-negative base (holds for the blend h^k)
+-        auto*P=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::pow,{b.getFloatTy()});
++        auto*P=frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::pow,{b.getFloatTy()});
+         auto lo=mx(a[0].first,fc(0.0f)), hi=mx(a[0].second,fc(0.0f));
+         return {b.CreateCall(P,{lo,a[1].first}), b.CreateCall(P,{hi,a[1].second})}; }
+     if (nm=="nth_root"){ // b-th root: monotone increasing in the base for b>0
+-        auto*P=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::pow,{b.getFloatTy()});
+-        auto*fa=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::fabs,{b.getFloatTy()});
+-        auto*cs=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::copysign,{b.getFloatTy()});
++        auto*P=frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::pow,{b.getFloatTy()});
++        auto*fa=frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::fabs,{b.getFloatTy()});
++        auto*cs=frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::copysign,{b.getFloatTy()});
+         auto invlo=b.CreateFDiv(fc(1.0f),a[1].first), invhi=b.CreateFDiv(fc(1.0f),a[1].second);
+         auto lo=b.CreateCall(cs,{b.CreateCall(P,{b.CreateCall(fa,{a[0].first}),invlo}),a[0].first});
+         auto hi=b.CreateCall(cs,{b.CreateCall(P,{b.CreateCall(fa,{a[0].second}),invhi}),a[0].second});
+@@ -424,7 +424,7 @@ struct VPoly {
+     llvm::Value* fma(llvm::Value* a, llvm::Value* x, llvm::Value* c){
+         return b.CreateFAdd(b.CreateFMul(a, x), c); }
+     llvm::Value* intr(llvm::Intrinsic::ID id, llvm::Value* x){
+-        return b.CreateCall(llvm::Intrinsic::getDeclaration(
++        return b.CreateCall(frep::llvm_compat::get_declaration(
+             b.GetInsertBlock()->getModule(), id, {vt}), {x}); }
+     // sin/cos via reduction to [-pi/4,pi/4] + quadrant swap (accurate to ~1e-6).
+     void sincos(llvm::Value* x, llvm::Value** so, llvm::Value** co){
+@@ -503,7 +503,7 @@ llvm::Value* CustomExprCompiler::gen_call_vec(const expr::Node& n) {
+     }
+     auto* vt = vty(*ctx_, vw_);
+     auto vintr = [&](llvm::Intrinsic::ID id) {
+-        auto* f = llvm::Intrinsic::getDeclaration(mod_, id, {vt});
++        auto* f = frep::llvm_compat::get_declaration(mod_, id, {vt});
+         return a.size() == 2 ? b.CreateCall(f, {a[0], a[1]})
+                              : b.CreateCall(f, {a[0]});
+     };
+@@ -519,17 +519,17 @@ llvm::Value* CustomExprCompiler::gen_call_vec(const expr::Node& n) {
+     if (nm == "ceil")  return vintr(llvm::Intrinsic::ceil);
+     if (nm == "pow") {
+         // Match the scalar path's domain-safe pow: copysign(|a|^b, a).
+-        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {a[0]->getType()});
+-        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {a[0]->getType()});
+-        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {a[0]->getType()});
++        auto* P  = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::pow, {a[0]->getType()});
++        auto* fa = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::fabs, {a[0]->getType()});
++        auto* cs = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::copysign, {a[0]->getType()});
+         auto* mag = b.CreateCall(P, {b.CreateCall(fa, {a[0]}), a[1]});
+         return b.CreateCall(cs, {mag, a[0]});
+     }
+     if (nm == "nth_root") {
+         // copysign(|a|^(1/b), a), vector-wide.
+-        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {a[0]->getType()});
+-        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {a[0]->getType()});
+-        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {a[0]->getType()});
++        auto* P  = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::pow, {a[0]->getType()});
++        auto* fa = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::fabs, {a[0]->getType()});
++        auto* cs = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::copysign, {a[0]->getType()});
+         auto* one = llvm::ConstantFP::get(a[0]->getType(), 1.0f);
+         auto* inv = b.CreateFDiv(one, a[1]);
+         auto* mag = b.CreateCall(P, {b.CreateCall(fa, {a[0]}), inv});
+@@ -544,7 +544,7 @@ llvm::Value* CustomExprCompiler::gen_call_vec(const expr::Node& n) {
+     if (nm == "atan")  return vp.atan(a[0]);
+     if (nm == "atan2") return vp.atan2(a[0], a[1]);
+     if (nm == "mod") {  // x - floor(x/y)*y  (matches fmod for y>0; SIMD-friendly)
+-        auto* ff = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::floor, {vt});
++        auto* ff = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::floor, {vt});
+         auto flq = b.CreateCall(ff, {b.CreateFDiv(a[0], a[1])});
+         return b.CreateFSub(a[0], b.CreateFMul(flq, a[1]));
+     }
+-- 
+2.43.0
+

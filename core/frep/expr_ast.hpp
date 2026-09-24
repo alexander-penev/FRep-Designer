@@ -61,7 +61,10 @@ struct Node {
 
     // Payload (union-ish — only the relevant field per kind is set).
     Op          bop  {};
-    float       num  = 0.0f;
+    /// Double: the literal in the expression text is written in decimal and
+    /// a float store rounds it before evaluation ever begins. eval_ast<T>
+    /// narrows per type instead.
+    double      num  = 0.0;
     std::string ident;
 
     std::vector<NodePtr> children;

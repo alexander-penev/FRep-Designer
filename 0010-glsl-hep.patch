@@ -1,0 +1,937 @@
+From d258d824412971796de6b4f22a1a82d2c58faeb8 Mon Sep 17 00:00:00 2001
+From: Alexander Penev <alexander.p.penev@gmail.com>
+Date: Thu, 24 Sep 2026 13:06:29 +0300
+Subject: [PATCH] gpu: GLSL for the six HEP nodes, value and gradient
+
+Without these a converted detector could not reach the GPU at all. The
+emitter's switch did not know the kinds, and its plugin fallback could not
+serve them: FRepNode::emit_glsl is handed the child expressions and a name
+prefix but never the coordinates, and its own example writes the literal
+names x, y, z. That is right for a node at the root and wrong under any
+transform, where the point arrives as t3_x or as a Frame's rebuilt names.
+
+glsl_hep.cpp mirrors hep_codegen.cpp for the value and hep_ad.cpp for the
+dual, so there are now four descriptions of each solid - eval_t, IR, GLSL
+value, GLSL dual - equal only because each was written against the last.
+The tests are what make that a fact.
+
+Both switches, not just the value one. A kind without a dual emitter sends
+the WHOLE scene back to central-difference normals, which is the defect
+measured on the CPU last commit (a Tube's |grad| reaching 1.092 at 10 m
+because the step is absolute). Two helpers were added to the shader
+preamble for it: d_div_s, a true divide so the dual matches the value path's
+bits rather than multiplying by a reciprocal, and d_abs.
+
+Every parameter goes through pval(), so one the policy made a runtime slot
+is read from the shared buffer. That only began working for these kinds when
+node_param_schema learned about them - before, slot_of() never matched and
+every parameter silently baked.
+
+Checked four ways, and this container can do all four:
+  - all six kinds emit, no fallback and no CustomExpr;
+  - the dual path survives, so normals stay analytic;
+  - the shader compiles: 16208 SPIR-V words from 26109 chars of GLSL;
+  - it RUNS on lavapipe and agrees with the CPU on a six-solid HEP scene -
+    mean |difference| 0.00078 over 27648 channels, 3 of them past 0.05,
+    which is the silhouette where a ray hits on one path and misses on the
+    other.
+
+Two defects the tests caught, both mine. d_abs was emitted BEFORE d_neg,
+which it calls, and GLSL has no forward declarations - three compile errors
+that only a real glslangValidator run finds. And the first version of the
+SPIR-V check printed spv->size() as a word count: that function returns the
+PATH of the .spv, so it reported 25 words for a 16208 word module. It now
+stats the file.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5ALyYbzrXTGtc7LqRPGCz
+---
+ CMakeLists.txt            |   2 +
+ core/gpu/glsl_emitter.cpp |  54 +++--
+ core/gpu/glsl_emitter.hpp |  82 +++++++
+ core/gpu/glsl_hep.cpp     | 493 ++++++++++++++++++++++++++++++++++++++
+ tests/test_glsl_hep.cpp   | 158 ++++++++++++
+ 5 files changed, 772 insertions(+), 17 deletions(-)
+ create mode 100644 core/gpu/glsl_hep.cpp
+ create mode 100644 tests/test_glsl_hep.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b86daa9..2da9c2d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -285,6 +285,7 @@ if(FREP_BUILD_GPU)
+     target_sources(frep_core PRIVATE
+         core/gpu/vulkan_ctx.cpp
+         core/gpu/glsl_emitter.cpp
++    core/gpu/glsl_hep.cpp
+         core/gpu/rtx_caps.cpp
+         core/gpu/rtx_ctx.cpp
+         core/gpu/rtx_accel.cpp
+@@ -623,6 +624,7 @@ add_executable(frep_tests
+     tests/test_codegen_f64.cpp
+     tests/test_simd_scalar_type.cpp
+     tests/test_hep_ad.cpp
++    tests/test_glsl_hep.cpp
+     tests/test_expr_backends.cpp
+     tests/test_plugin_runtime.cpp
+     tests/test_scene_set_geometry.cpp
+diff --git a/core/gpu/glsl_emitter.cpp b/core/gpu/glsl_emitter.cpp
+index 1b2bc7a..717b0c3 100644
+--- a/core/gpu/glsl_emitter.cpp
++++ b/core/gpu/glsl_emitter.cpp
+@@ -12,23 +12,7 @@
+ 
+ namespace frep::gpu {
+ 
+-namespace {
+-
+-// Helper: emit a float literal with enough precision for round-trip.
+-std::string flit(float v) {
+-    std::ostringstream os;
+-    os << std::setprecision(9) << v;
+-    std::string s = os.str();
+-    // Ensure GLSL parses it as a float (presence of '.' or 'e').
+-    if (s.find('.') == std::string::npos && s.find('e') == std::string::npos
+-        && s.find('E') == std::string::npos)
+-    {
+-        s += ".0";
+-    }
+-    return s;
+-}
+-
+-} // anon
++// flit() now lives in the header - glsl_hep.cpp needs it too.
+ 
+ // Parameter choke point: literal when Constant / no table, P.v[slot] when
+ // Runtime. All node emitters below build their GLSL arithmetic over pval()
+@@ -403,6 +387,21 @@ GlslEmitter::emit_node(Ctx& c, const FRepNode& n,
+         case K::BendXY:    return emit_bend_xy(c, n, x, y, z);
+         case K::TaperY:    return emit_taper_y(c, n, x, y, z);
+ 
++        // HEP primitives (core/gpu/glsl_hep.cpp).
++        case K::Tube:           return emit_hep_tube(c, n, x, y, z);
++        case K::Cone:           return emit_hep_cone(c, n, x, y, z);
++        case K::SphericalShell: return emit_hep_shell(c, n, x, y, z);
++        case K::Trapezoid:      return emit_hep_trd(c, n, x, y, z);
++        case K::Polyhedron:     return emit_hep_poly(c, n, x, y, z);
++        case K::Frame: {
++            // Rewrites the point and recurses - the child is the value.
++            if (n.children.empty() || !n.children[0])
++                return std::unexpected(std::string("Frame has no child"));
++            std::string qx, qy, qz;
++            emit_hep_frame_coords(c, n, x, y, z, qx, qy, qz);
++            return emit_node(c, *n.children[0], qx, qy, qz);
++        }
++
+         case K::Instance: {
+             if (n.children.empty() || !n.children[0])
+                 return std::string("1e30");        // dangling -> empty
+@@ -732,6 +731,20 @@ GlslEmitter::emit_node_dual(Ctx& c, const FRepNode& n,
+             }
+             return emit_node_dual(c, *target, x, y, z);   // delegate to target
+         }
++        // HEP primitives (core/gpu/glsl_hep.cpp).
++        case K::Tube:           return emit_hep_tube_dual(c, n, x, y, z);
++        case K::Cone:           return emit_hep_cone_dual(c, n, x, y, z);
++        case K::SphericalShell: return emit_hep_shell_dual(c, n, x, y, z);
++        case K::Trapezoid:      return emit_hep_trd_dual(c, n, x, y, z);
++        case K::Polyhedron:     return emit_hep_poly_dual(c, n, x, y, z);
++        case K::Frame: {
++            if (n.children.empty() || !n.children[0])
++                return std::unexpected(std::string("Frame has no child"));
++            std::string qx, qy, qz;
++            emit_hep_frame_dual_coords(c, n, x, y, z, qx, qy, qz);
++            return emit_node_dual(c, *n.children[0], qx, qy, qz);
++        }
++
+         default:
+             // BendXY and plugin/mesh/custom nodes: no dual emitter yet.
+             // Signal the caller to fall back to finite-difference normals
+@@ -1369,7 +1382,14 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
+             << "Dual d_add_s(Dual a, float s){ return Dual(a.v+s, a.g); }\n"
+             << "Dual d_sub_s(Dual a, float s){ return Dual(a.v-s, a.g); }\n"
+             << "Dual d_mul_s(Dual a, float s){ return Dual(a.v*s, a.g*s); }\n"
++            // A true divide, not a multiply by the reciprocal: the value
++            // path divides by the slant factor, and the dual has to produce
++            // the same bits or the two disagree on the surface itself.
++            << "Dual d_div_s(Dual a, float s){ return Dual(a.v/s, a.g/s); }\n"
+             << "Dual d_neg(Dual a){ return Dual(-a.v, -a.g); }\n"
++            // |a|, after d_neg because GLSL has no forward declarations. The
++            // subgradient is sign(a), matching the CPU's ad_ir::fabs.
++            << "Dual d_abs(Dual a){ return (a.v >= 0.0) ? a : d_neg(a); }\n"
+             << "Dual d_sqrt(Dual a){ float s=sqrt(max(a.v,1e-12)); return Dual(s, a.g*(0.5/s)); }\n"
+             << "Dual d_sin(Dual a){ return Dual(sin(a.v), cos(a.v)*a.g); }\n"
+             << "Dual d_cos(Dual a){ return Dual(cos(a.v), -sin(a.v)*a.g); }\n"
+diff --git a/core/gpu/glsl_emitter.hpp b/core/gpu/glsl_emitter.hpp
+index b4e7055..8f65142 100644
+--- a/core/gpu/glsl_emitter.hpp
++++ b/core/gpu/glsl_emitter.hpp
+@@ -36,6 +36,7 @@
+ 
+ #include <array>
+ #include <expected>
++#include <iomanip>
+ #include <sstream>
+ #include <string>
+ #include <unordered_map>
+@@ -43,6 +44,18 @@
+ 
+ namespace frep::gpu {
+ 
++/// A float literal with enough precision to round-trip, and always parseable
++/// by GLSL as a float. In the header because glsl_hep.cpp needs it too.
++inline std::string flit(float v) {
++    std::ostringstream os;
++    os << std::setprecision(9) << v;
++    std::string s = os.str();
++    if (s.find('.') == std::string::npos && s.find('e') == std::string::npos &&
++        s.find('E') == std::string::npos)
++        s += ".0";
++    return s;
++}
++
+ // One scene-translation result.
+ struct GlslEmitResult {
+     std::string source;           // complete .comp shader text
+@@ -233,6 +246,75 @@ private:
+     // interpolation against the global voxel storage buffer.
+     static std::string emit_mesh_sdf (Ctx& c, const FRepNode& n,
+         const std::string& x, const std::string& y, const std::string& z);
++
++    // ── HEP primitives (core/gpu/glsl_hep.cpp) ─────────────────────────────
++    //
++    // In the emitter's own switch rather than through FRepNode::emit_glsl,
++    // the plugin hook. That hook takes no coordinates: it gets the child
++    // expressions and a name prefix, and the example in its comment writes
++    // the literal names x, y and z. That is fine for a node under no
++    // transform and wrong under one, where the point arrives as t3_x or a
++    // Frame's rebuilt names. A primitive must be told WHICH expressions its
++    // coordinates are, so these take x, y, z like every other primitive.
++    //
++    // Each mirrors hep_codegen.cpp expression for expression, so the GLSL
++    // and the IR describe the same solid; test_glsl_hep.cpp checks them
++    // against the CPU rather than trusting that they do.
++    // Shared by the HEP emitters. Private statics rather than file-local
++    // helpers because Ctx is a private nested type.
++    static std::string hep_rho  (Ctx& c, const std::string& x,
++                                 const std::string& y);
++    static std::string hep_wedge(Ctx& c, const FRepNode& n,
++                                 const std::string& x, const std::string& y);
++    static std::string hep_u    (Ctx& c, const std::string& z,
++                                 const std::string& hz);
++    static void        hep_fold (Ctx& c, const std::string& dst,
++                                 const std::string& term);
++
++    static std::string emit_hep_tube  (Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z);
++    static std::string emit_hep_cone  (Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z);
++    static std::string emit_hep_shell (Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z);
++    static std::string emit_hep_trd   (Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z);
++    static std::string emit_hep_poly  (Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z);
++    // The same six in dual arithmetic, for analytic GPU normals. Without
++    // them the dual emitter's default sends the whole object back to
++    // central differences - the same defect measured on the CPU, where a
++    // Tube's |grad| reached 1.092 at 10 m because the step is absolute.
++    static std::string emit_hep_tube_dual (Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z);
++    static std::string emit_hep_cone_dual (Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z);
++    static std::string emit_hep_shell_dual(Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z);
++    static std::string emit_hep_trd_dual  (Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z);
++    static std::string emit_hep_poly_dual (Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z);
++    static void        emit_hep_frame_dual_coords(Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z,
++        std::string& qx, std::string& qy, std::string& qz);
++
++    // Shared by the dual HEP emitters.
++    static std::string hep_rho_d  (Ctx& c, const std::string& x,
++                                   const std::string& y);
++    static std::string hep_wedge_d(Ctx& c, const FRepNode& n,
++                                   const std::string& x, const std::string& y);
++    static std::string hep_u_d    (Ctx& c, const std::string& z,
++                                   const std::string& hz);
++    static void        hep_fold_d (Ctx& c, const std::string& dst,
++                                   const std::string& term);
++
++    /// Frame rewrites the point and recurses, so it returns the child's
++    /// expression rather than one of its own; the recursion goes through
++    /// the caller's emit_node, which is passed in.
++    static std::string emit_hep_frame_coords(Ctx& c, const FRepNode& n,
++        const std::string& x, const std::string& y, const std::string& z,
++        std::string& qx, std::string& qy, std::string& qz);
+ };
+ 
+ } // namespace frep::gpu
+diff --git a/core/gpu/glsl_hep.cpp b/core/gpu/glsl_hep.cpp
+new file mode 100644
+index 0000000..275fd4e
+--- /dev/null
++++ b/core/gpu/glsl_hep.cpp
+@@ -0,0 +1,493 @@
++// core/gpu/glsl_hep.cpp
++//
++// GLSL for the six HEP node types.
++//
++// Without these a converted detector cannot run on the GPU at all: the
++// emitter's switch does not know the kinds, and its plugin fallback
++// (FRepNode::emit_glsl) takes no coordinates - it hands the node its child
++// expressions and a name prefix, and its own example writes the literal
++// names x, y, z. That is correct for a node sitting at the root and wrong
++// under any transform, where the point arrives as t3_x or as a Frame's
++// rebuilt names. A primitive has to be told which expressions its
++// coordinates are, which is what the emitter's own switch does.
++//
++// Each body mirrors hep_codegen.cpp expression for expression and in the
++// same order, for the same reason that file mirrors eval(): three
++// descriptions of one solid that are only equal because they were written
++// to be. tests/test_glsl_hep.cpp checks the GLSL against the CPU rather
++// than trusting it.
++//
++// EVERY PARAMETER GOES THROUGH pval(), so a parameter the policy made a
++// runtime slot is read from the shared buffer and the shader source does
++// not change when its value does. That only started working for these kinds
++// when node_param_schema learned about them - before, they had no schema,
++// so slot_of() never matched and every parameter silently baked.
++//
++// ANGLES ARE FOLDED, as in the IR: phi0, dphi, theta0 and dtheta enter as
++// sines and cosines computed here in double and printed as literals. A
++// sin() of a buffer read would be possible but would make the GLSL and the
++// IR disagree the moment a policy promoted one of them.
++
++#include "core/frep/hep.hpp"
++#include "core/gpu/glsl_emitter.hpp"
++
++#include <cmath>
++#include <string>
++
++namespace frep::gpu {
++
++namespace {
++/// "(expr)" - parenthesised once, so the caller never has to think about it.
++std::string par(const std::string& e) { return "(" + e + ")"; }
++}  // namespace
++
++/// rho = sqrt(x*x + y*y), as an explicit sqrt rather than GLSL length().
++/// Same reason as emit_sphere: length() may lower to a reduced-precision
++/// reciprocal-sqrt sequence, which would shift every value on this node
++/// against the CPU by a systematic amount rather than at the last bit.
++std::string GlslEmitter::hep_rho(Ctx& c, const std::string& x,
++                                 const std::string& y) {
++    auto v = c.fresh("rho");
++    c.sdf_body << "    float " << v << " = sqrt(" << par(x) << "*" << par(x)
++               << " + " << par(y) << "*" << par(y) << ");\n";
++    return v;
++}
++
++/// The phi wedge, or an empty string when there is no cut - in which case
++/// the caller omits the term entirely, exactly as eval() and codegen() do.
++std::string GlslEmitter::hep_wedge(Ctx& c, const FRepNode& n,
++                                   const std::string& x,
++                                   const std::string& y) {
++    float sa, ca, sb, cb;
++    bool use_max = true;
++    if (!hep::wedge_coeffs<float>(float(n.params.at("phi0")),
++                                  float(n.params.at("dphi")), sa, ca, sb, cb,
++                                  use_max))
++        return {};
++    auto v = c.fresh("wd");
++    c.sdf_body << "    float " << v << " = " << (use_max ? "max" : "min") << "("
++               << par(x) << "*" << flit(sa) << " - " << par(y)
++               << "*" << flit(ca) << ", " << par(x) << "*"
++               << flit(sb) << " + " << par(y) << "*"
++               << flit(cb) << ");\n";
++    return v;
++}
++
++/// u = (z + hz) / (2 hz), the frustum interpolation.
++std::string GlslEmitter::hep_u(Ctx& c, const std::string& z,
++                               const std::string& hz) {
++    auto v = c.fresh("u");
++    c.sdf_body << "    float " << v << " = (" << par(z) << " + " << hz
++               << ") / (2.0 * " << hz << ");\n";
++    return v;
++}
++
++/// dst = max(dst, term)
++void GlslEmitter::hep_fold(Ctx& c, const std::string& dst,
++                           const std::string& term) {
++    c.sdf_body << "    " << dst << " = max(" << dst << ", " << term << ");\n";
++}
++
++// ── Tube ─────────────────────────────────────────────────────────────────────
++std::string GlslEmitter::emit_hep_tube(Ctx& c, const FRepNode& n,
++                                       const std::string& x,
++                                       const std::string& y,
++                                       const std::string& z) {
++    const std::string rho = hep_rho(c, x, y);
++    const std::string rmax = pval(c, n, "rmax"), hz = pval(c, n, "hz");
++    auto v = c.fresh("tube");
++    c.sdf_body << "    float " << v << " = max(" << rho << " - " << rmax
++               << ", abs(" << par(z) << ") - " << hz << ");\n";
++    if (n.params.at("rmin") > 0.0)
++        hep_fold(c, v, pval(c, n, "rmin") + " - " + rho);
++    if (auto w = hep_wedge(c, n, x, y); !w.empty()) hep_fold(c, v, w);
++    return v;
++}
++
++// ── Cone ─────────────────────────────────────────────────────────────────────
++std::string GlslEmitter::emit_hep_cone(Ctx& c, const FRepNode& n,
++                                       const std::string& x,
++                                       const std::string& y,
++                                       const std::string& z) {
++    const double hzf = n.params.at("hz");
++    const double a1 = n.params.at("rmax1"), a2 = n.params.at("rmax2");
++    const std::string hz = pval(c, n, "hz");
++    const std::string u = hep_u(c, z, hz);
++    const std::string rho = hep_rho(c, x, y);
++
++    auto Rmax = c.fresh("Rmax");
++    c.sdf_body << "    float " << Rmax << " = " << pval(c, n, "rmax1") << " + "
++               << flit(float(a2 - a1)) << " * " << u << ";\n";
++    auto v = c.fresh("cone");
++    c.sdf_body << "    float " << v << " = max((" << rho << " - " << Rmax
++               << ") / " << flit(hep::lat_scale<float>(a2 - a1, 2.0 * hzf))
++               << ", abs(" << par(z) << ") - " << hz << ");\n";
++
++    const double i1 = n.params.at("rmin1"), i2 = n.params.at("rmin2");
++    if (i1 > 0.0 || i2 > 0.0) {
++        auto Rmin = c.fresh("Rmin");
++        c.sdf_body << "    float " << Rmin << " = " << pval(c, n, "rmin1")
++                   << " + " << flit(float(i2 - i1)) << " * " << u << ";\n";
++        hep_fold(c, v,
++                 "(" + Rmin + " - " + rho + ") / " +
++                     flit(hep::lat_scale<float>(i2 - i1, 2.0 * hzf)));
++    }
++    if (auto w = hep_wedge(c, n, x, y); !w.empty()) hep_fold(c, v, w);
++    return v;
++}
++
++// ── SphericalShell ───────────────────────────────────────────────────────────
++std::string GlslEmitter::emit_hep_shell(Ctx& c, const FRepNode& n,
++                                        const std::string& x,
++                                        const std::string& y,
++                                        const std::string& z) {
++    const std::string rho = hep_rho(c, x, y);
++    // rad from rho, not from x,y,z - see hep.hpp. The order matters: this is
++    // a sqrt of a sum containing another sqrt, and reassociating it would
++    // move the last bits away from the CPU.
++    auto rad = c.fresh("rad");
++    c.sdf_body << "    float " << rad << " = sqrt(" << rho << "*" << rho
++               << " + " << par(z) << "*" << par(z) << ");\n";
++    auto v = c.fresh("shell");
++    c.sdf_body << "    float " << v << " = " << rad << " - "
++               << pval(c, n, "rmax") << ";\n";
++    if (n.params.at("rmin") > 0.0)
++        hep_fold(c, v, pval(c, n, "rmin") + " - " + rad);
++    if (auto w = hep_wedge(c, n, x, y); !w.empty()) hep_fold(c, v, w);
++
++    const double t0 = n.params.at("theta0");
++    const double t1 = t0 + n.params.at("dtheta");
++    auto cone = [&](double t, bool neg) {
++        const std::string e = rho + "*" + flit(float(std::cos(t))) + " - " +
++                              par(z) + "*" + flit(float(std::sin(t)));
++        return neg ? "-(" + e + ")" : "(" + e + ")";
++    };
++    if (t0 > 1e-6) hep_fold(c, v, cone(t0, true));
++    if (t1 < M_PI - 1e-6) hep_fold(c, v, cone(t1, false));
++    return v;
++}
++
++// ── Trapezoid ────────────────────────────────────────────────────────────────
++std::string GlslEmitter::emit_hep_trd(Ctx& c, const FRepNode& n,
++                                      const std::string& x,
++                                      const std::string& y,
++                                      const std::string& z) {
++    const double hzf = n.params.at("hz");
++    const std::string hz = pval(c, n, "hz");
++    const std::string u = hep_u(c, z, hz);
++    auto face = [&](const char* p0, double v0, double v1,
++                    const std::string& coord) {
++        auto half = c.fresh("half");
++        c.sdf_body << "    float " << half << " = " << pval(c, n, p0) << " + "
++                   << flit(float(v1 - v0)) << " * " << u << ";\n";
++        return "((abs(" + par(coord) + ") - " + half + ") / " +
++               flit(hep::lat_scale<float>(v1 - v0, 2.0 * hzf)) + ")";
++    };
++    const std::string fx =
++        face("dx1", n.params.at("dx1"), n.params.at("dx2"), x);
++    const std::string fy =
++        face("dy1", n.params.at("dy1"), n.params.at("dy2"), y);
++    auto v = c.fresh("trd");
++    c.sdf_body << "    float " << v << " = max(max(" << fx << ", " << fy
++               << "), abs(" << par(z) << ") - " << hz << ");\n";
++    return v;
++}
++
++// ── Polyhedron ───────────────────────────────────────────────────────────────
++std::string GlslEmitter::emit_hep_poly(Ctx& c, const FRepNode& n,
++                                       const std::string& x,
++                                       const std::string& y,
++                                       const std::string& z) {
++    const auto* p = static_cast<const hep::PolyhedronNode*>(&n);
++    const std::vector<double>& fc = p->faces();
++    // A max of linear functions, unrolled: branch-free, which is what every
++    // GPU backend wants, and in the same order the IR takes them.
++    auto r = c.fresh("pface");
++    c.sdf_body << "    float " << r << " = ";
++    for (std::size_t j = 0; j + 1 < fc.size(); j += 2) {
++        const std::string term = par(x) + "*" + flit(float(fc[j])) + " + " +
++                                 par(y) + "*" + flit(float(fc[j + 1]));
++        if (j == 0) c.sdf_body << "(" << term << ")";
++        else c.sdf_body << ";\n    " << r << " = max(" << r << ", " << term << ")";
++    }
++    c.sdf_body << ";\n";
++
++    const double hzf = n.params.at("hz");
++    const double a1 = n.params.at("rmax1"), a2 = n.params.at("rmax2");
++    const std::string hz = pval(c, n, "hz");
++    const std::string u = hep_u(c, z, hz);
++    auto Rmax = c.fresh("Rmax");
++    c.sdf_body << "    float " << Rmax << " = " << pval(c, n, "rmax1") << " + "
++               << flit(float(a2 - a1)) << " * " << u << ";\n";
++    auto v = c.fresh("poly");
++    c.sdf_body << "    float " << v << " = max((" << r << " - " << Rmax
++               << ") / " << flit(hep::lat_scale<float>(a2 - a1, 2.0 * hzf))
++               << ", abs(" << par(z) << ") - " << hz << ");\n";
++
++    const double i1 = n.params.at("rmin1"), i2 = n.params.at("rmin2");
++    if (i1 > 0.0 || i2 > 0.0) {
++        auto Rmin = c.fresh("Rmin");
++        c.sdf_body << "    float " << Rmin << " = " << pval(c, n, "rmin1")
++                   << " + " << flit(float(i2 - i1)) << " * " << u << ";\n";
++        hep_fold(c, v,
++                 "(" + Rmin + " - " + r + ") / " +
++                     flit(hep::lat_scale<float>(i2 - i1, 2.0 * hzf)));
++    }
++    if (auto w = hep_wedge(c, n, x, y); !w.empty()) hep_fold(c, v, w);
++    return v;
++}
++
++// ── Frame: q = R^T (p - t) ───────────────────────────────────────────────────
++std::string GlslEmitter::emit_hep_frame_coords(Ctx& c, const FRepNode& n,
++                                               const std::string& x,
++                                               const std::string& y,
++                                               const std::string& z,
++                                               std::string& qx, std::string& qy,
++                                               std::string& qz) {
++    auto dx = c.fresh("fdx"), dy = c.fresh("fdy"), dz = c.fresh("fdz");
++    c.sdf_body << "    float " << dx << " = " << par(x) << " - "
++               << pval(c, n, "tx") << ";\n"
++               << "    float " << dy << " = " << par(y) << " - "
++               << pval(c, n, "ty") << ";\n"
++               << "    float " << dz << " = " << par(z) << " - "
++               << pval(c, n, "tz") << ";\n";
++    auto row = [&](const char* a, const char* d, const char* g,
++                   const char* nm) {
++        auto q = c.fresh(nm);
++        c.sdf_body << "    float " << q << " = " << pval(c, n, a) << "*" << dx
++                   << " + " << pval(c, n, d) << "*" << dy << " + "
++                   << pval(c, n, g) << "*" << dz << ";\n";
++        return q;
++    };
++    qx = row("r0", "r3", "r6", "fqx");
++    qy = row("r1", "r4", "r7", "fqy");
++    qz = row("r2", "r5", "r8", "fqz");
++    return qx;
++}
++
++// ═════════════════════════════════════════════════════════════════════════════
++// The same six in dual arithmetic.
++//
++// Mirrors hep_ad.cpp, which mirrors hep_codegen.cpp, which mirrors eval_t.
++// Four descriptions of one solid, equal only because each was written
++// against the last; the tests are what make that a fact rather than a hope.
++//
++// d_max already picks the winning branch's gradient, so a max of pieces
++// carries the active piece's subgradient with no extra work - the same
++// property ad_ir::max has on the CPU.
++// ═════════════════════════════════════════════════════════════════════════════
++
++std::string GlslEmitter::hep_rho_d(Ctx& c, const std::string& x,
++                                   const std::string& y) {
++    auto v = c.fresh_d();
++    c.grad_body << "    Dual " << v << " = d_sqrt(d_add(d_mul(" << x << ", "
++                << x << "), d_mul(" << y << ", " << y << ")));\n";
++    return v;
++}
++
++std::string GlslEmitter::hep_wedge_d(Ctx& c, const FRepNode& n,
++                                     const std::string& x,
++                                     const std::string& y) {
++    float sa, ca, sb, cb;
++    bool use_max = true;
++    if (!hep::wedge_coeffs<float>(float(n.params.at("phi0")),
++                                  float(n.params.at("dphi")), sa, ca, sb, cb,
++                                  use_max))
++        return {};
++    auto v = c.fresh_d();
++    c.grad_body << "    Dual " << v << " = " << (use_max ? "d_max" : "d_min")
++                << "(d_sub(d_mul_s(" << x << ", " << flit(sa)
++                << "), d_mul_s(" << y << ", " << flit(ca)
++                << ")), d_add(d_mul_s(" << x << ", " << flit(sb)
++                << "), d_mul_s(" << y << ", " << flit(cb) << ")));\n";
++    return v;
++}
++
++std::string GlslEmitter::hep_u_d(Ctx& c, const std::string& z,
++                                 const std::string& hz) {
++    auto v = c.fresh_d();
++    c.grad_body << "    Dual " << v << " = d_div_s(d_add_s(" << z << ", " << hz
++                << "), 2.0 * " << hz << ");\n";
++    return v;
++}
++
++void GlslEmitter::hep_fold_d(Ctx& c, const std::string& dst,
++                             const std::string& term) {
++    c.grad_body << "    " << dst << " = d_max(" << dst << ", " << term
++                << ");\n";
++}
++
++// ── Tube ─────────────────────────────────────────────────────────────────────
++std::string GlslEmitter::emit_hep_tube_dual(Ctx& c, const FRepNode& n,
++                                            const std::string& x,
++                                            const std::string& y,
++                                            const std::string& z) {
++    const std::string rho = hep_rho_d(c, x, y);
++    auto v = c.fresh_d();
++    c.grad_body << "    Dual " << v << " = d_max(d_sub_s(" << rho << ", "
++                << pval(c, n, "rmax") << "), d_sub_s(d_abs(" << z << "), "
++                << pval(c, n, "hz") << "));\n";
++    if (n.params.at("rmin") > 0.0)
++        hep_fold_d(c, v, "d_neg(d_sub_s(" + rho + ", " + pval(c, n, "rmin") + "))");
++    if (auto w = hep_wedge_d(c, n, x, y); !w.empty()) hep_fold_d(c, v, w);
++    return v;
++}
++
++// ── Cone ─────────────────────────────────────────────────────────────────────
++std::string GlslEmitter::emit_hep_cone_dual(Ctx& c, const FRepNode& n,
++                                            const std::string& x,
++                                            const std::string& y,
++                                            const std::string& z) {
++    const double hzf = n.params.at("hz");
++    const double a1 = n.params.at("rmax1"), a2 = n.params.at("rmax2");
++    const std::string hz = pval(c, n, "hz");
++    const std::string u = hep_u_d(c, z, hz);
++    const std::string rho = hep_rho_d(c, x, y);
++    auto Rmax = c.fresh_d();
++    c.grad_body << "    Dual " << Rmax << " = d_add_s(d_mul_s(" << u << ", "
++                << flit(float(a2 - a1)) << "), " << pval(c, n, "rmax1")
++                << ");\n";
++    auto v = c.fresh_d();
++    c.grad_body << "    Dual " << v << " = d_max(d_div_s(d_sub(" << rho << ", "
++                << Rmax << "), " << flit(hep::lat_scale<float>(a2 - a1, 2.0 * hzf))
++                << "), d_sub_s(d_abs(" << z << "), " << hz << "));\n";
++    const double i1 = n.params.at("rmin1"), i2 = n.params.at("rmin2");
++    if (i1 > 0.0 || i2 > 0.0) {
++        auto Rmin = c.fresh_d();
++        c.grad_body << "    Dual " << Rmin << " = d_add_s(d_mul_s(" << u << ", "
++                    << flit(float(i2 - i1)) << "), " << pval(c, n, "rmin1")
++                    << ");\n";
++        hep_fold_d(c, v,
++                   "d_div_s(d_sub(" + Rmin + ", " + rho + "), " +
++                       flit(hep::lat_scale<float>(i2 - i1, 2.0 * hzf)) + ")");
++    }
++    if (auto w = hep_wedge_d(c, n, x, y); !w.empty()) hep_fold_d(c, v, w);
++    return v;
++}
++
++// ── SphericalShell ───────────────────────────────────────────────────────────
++std::string GlslEmitter::emit_hep_shell_dual(Ctx& c, const FRepNode& n,
++                                             const std::string& x,
++                                             const std::string& y,
++                                             const std::string& z) {
++    const std::string rho = hep_rho_d(c, x, y);
++    auto rad = c.fresh_d();
++    c.grad_body << "    Dual " << rad << " = d_sqrt(d_add(d_mul(" << rho << ", "
++                << rho << "), d_mul(" << z << ", " << z << ")));\n";
++    auto v = c.fresh_d();
++    c.grad_body << "    Dual " << v << " = d_sub_s(" << rad << ", "
++                << pval(c, n, "rmax") << ");\n";
++    if (n.params.at("rmin") > 0.0)
++        hep_fold_d(c, v, "d_neg(d_sub_s(" + rad + ", " + pval(c, n, "rmin") + "))");
++    if (auto w = hep_wedge_d(c, n, x, y); !w.empty()) hep_fold_d(c, v, w);
++
++    const double t0 = n.params.at("theta0");
++    const double t1 = t0 + n.params.at("dtheta");
++    auto cone = [&](double t, bool neg) {
++        const std::string e = "d_sub(d_mul_s(" + rho + ", " +
++                              flit(float(std::cos(t))) + "), d_mul_s(" + z +
++                              ", " + flit(float(std::sin(t))) + "))";
++        return neg ? "d_neg(" + e + ")" : e;
++    };
++    if (t0 > 1e-6) hep_fold_d(c, v, cone(t0, true));
++    if (t1 < M_PI - 1e-6) hep_fold_d(c, v, cone(t1, false));
++    return v;
++}
++
++// ── Trapezoid ────────────────────────────────────────────────────────────────
++std::string GlslEmitter::emit_hep_trd_dual(Ctx& c, const FRepNode& n,
++                                           const std::string& x,
++                                           const std::string& y,
++                                           const std::string& z) {
++    const double hzf = n.params.at("hz");
++    const std::string hz = pval(c, n, "hz");
++    const std::string u = hep_u_d(c, z, hz);
++    auto face = [&](const char* p0, double v0, double v1,
++                    const std::string& coord) {
++        auto half = c.fresh_d();
++        c.grad_body << "    Dual " << half << " = d_add_s(d_mul_s(" << u << ", "
++                    << flit(float(v1 - v0)) << "), " << pval(c, n, p0) << ");\n";
++        return "d_div_s(d_sub(d_abs(" + coord + "), " + half + "), " +
++               flit(hep::lat_scale<float>(v1 - v0, 2.0 * hzf)) + ")";
++    };
++    const std::string fx = face("dx1", n.params.at("dx1"), n.params.at("dx2"), x);
++    const std::string fy = face("dy1", n.params.at("dy1"), n.params.at("dy2"), y);
++    auto v = c.fresh_d();
++    c.grad_body << "    Dual " << v << " = d_max(d_max(" << fx << ", " << fy
++                << "), d_sub_s(d_abs(" << z << "), " << hz << "));\n";
++    return v;
++}
++
++// ── Polyhedron ───────────────────────────────────────────────────────────────
++std::string GlslEmitter::emit_hep_poly_dual(Ctx& c, const FRepNode& n,
++                                            const std::string& x,
++                                            const std::string& y,
++                                            const std::string& z) {
++    const auto* p = static_cast<const hep::PolyhedronNode*>(&n);
++    const std::vector<double>& fc = p->faces();
++    auto r = c.fresh_d();
++    for (std::size_t j = 0; j + 1 < fc.size(); j += 2) {
++        const std::string term = "d_add(d_mul_s(" + x + ", " +
++                                 flit(float(fc[j])) + "), d_mul_s(" + y + ", " +
++                                 flit(float(fc[j + 1])) + "))";
++        if (j == 0)
++            c.grad_body << "    Dual " << r << " = " << term << ";\n";
++        else
++            c.grad_body << "    " << r << " = d_max(" << r << ", " << term
++                        << ");\n";
++    }
++    const double hzf = n.params.at("hz");
++    const double a1 = n.params.at("rmax1"), a2 = n.params.at("rmax2");
++    const std::string hz = pval(c, n, "hz");
++    const std::string u = hep_u_d(c, z, hz);
++    auto Rmax = c.fresh_d();
++    c.grad_body << "    Dual " << Rmax << " = d_add_s(d_mul_s(" << u << ", "
++                << flit(float(a2 - a1)) << "), " << pval(c, n, "rmax1") << ");\n";
++    auto v = c.fresh_d();
++    c.grad_body << "    Dual " << v << " = d_max(d_div_s(d_sub(" << r << ", "
++                << Rmax << "), " << flit(hep::lat_scale<float>(a2 - a1, 2.0 * hzf))
++                << "), d_sub_s(d_abs(" << z << "), " << hz << "));\n";
++    const double i1 = n.params.at("rmin1"), i2 = n.params.at("rmin2");
++    if (i1 > 0.0 || i2 > 0.0) {
++        auto Rmin = c.fresh_d();
++        c.grad_body << "    Dual " << Rmin << " = d_add_s(d_mul_s(" << u << ", "
++                    << flit(float(i2 - i1)) << "), " << pval(c, n, "rmin1")
++                    << ");\n";
++        hep_fold_d(c, v,
++                   "d_div_s(d_sub(" + Rmin + ", " + r + "), " +
++                       flit(hep::lat_scale<float>(i2 - i1, 2.0 * hzf)) + ")");
++    }
++    if (auto w = hep_wedge_d(c, n, x, y); !w.empty()) hep_fold_d(c, v, w);
++    return v;
++}
++
++// ── Frame ────────────────────────────────────────────────────────────────────
++void GlslEmitter::emit_hep_frame_dual_coords(Ctx& c, const FRepNode& n,
++                                             const std::string& x,
++                                             const std::string& y,
++                                             const std::string& z,
++                                             std::string& qx, std::string& qy,
++                                             std::string& qz) {
++    // R is constant, so the duals transform by the same linear map and no
++    // Jacobian factor is needed; a rotation returns a unit gradient unit.
++    auto dx = c.fresh_d(), dy = c.fresh_d(), dz = c.fresh_d();
++    c.grad_body << "    Dual " << dx << " = d_sub_s(" << x << ", "
++                << pval(c, n, "tx") << ");\n"
++                << "    Dual " << dy << " = d_sub_s(" << y << ", "
++                << pval(c, n, "ty") << ");\n"
++                << "    Dual " << dz << " = d_sub_s(" << z << ", "
++                << pval(c, n, "tz") << ");\n";
++    auto row = [&](const char* a, const char* d, const char* g) {
++        auto q = c.fresh_d();
++        c.grad_body << "    Dual " << q << " = d_add(d_add(d_mul_s(" << dx
++                    << ", " << pval(c, n, a) << "), d_mul_s(" << dy << ", "
++                    << pval(c, n, d) << ")), d_mul_s(" << dz << ", "
++                    << pval(c, n, g) << "));\n";
++        return q;
++    };
++    qx = row("r0", "r3", "r6");
++    qy = row("r1", "r4", "r7");
++    qz = row("r2", "r5", "r8");
++}
++
++}  // namespace frep::gpu
+diff --git a/tests/test_glsl_hep.cpp b/tests/test_glsl_hep.cpp
+new file mode 100644
+index 0000000..7105066
+--- /dev/null
++++ b/tests/test_glsl_hep.cpp
+@@ -0,0 +1,158 @@
++// tests/test_glsl_hep.cpp
++//
++// The six HEP node types on the GPU path.
++//
++//   A  They EMIT. Before this, the emitter's switch did not know the kinds
++//      and the plugin fallback could not serve them (it is handed child
++//      expressions and a name prefix, never the coordinates), so a converted
++//      detector could not reach the GPU at all.
++//   B  The emitted GLSL COMPILES to SPIR-V. String-built shader source fails
++//      at the first type slip, and nothing else in the build catches it.
++//   C  It RUNS, and agrees with the CPU. A shader that compiles can still be
++//      the wrong solid; this container has lavapipe, so the comparison is a
++//      real one rather than a promise about hardware elsewhere.
++//   D  The normals are ANALYTIC. Every kind needs a dual emitter or the
++//      whole scene falls back to central differences - the same defect
++//      measured on the CPU, where a Tube's |grad| reached 1.092 at 10 m.
++
++#include "core/exec/cpu_executor.hpp"
++#include "core/exec/multipath.hpp"
++#include "core/exec/gpu_executor.hpp"
++#include "core/frep/hep.hpp"
++#include "core/frep/operations.hpp"
++#include "core/gpu/glsl_compile.hpp"
++#include "core/gpu/glsl_emitter.hpp"
++#include "core/gpu/vulkan_ctx.hpp"
++
++#include <gtest/gtest.h>
++
++#include <cmath>
++#include <filesystem>
++#include <system_error>
++#include <cstdio>
++#include <memory>
++#include <string>
++#include <vector>
++
++using namespace frep;
++
++namespace {
++
++/// Detector-shaped, and small enough to render fast on a software device.
++SceneGraph hep_scene() {
++    SceneGraph s;
++    s.add_object(std::make_shared<hep::TubeNode>(0.45, 0.9, 1.1, 0.0, 7.0));
++    s.add_object(std::make_shared<hep::ConeNode>(0.1, 0.5, 0.2, 0.8, 0.9, 0.0,
++                                                 7.0));
++    s.add_object(std::make_shared<hep::SphericalShellNode>(0.6, 0.85, 0.0, 7.0,
++                                                           0.4, 2.2));
++    s.add_object(std::make_shared<hep::TrapezoidNode>(0.3, 0.6, 0.2, 0.5, 0.8));
++    s.add_object(std::make_shared<hep::PolyhedronNode>(0.2, 0.7, 0.3, 0.9, 1.0,
++                                                       0.13, 7.0, 6));
++    {
++        const double r[9] = {0.8, 0.0, 0.6, 0.0, 1.0, 0.0, -0.6, 0.0, 0.8};
++        s.add_object(std::make_shared<hep::FrameNode>(
++            std::make_shared<hep::TubeNode>(0.0, 0.4, 0.7, 0.0, 7.0), r, 0.3,
++            -0.2, 0.1));
++    }
++    return s;
++}
++
++bool glslang_available() { return !gpu::find_glslang().empty(); }
++
++struct Diff { double max_abs = 0.0; double mean_abs = 0.0; long over = 0; };
++
++Diff compare(const std::vector<float>& a, const std::vector<float>& b,
++             double tol) {
++    Diff d;
++    const std::size_t n = std::min(a.size(), b.size());
++    double sum = 0.0;
++    for (std::size_t i = 0; i < n; ++i) {
++        const double e = std::fabs(double(a[i]) - double(b[i]));
++        d.max_abs = std::max(d.max_abs, e);
++        sum += e;
++        if (e > tol) ++d.over;
++    }
++    d.mean_abs = n ? sum / double(n) : 0.0;
++    return d;
++}
++
++}  // namespace
++
++TEST(GlslHep, AllSixKindsEmitWithoutFallingBack) {
++    auto emitted = gpu::GlslEmitter::emit(hep_scene());
++    ASSERT_TRUE(emitted.has_value()) << emitted.error();
++    const std::string& src = emitted->source;
++
++    // Each kind leaves a recognisable trace. Checking for the VARIABLE name
++    // prefixes rather than for arbitrary substrings, because those come from
++    // the emitters themselves and change if a kind silently stops emitting.
++    for (const char* marker : {"tube", "cone", "shell", "trd", "poly", "fqx"})
++        EXPECT_NE(src.find(marker), std::string::npos)
++            << "no trace of " << marker << " in the emitted shader";
++
++    // A CustomExpr or a bail-out would show up as the emitter refusing.
++    EXPECT_EQ(src.find("unsupported node type"), std::string::npos);
++}
++
++TEST(GlslHep, TheNormalsAreAnalyticNotCentralDifferences) {
++    auto emitted = gpu::GlslEmitter::emit(hep_scene());
++    ASSERT_TRUE(emitted.has_value()) << emitted.error();
++    const std::string& src = emitted->source;
++
++    EXPECT_NE(src.find("Dual scene_sdf_grad"), std::string::npos)
++        << "the dual path was abandoned - some HEP kind has no dual emitter";
++    EXPECT_NE(src.find("scene_sdf_grad(p).g"), std::string::npos);
++    EXPECT_EQ(src.find("scene_sdf_v(p + vec3(h,0,0))"), std::string::npos)
++        << "central-difference normal leaked into a scene that has duals";
++    // The helpers the HEP duals need must be in the preamble.
++    EXPECT_NE(src.find("Dual d_div_s"), std::string::npos);
++    EXPECT_NE(src.find("Dual d_abs"), std::string::npos);
++}
++
++TEST(GlslHep, TheEmittedShaderCompilesToSpirv) {
++    auto emitted = gpu::GlslEmitter::emit(hep_scene());
++    ASSERT_TRUE(emitted.has_value()) << emitted.error();
++    if (!glslang_available()) GTEST_SKIP() << "glslangValidator not on PATH";
++    auto spv = gpu::compile_glsl_to_spv(emitted->source);
++    ASSERT_TRUE(spv.has_value()) << spv.error();
++    // compile_glsl_to_spv returns the PATH of the .spv, not its contents -
++    // spv->size() is the length of a filename. Measuring that and calling it
++    // a shader size is how a test ends up reporting 25 words for a 16208
++    // word module, which is what the first version of this line did.
++    std::error_code ec;
++    const auto bytes = std::filesystem::file_size(*spv, ec);
++    ASSERT_FALSE(ec) << "no .spv at " << *spv;
++    EXPECT_GT(bytes, 1024u) << "a real module, not an empty file";
++    std::printf("  SPIR-V: %zu words from %zu chars of GLSL\n",
++                std::size_t(bytes / 4), emitted->source.size());
++    std::filesystem::remove(*spv, ec);
++}
++
++TEST(GlslHep, TheGpuAgreesWithTheCpuOnHepGeometry) {
++    if (!gpu::VulkanCtx::available()) GTEST_SKIP() << "no Vulkan device";
++    if (!glslang_available()) GTEST_SKIP() << "glslangValidator not on PATH";
++
++    const SceneGraph s = hep_scene();
++    const int W = 96, H = 72;
++
++    exec::CpuIrExecutor cpu_exec;
++    auto rc = cpu_exec.render(s, W, H, exec::Tile{0, 0, W, H});
++    ASSERT_TRUE(rc.ok) << rc.error;
++
++    exec::GpuGlslExecutor gpu_exec;
++    auto rg = gpu_exec.render(s, W, H, exec::Tile{0, 0, W, H});
++    ASSERT_TRUE(rg.ok) << rg.error;
++
++    ASSERT_EQ(rc.rgba.size(), rg.rgba.size());
++    // A shading pipeline, not a distance query: the two paths round
++    // differently at every stage, so the statement is that they render the
++    // SAME PICTURE, not the same bits. A wrong solid or a wrong normal moves
++    // whole regions and shows up in the max; f32 divergence does not.
++    const Diff d = compare(rc.rgba, rg.rgba, 0.05);
++    std::printf("  CPU vs GLSL over %zu channels: max %.4f, mean %.5f, "
++                "%ld past 0.05\n", rc.rgba.size(), d.max_abs, d.mean_abs,
++                d.over);
++    EXPECT_LT(d.mean_abs, 0.02);
++    EXPECT_LT(double(d.over) / double(rc.rgba.size()), 0.02);
++}
+-- 
+2.43.0
+

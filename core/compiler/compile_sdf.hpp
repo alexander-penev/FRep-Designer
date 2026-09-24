@@ -15,7 +15,9 @@
 #include <expected>
 #include <memory>
 #include <vector>
+#include <algorithm>
 #include <cmath>
+#include <utility>
 #include <string>
 namespace frep::jit {
 
@@ -59,6 +61,8 @@ inline unsigned native_simd_width() {
 }
 
 using SceneSdfSimdFn = void (*)(const float*, const float*, const float*, float*);
+using SceneSdfSimdFn64 = void (*)(const double*, const double*, const double*,
+                                  double*);
 
 struct CompiledSdfSimd {
     SceneSdfSimdFn             fn = nullptr;
@@ -66,9 +70,24 @@ struct CompiledSdfSimd {
     std::unique_ptr<JitEngine> engine;
 };
 
-inline std::expected<CompiledSdfSimd, std::string>
-compile_scene_sdf_simd(const SceneGraph& scene, unsigned width = 0) {
-    if (width == 0) width = native_simd_width();
+struct CompiledSdfSimd64 {
+    SceneSdfSimdFn64           fn = nullptr;
+    unsigned                   width = 0;
+    std::unique_ptr<JitEngine> engine;
+};
+
+namespace detail {
+
+/// One emitter for both lane types. The f32 and f64 vector paths differ only
+/// in CgCtx::scalar and the element type, so writing them twice would let
+/// them describe different solids; this way they cannot.
+///
+/// `width` is the LANE COUNT, not the register width. Comparing the types
+/// fairly means equal REGISTER bytes - f32 at 8 lanes against f64 at 4 - so
+/// the caller picks, and the benchmark in tests/test_simd_scalar_type.cpp
+/// says which comparison it is making.
+inline std::expected<std::pair<void*, std::unique_ptr<JitEngine>>, std::string>
+emit_simd(const SceneGraph& scene, unsigned width, ScalarKind sk) {
     std::vector<FRepNode::Ptr> geoms;
     for (auto& [id, obj] : scene.objects())
         if (obj.visible) geoms.push_back(obj.geometry);
@@ -78,7 +97,9 @@ compile_scene_sdf_simd(const SceneGraph& scene, unsigned width = 0) {
     auto ctx = std::make_unique<llvm::LLVMContext>();
     auto mod = std::make_unique<llvm::Module>("bench_simd", *ctx);
     auto& C = *ctx;
-    auto* vt  = llvm::VectorType::get(llvm::Type::getFloatTy(C), width, false);
+    const bool wide = (sk == ScalarKind::F64);
+    auto* et  = wide ? llvm::Type::getDoubleTy(C) : llvm::Type::getFloatTy(C);
+    auto* vt  = llvm::VectorType::get(et, width, false);
     auto* pf  = llvm::PointerType::getUnqual(C);
     auto* fty = llvm::FunctionType::get(llvm::Type::getVoidTy(C), {pf,pf,pf,pf}, false);
     auto* fn  = llvm::Function::Create(fty, llvm::Function::ExternalLinkage,
@@ -88,19 +109,43 @@ compile_scene_sdf_simd(const SceneGraph& scene, unsigned width = 0) {
     llvm::Value *pX=&*it++, *pY=&*it++, *pZ=&*it++, *pO=&*it++;
     auto* bb = llvm::BasicBlock::Create(C, "entry", fn);
     llvm::IRBuilder<> b(bb);
-    auto ld = [&](llvm::Value* p){ return b.CreateAlignedLoad(vt, p, llvm::MaybeAlign(4)); };
-    CgCtx cg{C, *mod, b}; cg.width = width;
+    const unsigned al = wide ? 8u : 4u;
+    auto ld = [&](llvm::Value* p){ return b.CreateAlignedLoad(vt, p, llvm::MaybeAlign(al)); };
+    CgCtx cg{C, *mod, b}; cg.width = width; cg.scalar = sk;
     auto r = root->codegen(cg, ld(pX), ld(pY), ld(pZ));
     if (!r) return std::unexpected("codegen failed");
-    b.CreateAlignedStore(r, pO, llvm::MaybeAlign(4));
+    b.CreateAlignedStore(r, pO, llvm::MaybeAlign(al));
     b.CreateRetVoid();
     if (llvm::verifyFunction(*fn, &llvm::errs()))
         return std::unexpected("verify failed");
 
     auto eng = std::make_unique<JitEngine>();
-    auto jf = eng->load_as<SceneSdfSimdFn>(std::move(mod), std::move(ctx), "scene_sdf_simd");
+    auto jf = eng->load_as<void*>(std::move(mod), std::move(ctx), "scene_sdf_simd");
     if (!jf) return std::unexpected(jf.error());
-    return CompiledSdfSimd{*jf, width, std::move(eng)};
+    return std::make_pair(reinterpret_cast<void*>(*jf), std::move(eng));
+}
+
+}  // namespace detail
+
+inline std::expected<CompiledSdfSimd, std::string>
+compile_scene_sdf_simd(const SceneGraph& scene, unsigned width = 0) {
+    if (width == 0) width = native_simd_width();
+    auto r = detail::emit_simd(scene, width, ScalarKind::F32);
+    if (!r) return std::unexpected(r.error());
+    return CompiledSdfSimd{reinterpret_cast<SceneSdfSimdFn>(r->first), width,
+                           std::move(r->second)};
+}
+
+/// The same, in double lanes. Default width is HALF the native float width,
+/// so the vector register holds the same number of bytes and the comparison
+/// is register-for-register rather than lane-for-lane.
+inline std::expected<CompiledSdfSimd64, std::string>
+compile_scene_sdf_simd_f64(const SceneGraph& scene, unsigned width = 0) {
+    if (width == 0) width = std::max(2u, native_simd_width() / 2u);
+    auto r = detail::emit_simd(scene, width, ScalarKind::F64);
+    if (!r) return std::unexpected(r.error());
+    return CompiledSdfSimd64{reinterpret_cast<SceneSdfSimdFn64>(r->first), width,
+                             std::move(r->second)};
 }
 
 // Interval SDF (single CustomExprNode). fn(B[6],O[2]) with B=[xlo,xhi,...],

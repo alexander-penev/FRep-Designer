@@ -126,7 +126,7 @@ private:
     }
 
     float pf(const FRepNode& n, const char* k, float d) {
-        auto it = n.params.find(k); return it != n.params.end() ? it->second : d;
+        return float(n.params.value_or(k, double(d)));
     }
 
     // ── Node dispatch (mirrors node_interval() in node_interval.hpp) ──────────

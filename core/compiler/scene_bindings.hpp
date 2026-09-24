@@ -18,7 +18,7 @@ namespace frep {
 // table builder free of any node.hpp (LLVM) dependency.
 inline ParamBindingTable::NodeView to_view(const FRepNode& n) {
     ParamBindingTable::NodeView v;
-    v.kind   = static_cast<int>(n.kind);
+    v.kind   = n.kind;
     v.id     = n.id;
     v.params = &n.params;
     v.children.reserve(n.children.size());
@@ -33,7 +33,7 @@ inline ParamBindingTable::NodeView to_view(const FRepNode& n) {
 inline ParamBindingTable build_bindings(const SceneGraph& scene,
                                         const CompilePolicy& policy) {
     ParamBindingTable::NodeView root;
-    root.kind = pk::Scene;
+    root.kind = NodeKind::Scene;
     root.id   = "$scene";
     for (const auto& [id, obj] : scene.objects()) {
         if (!obj.visible || !obj.geometry) continue;

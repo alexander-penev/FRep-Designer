@@ -96,9 +96,9 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
     if (name == "sqrt") {
         // Domain-safe: sqrt of a negative (from imported expressions that assume
         // clamped domains) would be NaN. Clamp the argument at 0 like libfive.
-        auto* mx0 = llvm::Intrinsic::getDeclaration(
+        auto* mx0 = frep::llvm_compat::get_declaration(
             mod_, llvm::Intrinsic::maxnum, {b.getFloatTy()});
-        auto* S = llvm::Intrinsic::getDeclaration(
+        auto* S = frep::llvm_compat::get_declaration(
             mod_, llvm::Intrinsic::sqrt, {b.getFloatTy()});
         return b.CreateCall(S, {b.CreateCall(mx0,
             {args[0], llvm::ConstantFP::get(b.getFloatTy(), 0.0f)})});
@@ -120,9 +120,9 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
         // case is unchanged. The extra fabs/copysign cost is negligible next to
         // the pow itself; scenes with hundreds of pow calls (gears) are expensive
         // to compile regardless, because of their sheer expression size.
-        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {b.getFloatTy()});
-        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {b.getFloatTy()});
-        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {b.getFloatTy()});
+        auto* P  = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::pow, {b.getFloatTy()});
+        auto* fa = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::fabs, {b.getFloatTy()});
+        auto* cs = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::copysign, {b.getFloatTy()});
         auto* mag = b.CreateCall(P, {b.CreateCall(fa, {args[0]}), args[1]});
         return b.CreateCall(cs, {mag, args[0]});
     }
@@ -131,9 +131,9 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
         // This is what libfive's OP_NTH_ROOT does; the converter emits it (rather
         // than pow(a,1/b), which is NaN for a negative base). Plain pow stays the
         // raw fast intrinsic — only genuine nth-roots pay for the sign handling.
-        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {b.getFloatTy()});
-        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {b.getFloatTy()});
-        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {b.getFloatTy()});
+        auto* P  = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::pow, {b.getFloatTy()});
+        auto* fa = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::fabs, {b.getFloatTy()});
+        auto* cs = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::copysign, {b.getFloatTy()});
         auto* inv = b.CreateFDiv(llvm::ConstantFP::get(b.getFloatTy(), 1.0f), args[1]);
         auto* mag = b.CreateCall(P, {b.CreateCall(fa, {args[0]}), inv});
         return b.CreateCall(cs, {mag, args[0]});
@@ -151,8 +151,8 @@ llvm::Value* CustomExprCompiler::gen_call(const expr::Node& n) {
     };
     // clamp helper for inverse-trig domain [-1, 1]
     auto clamp_unit = [&](llvm::Value* v) {
-        auto* mn = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::minnum, {b.getFloatTy()});
-        auto* mx = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::maxnum, {b.getFloatTy()});
+        auto* mn = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::minnum, {b.getFloatTy()});
+        auto* mx = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::maxnum, {b.getFloatTy()});
         auto* lo = b.CreateCall(mx, {v, llvm::ConstantFP::get(b.getFloatTy(), -1.0f)});
         return b.CreateCall(mn, {lo, llvm::ConstantFP::get(b.getFloatTy(), 1.0f)});
     };
@@ -229,9 +229,9 @@ CustomExprCompiler::gen_ival(const expr::Node& n) {
     auto& b = *b_;
     auto k = [&](float v){ return fc(v); };
     auto mn = [&](llvm::Value* a, llvm::Value* c){
-        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::minnum,{b.getFloatTy()}),{a,c}); };
+        return b.CreateCall(frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::minnum,{b.getFloatTy()}),{a,c}); };
     auto mx = [&](llvm::Value* a, llvm::Value* c){
-        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::maxnum,{b.getFloatTy()}),{a,c}); };
+        return b.CreateCall(frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::maxnum,{b.getFloatTy()}),{a,c}); };
     std::pair<llvm::Value*,llvm::Value*> out{nullptr,nullptr};
     switch (n.kind) {
         case Kind::Number: out = {k(n.num), k(n.num)}; break;
@@ -284,11 +284,11 @@ CustomExprCompiler::gen_call_ival(const expr::Node& n) {
     auto& b = *b_;
     const auto& nm = n.ident;
     auto I=[&](llvm::Intrinsic::ID id,llvm::Value* v){
-        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,id,{b.getFloatTy()}),{v}); };
+        return b.CreateCall(frep::llvm_compat::get_declaration(mod_,id,{b.getFloatTy()}),{v}); };
     auto mn=[&](llvm::Value* a,llvm::Value* c){
-        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::minnum,{b.getFloatTy()}),{a,c}); };
+        return b.CreateCall(frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::minnum,{b.getFloatTy()}),{a,c}); };
     auto mx=[&](llvm::Value* a,llvm::Value* c){
-        return b.CreateCall(llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::maxnum,{b.getFloatTy()}),{a,c}); };
+        return b.CreateCall(frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::maxnum,{b.getFloatTy()}),{a,c}); };
     std::vector<std::pair<llvm::Value*,llvm::Value*>> a;
     for (auto& c:n.children){ auto p=gen_ival(*c); if(!p.first) return {}; a.push_back(p); }
     if (nm=="sqrt"){ auto lo=mx(a[0].first, fc(0.0f));
@@ -300,13 +300,13 @@ CustomExprCompiler::gen_call_ival(const expr::Node& n) {
     if (nm=="min") return {mn(a[0].first,a[1].first), mn(a[0].second,a[1].second)};
     if (nm=="max") return {mx(a[0].first,a[1].first), mx(a[0].second,a[1].second)};
     if (nm=="pow"){ // constant exponent, non-negative base (holds for the blend h^k)
-        auto*P=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::pow,{b.getFloatTy()});
+        auto*P=frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::pow,{b.getFloatTy()});
         auto lo=mx(a[0].first,fc(0.0f)), hi=mx(a[0].second,fc(0.0f));
         return {b.CreateCall(P,{lo,a[1].first}), b.CreateCall(P,{hi,a[1].second})}; }
     if (nm=="nth_root"){ // b-th root: monotone increasing in the base for b>0
-        auto*P=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::pow,{b.getFloatTy()});
-        auto*fa=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::fabs,{b.getFloatTy()});
-        auto*cs=llvm::Intrinsic::getDeclaration(mod_,llvm::Intrinsic::copysign,{b.getFloatTy()});
+        auto*P=frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::pow,{b.getFloatTy()});
+        auto*fa=frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::fabs,{b.getFloatTy()});
+        auto*cs=frep::llvm_compat::get_declaration(mod_,llvm::Intrinsic::copysign,{b.getFloatTy()});
         auto invlo=b.CreateFDiv(fc(1.0f),a[1].first), invhi=b.CreateFDiv(fc(1.0f),a[1].second);
         auto lo=b.CreateCall(cs,{b.CreateCall(P,{b.CreateCall(fa,{a[0].first}),invlo}),a[0].first});
         auto hi=b.CreateCall(cs,{b.CreateCall(P,{b.CreateCall(fa,{a[0].second}),invhi}),a[0].second});
@@ -424,7 +424,7 @@ struct VPoly {
     llvm::Value* fma(llvm::Value* a, llvm::Value* x, llvm::Value* c){
         return b.CreateFAdd(b.CreateFMul(a, x), c); }
     llvm::Value* intr(llvm::Intrinsic::ID id, llvm::Value* x){
-        return b.CreateCall(llvm::Intrinsic::getDeclaration(
+        return b.CreateCall(frep::llvm_compat::get_declaration(
             b.GetInsertBlock()->getModule(), id, {vt}), {x}); }
     // sin/cos via reduction to [-pi/4,pi/4] + quadrant swap (accurate to ~1e-6).
     void sincos(llvm::Value* x, llvm::Value** so, llvm::Value** co){
@@ -503,7 +503,7 @@ llvm::Value* CustomExprCompiler::gen_call_vec(const expr::Node& n) {
     }
     auto* vt = vty(*ctx_, vw_);
     auto vintr = [&](llvm::Intrinsic::ID id) {
-        auto* f = llvm::Intrinsic::getDeclaration(mod_, id, {vt});
+        auto* f = frep::llvm_compat::get_declaration(mod_, id, {vt});
         return a.size() == 2 ? b.CreateCall(f, {a[0], a[1]})
                              : b.CreateCall(f, {a[0]});
     };
@@ -519,17 +519,17 @@ llvm::Value* CustomExprCompiler::gen_call_vec(const expr::Node& n) {
     if (nm == "ceil")  return vintr(llvm::Intrinsic::ceil);
     if (nm == "pow") {
         // Match the scalar path's domain-safe pow: copysign(|a|^b, a).
-        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {a[0]->getType()});
-        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {a[0]->getType()});
-        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {a[0]->getType()});
+        auto* P  = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::pow, {a[0]->getType()});
+        auto* fa = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::fabs, {a[0]->getType()});
+        auto* cs = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::copysign, {a[0]->getType()});
         auto* mag = b.CreateCall(P, {b.CreateCall(fa, {a[0]}), a[1]});
         return b.CreateCall(cs, {mag, a[0]});
     }
     if (nm == "nth_root") {
         // copysign(|a|^(1/b), a), vector-wide.
-        auto* P  = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::pow, {a[0]->getType()});
-        auto* fa = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::fabs, {a[0]->getType()});
-        auto* cs = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::copysign, {a[0]->getType()});
+        auto* P  = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::pow, {a[0]->getType()});
+        auto* fa = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::fabs, {a[0]->getType()});
+        auto* cs = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::copysign, {a[0]->getType()});
         auto* one = llvm::ConstantFP::get(a[0]->getType(), 1.0f);
         auto* inv = b.CreateFDiv(one, a[1]);
         auto* mag = b.CreateCall(P, {b.CreateCall(fa, {a[0]}), inv});
@@ -544,7 +544,7 @@ llvm::Value* CustomExprCompiler::gen_call_vec(const expr::Node& n) {
     if (nm == "atan")  return vp.atan(a[0]);
     if (nm == "atan2") return vp.atan2(a[0], a[1]);
     if (nm == "mod") {  // x - floor(x/y)*y  (matches fmod for y>0; SIMD-friendly)
-        auto* ff = llvm::Intrinsic::getDeclaration(mod_, llvm::Intrinsic::floor, {vt});
+        auto* ff = frep::llvm_compat::get_declaration(mod_, llvm::Intrinsic::floor, {vt});
         auto flq = b.CreateCall(ff, {b.CreateFDiv(a[0], a[1])});
         return b.CreateFSub(a[0], b.CreateFMul(flq, a[1]));
     }
@@ -674,24 +674,26 @@ llvm::Function* CustomExprCompiler::compile(llvm::Module&       mod,
 // Back-end #2: CPU evaluation (direct AST interpretation)
 // ═════════════════════════════════════════════════════════════════════════════
 
-float CustomExprNode::eval_ast(const expr::Node& n, float x, float y, float z) {
+template <class T>
+T CustomExprNode::eval_ast(const expr::Node& n, T x, T y, T z) {
+    using S = ScalarTraits<T>;
     using Kind = expr::Node::Kind;
     switch (n.kind) {
-        case Kind::Number: return n.num;
+        case Kind::Number: return S::from(n.num);
         case Kind::Var:
             if (n.ident == "x") return x;
             if (n.ident == "y") return y;
             if (n.ident == "z") return z;
             throw std::runtime_error("unknown variable '" + n.ident + "'");
         case Kind::Const:
-            if (n.ident == "pi") return std::numbers::pi_v<float>;
-            if (n.ident == "e")  return std::numbers::e_v<float>;
+            if (n.ident == "pi") return S::from(std::numbers::pi_v<double>);
+            if (n.ident == "e")  return S::from(std::numbers::e_v<double>);
             throw std::runtime_error("unknown constant '" + n.ident + "'");
         case Kind::UnaryNeg:
-            return -eval_ast(*n.children[0], x, y, z);
+            return -eval_ast<T>(*n.children[0], x, y, z);
         case Kind::BinOp: {
-            float l = eval_ast(*n.children[0], x, y, z);
-            float r = eval_ast(*n.children[1], x, y, z);
+            const T l = eval_ast<T>(*n.children[0], x, y, z);
+            const T r = eval_ast<T>(*n.children[1], x, y, z);
             switch (n.bop) {
                 case expr::Op::Add: return l + r;
                 case expr::Op::Sub: return l - r;
@@ -702,8 +704,10 @@ float CustomExprNode::eval_ast(const expr::Node& n, float x, float y, float z) {
         }
         case Kind::Call: {
             const auto& name = n.ident;
-            // Eval args first.
-            float a0 = eval_ast(*n.children[0], x, y, z);
+            // Eval args first. std::sin of a T picks sinf for float and sin
+            // for double, so each type gets its own libm entry point rather
+            // than a widened float one.
+            const T a0 = eval_ast<T>(*n.children[0], x, y, z);
             if (name == "sin")   return std::sin(a0);
             if (name == "cos")   return std::cos(a0);
             if (name == "tan")   return std::tan(a0);
@@ -716,9 +720,10 @@ float CustomExprNode::eval_ast(const expr::Node& n, float x, float y, float z) {
             if (name == "acos")  return std::acos(a0);
             if (name == "atan")  return std::atan(a0);
             if (name == "ceil")  return std::ceil(a0);
-            float a1 = eval_ast(*n.children[1], x, y, z);
+            const T a1 = eval_ast<T>(*n.children[1], x, y, z);
             if (name == "pow")   return std::copysign(std::pow(std::fabs(a0), a1), a0);
-            if (name == "nth_root") return std::copysign(std::pow(std::fabs(a0), 1.0f/a1), a0);
+            if (name == "nth_root")
+                return std::copysign(std::pow(std::fabs(a0), S::from(1.0)/a1), a0);
             if (name == "min")   return std::fmin(a0, a1);
             if (name == "max")   return std::fmax(a0, a1);
             if (name == "atan2") return std::atan2(a0, a1);
@@ -728,6 +733,9 @@ float CustomExprNode::eval_ast(const expr::Node& n, float x, float y, float z) {
     }
     throw std::runtime_error("unhandled AST kind in eval");
 }
+
+template float  CustomExprNode::eval_ast<float>(const expr::Node&, float, float, float);
+template double CustomExprNode::eval_ast<double>(const expr::Node&, double, double, double);
 
 
 // ═════════════════════════════════════════════════════════════════════════════

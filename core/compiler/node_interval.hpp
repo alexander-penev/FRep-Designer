@@ -66,7 +66,7 @@ inline Iv expr_interval(const expr::Node& n, Iv X, Iv Y, Iv Z) {
     using namespace ivdetail;
     using K = expr::Node::Kind;
     switch (n.kind) {
-        case K::Number: return {n.num, n.num};
+        case K::Number: { const float v = float(n.num); return {v, v}; }
         case K::Const:  { float v = n.ident=="pi"?3.14159265359f:2.71828182846f; return {v,v}; }
         case K::Var:    return n.ident=="x"?X : n.ident=="y"?Y : Z;
         case K::UnaryNeg: return neg(expr_interval(*n.children[0],X,Y,Z));
@@ -102,7 +102,9 @@ inline Iv expr_interval(const expr::Node& n, Iv X, Iv Y, Iv Z) {
 // Interval bound of a node tree over box [lo,hi] (mirrors NodeIntervalEmitter).
 inline Iv node_interval(const FRepNode& n, Iv X, Iv Y, Iv Z) {
     using namespace ivdetail;
-    auto pf = [&](const char* k, float d){ auto it=n.params.find(k); return it!=n.params.end()?it->second:d; };
+    auto pf = [&](const char* k, float d) -> float {
+        return float(n.params.value_or(k, double(d)));
+    };
     switch (n.kind) {
         case NodeKind::Sphere: {
             Iv s = add(add(sqr(X), sqr(Y)), sqr(Z));

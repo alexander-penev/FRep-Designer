@@ -36,12 +36,25 @@
 
 #include <array>
 #include <expected>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace frep::gpu {
+
+/// A float literal with enough precision to round-trip, and always parseable
+/// by GLSL as a float. In the header because glsl_hep.cpp needs it too.
+inline std::string flit(float v) {
+    std::ostringstream os;
+    os << std::setprecision(9) << v;
+    std::string s = os.str();
+    if (s.find('.') == std::string::npos && s.find('e') == std::string::npos &&
+        s.find('E') == std::string::npos)
+        s += ".0";
+    return s;
+}
 
 // One scene-translation result.
 struct GlslEmitResult {
@@ -233,6 +246,75 @@ private:
     // interpolation against the global voxel storage buffer.
     static std::string emit_mesh_sdf (Ctx& c, const FRepNode& n,
         const std::string& x, const std::string& y, const std::string& z);
+
+    // ── HEP primitives (core/gpu/glsl_hep.cpp) ─────────────────────────────
+    //
+    // In the emitter's own switch rather than through FRepNode::emit_glsl,
+    // the plugin hook. That hook takes no coordinates: it gets the child
+    // expressions and a name prefix, and the example in its comment writes
+    // the literal names x, y and z. That is fine for a node under no
+    // transform and wrong under one, where the point arrives as t3_x or a
+    // Frame's rebuilt names. A primitive must be told WHICH expressions its
+    // coordinates are, so these take x, y, z like every other primitive.
+    //
+    // Each mirrors hep_codegen.cpp expression for expression, so the GLSL
+    // and the IR describe the same solid; test_glsl_hep.cpp checks them
+    // against the CPU rather than trusting that they do.
+    // Shared by the HEP emitters. Private statics rather than file-local
+    // helpers because Ctx is a private nested type.
+    static std::string hep_rho  (Ctx& c, const std::string& x,
+                                 const std::string& y);
+    static std::string hep_wedge(Ctx& c, const FRepNode& n,
+                                 const std::string& x, const std::string& y);
+    static std::string hep_u    (Ctx& c, const std::string& z,
+                                 const std::string& hz);
+    static void        hep_fold (Ctx& c, const std::string& dst,
+                                 const std::string& term);
+
+    static std::string emit_hep_tube  (Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    static std::string emit_hep_cone  (Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    static std::string emit_hep_shell (Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    static std::string emit_hep_trd   (Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    static std::string emit_hep_poly  (Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    // The same six in dual arithmetic, for analytic GPU normals. Without
+    // them the dual emitter's default sends the whole object back to
+    // central differences - the same defect measured on the CPU, where a
+    // Tube's |grad| reached 1.092 at 10 m because the step is absolute.
+    static std::string emit_hep_tube_dual (Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    static std::string emit_hep_cone_dual (Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    static std::string emit_hep_shell_dual(Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    static std::string emit_hep_trd_dual  (Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    static std::string emit_hep_poly_dual (Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z);
+    static void        emit_hep_frame_dual_coords(Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z,
+        std::string& qx, std::string& qy, std::string& qz);
+
+    // Shared by the dual HEP emitters.
+    static std::string hep_rho_d  (Ctx& c, const std::string& x,
+                                   const std::string& y);
+    static std::string hep_wedge_d(Ctx& c, const FRepNode& n,
+                                   const std::string& x, const std::string& y);
+    static std::string hep_u_d    (Ctx& c, const std::string& z,
+                                   const std::string& hz);
+    static void        hep_fold_d (Ctx& c, const std::string& dst,
+                                   const std::string& term);
+
+    /// Frame rewrites the point and recurses, so it returns the child's
+    /// expression rather than one of its own; the recursion goes through
+    /// the caller's emit_node, which is passed in.
+    static std::string emit_hep_frame_coords(Ctx& c, const FRepNode& n,
+        const std::string& x, const std::string& y, const std::string& z,
+        std::string& qx, std::string& qy, std::string& qz);
 };
 
 } // namespace frep::gpu

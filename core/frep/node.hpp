@@ -6,6 +6,10 @@
 // F-Rep* convention: f(X) <= 0 means inside the object.
 // The FRepNode tree is the program — the model is source code.
 
+#include "core/frep/node_kind.hpp"
+#include "core/frep/param_store.hpp"
+#include "core/frep/scalar.hpp"
+
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -23,19 +27,8 @@
 
 namespace frep {
 
-enum class NodeKind {
-    Sphere, Box, Plane,
-    Union, Intersection, Difference, SmoothUnion,
-    Negate,
-    Translate, Scale, RotateY, RotateX, RotateZ,
-    TwistY, BendXY, TaperY,
-    Scene,
-    Instance,
-    // Plugin-defined nodes — emit goes through the FRepNode::emit_glsl
-    // virtual fallback rather than the built-in switch table. Plugin
-    // authors should set `kind = NodeKind::Plugin` in their node ctor.
-    Plugin,
-};
+// NodeKind now lives in node_kind.hpp so the parameter binding table can
+// share it instead of keeping a copy. See that header.
 
 // Context passed during code generation — holds the LLVM state.
 struct CgCtx {
@@ -48,11 +41,24 @@ struct CgCtx {
         return width > 1 ? b.CreateVectorSplat(width, s) : s;
     }
 
+    // The scalar type this emission computes in. F32 is the render path and
+    // the GPU ABI; F64 is for a REPORTED distance, where the measurement in
+    // mixed_eval.hpp says the type has to be exact rather than cheap. It is
+    // not a speed knob - scalar f32 is the slower of the two on this CPU.
+    ScalarKind scalar = ScalarKind::F32;
+
+    /// The type the node bodies compute in. Use this, not f32(), anywhere
+    /// the value is part of the field rather than part of the pipeline.
+    llvm::Type* fty() const {
+        return scalar == ScalarKind::F64 ? llvm::Type::getDoubleTy(lc)
+                                         : llvm::Type::getFloatTy(lc);
+    }
+
     llvm::Type*  f32()  const { return llvm::Type::getFloatTy(lc); }
     llvm::Type*  i32()  const { return llvm::Type::getInt32Ty(lc); }
     llvm::Type*  vd()   const { return llvm::Type::getVoidTy(lc); }
-    llvm::Value* fc(float v)  const {
-        auto* s = llvm::ConstantFP::get(llvm::Type::getFloatTy(lc), v);
+    llvm::Value* fc(double v)  const {
+        auto* s = llvm::ConstantFP::get(fty(), v);
         return width > 1 ? b.CreateVectorSplat(width, s) : s;
     }
     llvm::Value* ic(int v)    const { return llvm::ConstantInt::get(llvm::Type::getInt32Ty(lc), v, true); }
@@ -112,10 +118,18 @@ struct CgCtx {
                                       param_class);
             if (slot >= 0) {
                 auto* idx = ic(slot);
+                // The runtime buffer stays float*: its ABI is shared with
+                // the OpenCL and CUDA kernels. In an F64 emission the loaded
+                // value is widened, which recovers nothing the buffer threw
+                // away - a runtime slot is f32-accurate by construction, and
+                // a caller that needs an exact parameter must bake it.
                 auto* gep = b.CreateGEP(f32(), params_buffer, idx,
                                         node_id + "." + param_name + "_addr");
-                auto* ld = b.CreateLoad(f32(), gep,
+                llvm::Value* ld = b.CreateLoad(f32(), gep,
                                     node_id + "." + param_name);
+                if (scalar == ScalarKind::F64)
+                    ld = b.CreateFPExt(ld, llvm::Type::getDoubleTy(lc),
+                                       node_id + "." + param_name + "_w");
                 return vsplat(ld);
             }
         }
@@ -195,7 +209,24 @@ public:
     NodeKind    kind;
     std::string id;
     std::vector<Ptr> children;
-    std::unordered_map<std::string, float> params;
+    // An ORDERED VECTOR of doubles, not a map of float, and those are two
+    // separate decisions.
+    //
+    // Double because a radius arriving from a detector description is a
+    // double: a float store rounds it once, before any arithmetic happens,
+    // and the ~1e-4 mm that costs at 10 m cannot be recovered afterwards.
+    // scene_io already WROTE these as double, so the store was the only place
+    // the value was narrowed and a json round trip lost precision the file on
+    // disk held correctly.
+    //
+    // A vector because the map was the evaluator: 40 of a BoxNode::eval's 45
+    // ns were three hash lookups of short strings. Each node addresses its
+    // own parameters by index (its `enum : int` beside the constructor, in
+    // node_param_schema order); name lookup stays available for I/O and the
+    // editor. See param_store.hpp.
+    //
+    // The EVALUATION type is a third question - see eval / evalw below.
+    ParamStore params;
 
     // Generates LLVM IR — returns a float Value* (the SDF value at point x,y,z).
     // Marked AlwaysInline → O3 inlines it directly into render_tile.
@@ -219,6 +250,35 @@ public:
         throw std::runtime_error(
             std::string("FRepNode::eval not implemented for type '") +
             type_name() + "'");
+    }
+
+    // The same field in double. A node that has one implements eval and evalw
+    // from ONE templated body (see eval_t in primitives/operations/transforms
+    // and hep.hpp) so the two cannot drift - the same discipline codegen()
+    // already owes eval().
+    //
+    // The default forwards through float, which is CORRECT and NOT WIDE: the
+    // answer is a float answer with zeroes after it. That is deliberate. It
+    // keeps a node that has not been converted working, and it keeps the
+    // conversion incremental. What it must never do is be silent, because a
+    // scene evaluated "in double" that is really float somewhere is worse
+    // than one that is float everywhere - the error is in an unknown place.
+    // So wide_eval() reports it and MixedEval counts it, and a caller that
+    // needs the exact type asks before it believes the number.
+    virtual double evalw(double x, double y, double z) const {
+        return double(eval(float(x), float(y), float(z)));
+    }
+
+    /// True when evalw is genuinely evaluated in double rather than forwarded.
+    virtual bool wide_eval() const noexcept { return false; }
+
+    /// Dispatch by kind, for code that is generic over the scalar type.
+    template <class T>
+    T eval_as(T x, T y, T z) const {
+        if constexpr (sizeof(T) >= sizeof(double))
+            return T(evalw(double(x), double(y), double(z)));
+        else
+            return T(eval(float(x), float(y), float(z)));
     }
 
     // Generates LLVM IR for forward-mode AD: takes dual numbers
@@ -343,12 +403,9 @@ inline bool node_is_unit_lipschitz(const FRepNode& n) {
         case NodeKind::Instance:      // metric-ness follows the shared target
             break;                       // gradient-preserving
         case NodeKind::Scale: {          // sound only if every |factor| >= 1 (never amplifies)
-            auto ax = n.params.find("sx");
-            auto ay = n.params.find("sy");
-            auto az = n.params.find("sz");
-            float sx = ax==n.params.end()?1.0f:ax->second;
-            float sy = ay==n.params.end()?1.0f:ay->second;
-            float sz = az==n.params.end()?1.0f:az->second;
+            const float sx = float(n.params.value_or("sx", 1.0));
+            const float sy = float(n.params.value_or("sy", 1.0));
+            const float sz = float(n.params.value_or("sz", 1.0));
             if (std::abs(sx) < 1.0f || std::abs(sy) < 1.0f || std::abs(sz) < 1.0f) return false;
             break;
         }

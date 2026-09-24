@@ -23,6 +23,7 @@
 
 #include "core/compiler/llvm_compat.hpp"
 #include "core/frep/node.hpp"
+#include "core/frep/scalar.hpp"
 
 #include <cmath>
 #include <memory>
@@ -39,10 +40,11 @@ namespace frep {
 //   y' =  y
 class TwistYNode final : public FRepNode {
 public:
+    enum : int { K };
     TwistYNode(FRepNode::Ptr child, float k, std::string nid = "twist") {
         kind = NodeKind::TwistY;
         id   = std::move(nid);
-        params["k"] = k;
+        params.init({"k"}, {k});
         children = {std::move(child)};
     }
 
@@ -63,22 +65,25 @@ public:
         return a;
     }
 
-    float eval(float x, float y, float z) const override {
-        float k = params.at("k");
-        float a = k * y;
-        float ca = std::cos(a), sa = std::sin(a);
-        float xr =  ca*x + sa*z;
-        float zr = -sa*x + ca*z;
+    template <class T>
+    T eval_t(T x, T y, T z) const {
+        using S = ScalarTraits<T>;
+        const T k = S::from(params[K]);
+        const T a = k * y;
+        const T ca = std::cos(a), sa = std::sin(a);
+        const T xr =  ca*x + sa*z;
+        const T zr = -sa*x + ca*z;
         // Lipschitz correction: locally the warp's Jacobian has spectral
         // norm <= sqrt(1 + (k*r)^2). We approximate r by xz-radius.
-        float r = std::sqrt(x*x + z*z);
-        float lip = std::sqrt(1.0f + (k*r)*(k*r));
-        return children[0]->eval(xr, y, zr) / lip;
+        const T r = S::sqrtv(x*x + z*z);
+        const T lip = S::sqrtv(S::from(1.0) + (k*r)*(k*r));
+        return children[0]->eval_as<T>(xr, y, zr) / lip;
     }
+    FREP_EVAL_T
 
     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
         auto& b = c.b;
-        auto k = c.param_value(id, "k", params.at("k"));
+        auto k = c.param_value(id, "k", params[K]);
         auto a = b.CreateFMul(k, y);
         auto ca = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::cos, a);
         auto sa = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sin, a);
@@ -117,10 +122,11 @@ public:
 // keep the input within the safe envelope.
 class BendXYNode final : public FRepNode {
 public:
+    enum : int { K };
     BendXYNode(FRepNode::Ptr child, float k, std::string nid = "bend") {
         kind = NodeKind::BendXY;
         id   = std::move(nid);
-        params["k"] = k;
+        params.init({"k"}, {k});
         children = {std::move(child)};
     }
 
@@ -138,22 +144,25 @@ public:
         return a;
     }
 
-    float eval(float x, float y, float z) const override {
-        float k = params.at("k");
-        if (std::abs(k) < 1e-6f) return children[0]->eval(x, y, z);
-        float invk  = 1.0f / k;
-        float theta = k * x;
-        float r     = invk + y;
-        float xr    = r * std::sin(theta);
-        float yr    = r * std::cos(theta) - invk;
+    template <class T>
+    T eval_t(T x, T y, T z) const {
+        using S = ScalarTraits<T>;
+        const T k = S::from(params[K]);
+        if (S::absv(k) < S::from(1e-6)) return children[0]->eval_as<T>(x, y, z);
+        const T invk  = S::from(1.0) / k;
+        const T theta = k * x;
+        const T r     = invk + y;
+        const T xr    = r * std::sin(theta);
+        const T yr    = r * std::cos(theta) - invk;
         // Lipschitz correction analogous to twist.
-        float lip = std::max(1.0f, std::abs(k) * std::abs(r));
-        return children[0]->eval(xr, yr, z) / lip;
+        const T lip = S::maxv(S::from(1.0), S::absv(k) * S::absv(r));
+        return children[0]->eval_as<T>(xr, yr, z) / lip;
     }
+    FREP_EVAL_T
 
     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
         auto& b = c.b;
-        auto k    = c.param_value(id, "k", params.at("k"));
+        auto k    = c.param_value(id, "k", params[K]);
         auto invk = b.CreateFDiv(c.fc(1.0f), k);
         auto th   = b.CreateFMul(k, x);
         auto rv   = b.CreateFAdd(invk, y);
@@ -191,6 +200,7 @@ public:
 class TaperYNode final : public FRepNode {
 public:
     // h: total height of the taper region. t: scale factor at y = +h/2.
+    enum : int { Ratio, Height };
     TaperYNode(FRepNode::Ptr child, float t, float h = 2.0f,
                std::string nid = "taper")
     {
@@ -206,31 +216,33 @@ public:
     AABB aabb() const noexcept override {
         // Bbox: child bbox scaled outward by max(1, t) in X/Z.
         AABB a = children[0]->aabb();
-        float t = params.at("t");
+        float t = params[Ratio];
         float s = std::max(1.0f, std::abs(t));
         a.min_x *= s; a.max_x *= s;
         a.min_z *= s; a.max_z *= s;
         return a;
     }
 
-    float eval(float x, float y, float z) const override {
-        float t = params.at("t");
-        float h = params.at("h");
-        float u = std::clamp((y + 0.5f*h) / h, 0.0f, 1.0f);
-        float s = 1.0f + u * (t - 1.0f);
-        s = std::max(s, 1e-3f);
-        float xr = x / s;
-        float zr = z / s;
-        // Lipschitz: 1/s on x and z, 1 on y → spectral norm 1/s when s < 1,
+    template <class T>
+    T eval_t(T x, T y, T z) const {
+        using S = ScalarTraits<T>;
+        const T one = S::from(1.0);
+        const T t = S::from(params[Ratio]), h = S::from(params[Height]);
+        const T u = std::clamp((y + S::from(0.5)*h) / h, S::from(0.0), one);
+        T s = one + u * (t - one);
+        s = S::maxv(s, S::from(1e-3));
+        const T xr = x / s, zr = z / s;
+        // Lipschitz: 1/s on x and z, 1 on y -> spectral norm 1/s when s < 1,
         // 1 otherwise. Use the conservative 1/min(s,1).
-        float lip = std::max(1.0f, 1.0f / s);
-        return children[0]->eval(xr, y, zr) / lip;
+        const T lip = S::maxv(one, one / s);
+        return children[0]->eval_as<T>(xr, y, zr) / lip;
     }
+    FREP_EVAL_T
 
     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
         auto& b = c.b;
-        auto t = c.param_value(id, "t", params.at("t"));
-        auto h = c.param_value(id, "h", params.at("h"));
+        auto t = c.param_value(id, "t", params[Ratio]);
+        auto h = c.param_value(id, "h", params[Height]);
 
         auto half_h = b.CreateFMul(h, c.fc(0.5f));
         auto u_raw  = b.CreateFDiv(b.CreateFAdd(y, half_h), h);

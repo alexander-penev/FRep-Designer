@@ -73,8 +73,21 @@ TEST(DistRender, PullSchedulerMatchesWholeFrame) {
         WorkerConfig wc;
         wc.host = "127.0.0.1"; wc.port = port; wc.width = W; wc.height = H;
         wc.verbose = false;
+        // retry_secs, as in the two tests below. The master binds on its own
+        // thread and the workers start immediately, so on a loaded machine a
+        // worker can reach connect() before the listener exists. With no
+        // retry that connect fails, run() returns an error the test then
+        // DISCARDS, the worker exits - and the master sits in accept()
+        // waiting for a connection that will never come, so the final join()
+        // never returns. Caught under ctest -j16 on a 2-core box: hung 1 run
+        // in 6, gdb showing Master::run in TcpListener::accept with both
+        // worker threads already gone.
+        wc.retry_secs = 8;
         Worker w(wc, [] { return std::make_unique<CpuIrExecutor>(); });
-        (void)w.run();
+        // Not discarded: a worker that gives up used to leave the master
+        // blocked in accept(), which reads as a 60 s ctest timeout rather
+        // than as the connect failure it is.
+        EXPECT_TRUE(w.run().has_value());
     };
     std::thread w1(run_worker), w2(run_worker);
 
@@ -122,8 +135,9 @@ TEST(DistRender, PushSchedulerCoversFrame) {
     std::thread mt([&] { mres = master.run(); });
     auto run_worker = [&] {
         WorkerConfig wc; wc.port = port; wc.width = W; wc.height = H; wc.verbose = false;
+        wc.retry_secs = 8;   // the startup race - see the note above
         Worker w(wc, [] { return std::make_unique<CpuIrExecutor>(); });
-        (void)w.run();
+        EXPECT_TRUE(w.run().has_value());
     };
     std::thread w1(run_worker), w2(run_worker);
     w1.join(); w2.join(); mt.join();

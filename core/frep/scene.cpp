@@ -151,8 +151,7 @@ void SceneGraph::set_rotation_axis(const std::string& id, int axis, float angle_
     while (is_rotation_tag(inner) && !inner->children.empty()) {
         std::string t = gizmo_tag(inner);
         int a = (t == "RotateX") ? 0 : (t == "RotateY") ? 1 : 2;
-        auto p = inner->params.find("a");
-        ang[a] = (p != inner->params.end()) ? p->second : 0.0f;
+        ang[a] = float(inner->params.value_or("a", 0.0));
         present[a] = true;
         inner = inner->children[0];
     }
@@ -188,8 +187,7 @@ float SceneGraph::get_rotation_axis(const std::string& id, int axis) const {
         n = n->children[0];
     while (is_rotation_tag(n) && !n->children.empty()) {
         if (gizmo_tag(n) == want) {
-            auto p = n->params.find("a");
-            return (p != n->params.end()) ? p->second : 0.0f;
+            return float(n->params.value_or("a", 0.0));
         }
         n = n->children[0];
     }
@@ -237,8 +235,7 @@ float SceneGraph::get_rotation_y(const std::string& id) const {
     if (gizmo_tag(n) == std::string("Translate") && !n->children.empty())
         n = n->children[0];
     if (gizmo_tag(n) == std::string("RotateY")) {
-        auto p = n->params.find("a");
-        if (p != n->params.end()) return p->second;
+        if (const double* p = n->params.get("a")) return float(*p);
     }
     return 0.0f;
 }
@@ -252,8 +249,7 @@ float SceneGraph::get_scale(const std::string& id) const {
     while (is_rotation_tag(n) && !n->children.empty())
         n = n->children[0];
     if (gizmo_tag(n) == std::string("Scale")) {
-        auto p = n->params.find("sx");
-        if (p != n->params.end()) return p->second;
+        if (const double* p = n->params.get("sx")) return float(*p);
     }
     return 1.0f;
 }
@@ -298,10 +294,9 @@ void SceneGraph::get_scale_xyz(const std::string& id, float& sx, float& sy, floa
     while (is_rotation_tag(n) && !n->children.empty())
         n = n->children[0];
     if (gizmo_tag(n) == std::string("Scale")) {
-        auto px=n->params.find("sx"), py=n->params.find("sy"), pz=n->params.find("sz");
-        if (px!=n->params.end()) sx=px->second;
-        if (py!=n->params.end()) sy=py->second;
-        if (pz!=n->params.end()) sz=pz->second;
+        sx = float(n->params.value_or("sx", double(sx)));
+        sy = float(n->params.value_or("sy", double(sy)));
+        sz = float(n->params.value_or("sz", double(sz)));
     }
 }
 
@@ -324,9 +319,9 @@ bool SceneGraph::get_node_param(const std::string& object_id, const std::string&
     // find_node_by_id needs a mutable ref; we only read, so const_cast is safe here.
     FRepNode* n = find_node_by_id(const_cast<FRepNode&>(*it->second.geometry), node_id);
     if (!n) return false;
-    auto p = n->params.find(param);
-    if (p == n->params.end()) return false;
-    out = p->second;
+    double* p = n->params.get(param);
+    if (!p) return false;
+    out = float(*p);
     return true;
 }
 

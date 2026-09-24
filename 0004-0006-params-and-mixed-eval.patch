@@ -1,0 +1,2506 @@
+From 907ba542749c5b9f1c44175a59c549474b44d5a7 Mon Sep 17 00:00:00 2001
+From: Alexander Penev <alexander.p.penev@gmail.com>
+Date: Thu, 24 Sep 2026 10:01:23 +0300
+Subject: [PATCH 1/3] compiler: one NodeKind, and a parameter schema that
+ covers every kind
+
+param_binding_table.hpp kept its own copy of NodeKind (`namespace pk`) so it
+could stay free of the LLVM-coupled node.hpp, and `static_cast<int>(n.kind)`
+bridged the two. The copy drifted: RotateX and RotateZ were added to NodeKind
+at 11 and 12, which were TwistY and BendXY in the copy, so every kind from 11
+upward was off by two.
+
+A wrong kind does not throw - it returns the wrong SCHEMA, and a node whose
+schema does not name its parameters simply has none of them bound. Measured
+with an all-runtime policy, slots bound per kind, before -> after:
+
+    Scale    0/3 -> 3/3      (schema said "s"; the node stores sx, sy, sz)
+    RotateX  0/1 -> 1/1      (read as TwistY, schema "k")
+    RotateZ  0/1 -> 1/1      (read as BendXY, schema "k")
+    TwistY   0/1 -> 1/1      (read as TaperY, schema "t","h")
+    BendXY   0/1 -> 1/1      (read as Scene, empty)
+    TaperY   0/2 -> 2/2      (read as Plugin, empty)
+    Tube     0/5 -> 5/5      (no schema at all)
+    Cone     0/7 -> 7/7      (no schema at all)
+
+Of twelve kinds only Sphere, Box, Translate and RotateY were correct. The
+effect was silent: editing any other kind's parameter forced a full
+recompile instead of a slot write, and classify_param answered Deform for
+parameters those nodes do not have.
+
+NodeKind moves to core/frep/node_kind.hpp, which has no LLVM dependency, and
+both headers include it. The schema is completed for Scale, RotateX/Z,
+TwistY, BendXY, TaperY and the six HEP kinds, and the switch is exhaustive
+over the enum so a new kind is a compile error rather than a silent empty.
+
+tests/test_param_schema.cpp asserts the schema names EXACTLY what each
+constructor stored, per kind, plus the end-to-end slot count. A second copy
+of a list that must stay in step with another is not decoupling, it is an
+unchecked invariant.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5ALyYbzrXTGtc7LqRPGCz
+---
+ CMakeLists.txt                        |   1 +
+ core/compiler/param_binding_table.hpp | 123 +++++++++++++----------
+ core/compiler/scene_bindings.hpp      |   4 +-
+ core/frep/node.hpp                    |  23 +----
+ core/frep/node_kind.hpp               |  48 +++++++++
+ tests/test_param_schema.cpp           | 137 ++++++++++++++++++++++++++
+ 6 files changed, 264 insertions(+), 72 deletions(-)
+ create mode 100644 core/frep/node_kind.hpp
+ create mode 100644 tests/test_param_schema.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f09a40e..d2e18fe 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -617,6 +617,7 @@ add_executable(frep_tests
+     tests/test_deformations_patterns.cpp
+     tests/test_custom_expr_eval.cpp
+     tests/test_scalar_type.cpp
++    tests/test_param_schema.cpp
+     tests/test_expr_backends.cpp
+     tests/test_plugin_runtime.cpp
+     tests/test_scene_set_geometry.cpp
+diff --git a/core/compiler/param_binding_table.hpp b/core/compiler/param_binding_table.hpp
+index ff0d578..41729c0 100644
+--- a/core/compiler/param_binding_table.hpp
++++ b/core/compiler/param_binding_table.hpp
+@@ -31,6 +31,7 @@
+ // from a real FRepNode through the thin NodeView adapter (see scene_bindings).
+ 
+ #include "core/compiler/compile_policy.hpp"
++#include "core/frep/node_kind.hpp"
+ 
+ #include <string>
+ #include <unordered_map>
+@@ -39,19 +40,10 @@
+ 
+ namespace frep {
+ 
+-// NodeKind mirrored as plain ints so this header need not include the
+-// LLVM-coupled node.hpp. Keep in sync with frep::NodeKind.
+-namespace pk {
+-enum : int {
+-    Sphere = 0, Box, Plane,
+-    Union, Intersection, Difference, SmoothUnion,
+-    Negate,
+-    Translate, Scale, RotateY,
+-    TwistY, BendXY, TaperY,
+-    Scene,
+-    Plugin,
+-};
+-} // namespace pk
++// NodeKind is shared with node.hpp via node_kind.hpp. It used to be
++// mirrored here as a second enum so this header need not include the
++// LLVM-coupled node.hpp; that copy drifted by two positions and silently
++// handed most kinds the wrong schema. See node_kind.hpp.
+ 
+ // One bound runtime parameter.
+ struct ParamSlot {
+@@ -66,48 +58,77 @@ struct ParamSlot {
+ // order fixes slot assignment; classes drive class-based policies. Centralises
+ // what used to be the scattered `param_class` argument at each emit site.
+ inline const std::vector<std::pair<std::string, ParamClass>>&
+-node_param_schema(int kind) {
+-    static const std::vector<std::pair<std::string, ParamClass>> empty{};
+-    static const std::vector<std::pair<std::string, ParamClass>> sphere{
+-        {"r", ParamClass::Geometry}};
+-    static const std::vector<std::pair<std::string, ParamClass>> box{
+-        {"hx", ParamClass::Geometry}, {"hy", ParamClass::Geometry},
+-        {"hz", ParamClass::Geometry}};
+-    static const std::vector<std::pair<std::string, ParamClass>> plane{
+-        {"nx", ParamClass::Geometry}, {"ny", ParamClass::Geometry},
+-        {"nz", ParamClass::Geometry}, {"d", ParamClass::Geometry}};
+-    static const std::vector<std::pair<std::string, ParamClass>> smooth{
+-        {"k", ParamClass::Geometry}};
+-    static const std::vector<std::pair<std::string, ParamClass>> translate{
+-        {"tx", ParamClass::Geometry}, {"ty", ParamClass::Geometry},
+-        {"tz", ParamClass::Geometry}};
+-    static const std::vector<std::pair<std::string, ParamClass>> scale{
+-        {"s", ParamClass::Geometry}};
+-    static const std::vector<std::pair<std::string, ParamClass>> rotatey{
+-        {"a", ParamClass::Geometry}};
+-    static const std::vector<std::pair<std::string, ParamClass>> twist{
+-        {"k", ParamClass::Deform}};
+-    static const std::vector<std::pair<std::string, ParamClass>> bend{
+-        {"k", ParamClass::Deform}};
+-    static const std::vector<std::pair<std::string, ParamClass>> taper{
+-        {"t", ParamClass::Deform}, {"h", ParamClass::Deform}};
++node_param_schema(NodeKind kind) {
++    using P = std::pair<std::string, ParamClass>;
++    using V = std::vector<P>;
++    const auto G = ParamClass::Geometry;
++    const auto D = ParamClass::Deform;
++    static const V empty{};
++    static const V sphere{{"r", G}};
++    static const V box{{"hx", G}, {"hy", G}, {"hz", G}};
++    static const V plane{{"nx", G}, {"ny", G}, {"nz", G}, {"d", G}};
++    static const V smooth{{"k", G}};
++    static const V translate{{"tx", G}, {"ty", G}, {"tz", G}};
++    // sx/sy/sz, not "s": ScaleNode stores three factors even when
++    // constructed from one, and the old single-entry schema matched none of
++    // them, so a Scale node could never have a runtime parameter.
++    static const V scale{{"sx", G}, {"sy", G}, {"sz", G}};
++    static const V angle{{"a", G}};                       // RotateX/Y/Z
++    static const V twist{{"k", D}};
++    static const V bend{{"k", D}};
++    static const V taper{{"t", D}, {"h", D}};
++    // HEP nodes. The order is the constructor's, and it fixes slot
++    // assignment, so entries are appended rather than reordered.
++    static const V tube{{"rmin", G}, {"rmax", G}, {"hz", G},
++                        {"phi0", G}, {"dphi", G}};
++    static const V cone{{"rmin1", G}, {"rmax1", G}, {"rmin2", G},
++                        {"rmax2", G}, {"hz", G}, {"phi0", G}, {"dphi", G}};
++    static const V shell{{"rmin", G}, {"rmax", G}, {"phi0", G},
++                         {"dphi", G}, {"theta0", G}, {"dtheta", G}};
++    static const V trd{{"dx1", G}, {"dx2", G}, {"dy1", G}, {"dy2", G},
++                       {"hz", G}};
++    static const V poly{{"rmin1", G}, {"rmax1", G}, {"rmin2", G},
++                        {"rmax2", G}, {"hz", G}, {"phi0", G}, {"dphi", G},
++                        {"nside", G}};
++    static const V frame{{"r0", G}, {"r1", G}, {"r2", G},
++                         {"r3", G}, {"r4", G}, {"r5", G},
++                         {"r6", G}, {"r7", G}, {"r8", G},
++                         {"tx", G}, {"ty", G}, {"tz", G}};
+     switch (kind) {
+-        case pk::Sphere:     return sphere;
+-        case pk::Box:        return box;
+-        case pk::Plane:      return plane;
+-        case pk::SmoothUnion:return smooth;
+-        case pk::Translate:  return translate;
+-        case pk::Scale:      return scale;
+-        case pk::RotateY:    return rotatey;
+-        case pk::TwistY:     return twist;
+-        case pk::BendXY:     return bend;
+-        case pk::TaperY:     return taper;
+-        default:             return empty;  // Union/Diff/Negate/Scene/Plugin
++        case NodeKind::Sphere:         return sphere;
++        case NodeKind::Box:            return box;
++        case NodeKind::Plane:          return plane;
++        case NodeKind::SmoothUnion:    return smooth;
++        case NodeKind::Translate:      return translate;
++        case NodeKind::Scale:          return scale;
++        case NodeKind::RotateX:
++        case NodeKind::RotateY:
++        case NodeKind::RotateZ:        return angle;
++        case NodeKind::TwistY:         return twist;
++        case NodeKind::BendXY:         return bend;
++        case NodeKind::TaperY:         return taper;
++        case NodeKind::Tube:           return tube;
++        case NodeKind::Cone:           return cone;
++        case NodeKind::SphericalShell: return shell;
++        case NodeKind::Trapezoid:      return trd;
++        case NodeKind::Polyhedron:     return poly;
++        case NodeKind::Frame:          return frame;
++        // Union/Intersection/Difference/Negate/Scene/Instance/Plugin carry
++        // no parameters of their own. Plugin nodes bind through their own
++        // capsule rather than this table.
++        case NodeKind::Union:
++        case NodeKind::Intersection:
++        case NodeKind::Difference:
++        case NodeKind::Negate:
++        case NodeKind::Scene:
++        case NodeKind::Instance:
++        case NodeKind::Plugin:         return empty;
+     }
++    return empty;
+ }
+ 
+ // (kind, param) -> class, via the schema. Geometry if unknown.
+-inline ParamClass classify_param(int kind, const std::string& param) {
++inline ParamClass classify_param(NodeKind kind, const std::string& param) {
+     for (const auto& ps : node_param_schema(kind))
+         if (ps.first == param) return ps.second;
+     return ParamClass::Geometry;
+@@ -119,7 +140,7 @@ public:
+     // tested without depending on the LLVM-coupled FRepNode. The project
+     // adapts a real scene into this view (children by value; trees are small).
+     struct NodeView {
+-        int                                          kind = pk::Scene;
++        NodeKind                                     kind = NodeKind::Scene;
+         std::string                                  id;
+         const std::unordered_map<std::string, double>* params = nullptr;
+         std::vector<NodeView>                        children;
+diff --git a/core/compiler/scene_bindings.hpp b/core/compiler/scene_bindings.hpp
+index 7718b82..f8f7e9c 100644
+--- a/core/compiler/scene_bindings.hpp
++++ b/core/compiler/scene_bindings.hpp
+@@ -18,7 +18,7 @@ namespace frep {
+ // table builder free of any node.hpp (LLVM) dependency.
+ inline ParamBindingTable::NodeView to_view(const FRepNode& n) {
+     ParamBindingTable::NodeView v;
+-    v.kind   = static_cast<int>(n.kind);
++    v.kind   = n.kind;
+     v.id     = n.id;
+     v.params = &n.params;
+     v.children.reserve(n.children.size());
+@@ -33,7 +33,7 @@ inline ParamBindingTable::NodeView to_view(const FRepNode& n) {
+ inline ParamBindingTable build_bindings(const SceneGraph& scene,
+                                         const CompilePolicy& policy) {
+     ParamBindingTable::NodeView root;
+-    root.kind = pk::Scene;
++    root.kind = NodeKind::Scene;
+     root.id   = "$scene";
+     for (const auto& [id, obj] : scene.objects()) {
+         if (!obj.visible || !obj.geometry) continue;
+diff --git a/core/frep/node.hpp b/core/frep/node.hpp
+index 589b58c..eef400e 100644
+--- a/core/frep/node.hpp
++++ b/core/frep/node.hpp
+@@ -6,6 +6,8 @@
+ // F-Rep* convention: f(X) <= 0 means inside the object.
+ // The FRepNode tree is the program — the model is source code.
+ 
++#include "core/frep/node_kind.hpp"
++
+ #include <llvm/IR/IRBuilder.h>
+ #include <llvm/IR/LLVMContext.h>
+ #include <llvm/IR/Module.h>
+@@ -23,25 +25,8 @@
+ 
+ namespace frep {
+ 
+-enum class NodeKind {
+-    Sphere, Box, Plane,
+-    Union, Intersection, Difference, SmoothUnion,
+-    Negate,
+-    Translate, Scale, RotateY, RotateX, RotateZ,
+-    TwistY, BendXY, TaperY,
+-    Scene,
+-    Instance,
+-    // High-energy-physics primitives (core/frep/hep.hpp), 1:1 with the Geant4
+-    // solids a detector geometry is made of, plus one general rigid frame.
+-    // Native rather than plugin because aabb() is not optional: a node
+-    // without one is infinite, and one infinite leaf takes the BVH, the RTX
+-    // proxy and marching cubes with it.
+-    Tube, Cone, SphericalShell, Trapezoid, Polyhedron, Frame,
+-    // Plugin-defined nodes — emit goes through the FRepNode::emit_glsl
+-    // virtual fallback rather than the built-in switch table. Plugin
+-    // authors should set `kind = NodeKind::Plugin` in their node ctor.
+-    Plugin,
+-};
++// NodeKind now lives in node_kind.hpp so the parameter binding table can
++// share it instead of keeping a copy. See that header.
+ 
+ // Context passed during code generation — holds the LLVM state.
+ struct CgCtx {
+diff --git a/core/frep/node_kind.hpp b/core/frep/node_kind.hpp
+new file mode 100644
+index 0000000..33bae0b
+--- /dev/null
++++ b/core/frep/node_kind.hpp
+@@ -0,0 +1,48 @@
++// core/frep/node_kind.hpp
++//
++// NodeKind, on its own and free of LLVM.
++//
++// It lives here because two places need it and only one of them can include
++// node.hpp. The parameter binding table is deliberately decoupled from the
++// LLVM-coupled FRepNode so it can be built and unit tested on its own, and it
++// used to carry its OWN copy of this enum (`namespace pk`) with
++// `static_cast<int>(n.kind)` bridging the two. The copy drifted: RotateX and
++// RotateZ were added to NodeKind at 11 and 12, which were TwistY and BendXY
++// in the copy, and every kind from 11 upward shifted by two.
++//
++// Nothing detected it, because the bridge is a cast between two ints and a
++// wrong kind does not fail - it just returns the WRONG SCHEMA, and a node
++// whose schema does not list its parameters simply has none of them bound.
++// Measured before the fix, with an all-runtime policy: of twelve kinds only
++// Sphere, Box, Translate and RotateY bound their parameters. Scale, RotateX,
++// RotateZ, TwistY, BendXY, TaperY and every HEP node bound NONE, so editing
++// any of them forced a full recompile instead of a slot write.
++//
++// One enum, one definition. A second copy of a list that must stay in step
++// with another is not decoupling, it is an unchecked invariant.
++
++#pragma once
++
++namespace frep {
++
++enum class NodeKind {
++    Sphere, Box, Plane,
++    Union, Intersection, Difference, SmoothUnion,
++    Negate,
++    Translate, Scale, RotateY, RotateX, RotateZ,
++    TwistY, BendXY, TaperY,
++    Scene,
++    Instance,
++    // High-energy-physics primitives (core/frep/hep.hpp), 1:1 with the Geant4
++    // solids a detector geometry is made of, plus one general rigid frame.
++    // Native rather than plugin because aabb() is not optional: a node
++    // without one is infinite, and one infinite leaf takes the BVH, the RTX
++    // proxy and marching cubes with it.
++    Tube, Cone, SphericalShell, Trapezoid, Polyhedron, Frame,
++    // Plugin-defined nodes — emit goes through the FRepNode::emit_glsl
++    // virtual fallback rather than the built-in switch table. Plugin
++    // authors should set `kind = NodeKind::Plugin` in their node ctor.
++    Plugin,
++};
++
++}  // namespace frep
+diff --git a/tests/test_param_schema.cpp b/tests/test_param_schema.cpp
+new file mode 100644
+index 0000000..9e5ffd8
+--- /dev/null
++++ b/tests/test_param_schema.cpp
+@@ -0,0 +1,137 @@
++// tests/test_param_schema.cpp
++//
++// Every parameter a node stores must be bindable. That sounds like a
++// tautology and was not one: the binding table kept its OWN copy of NodeKind
++// (`namespace pk`) so it could stay free of the LLVM-coupled node.hpp, the
++// copy drifted by two positions when RotateX and RotateZ were added, and
++// `static_cast<int>(n.kind)` bridged the two without complaint.
++//
++// Nothing failed, which is why it survived. A wrong kind does not throw - it
++// returns the wrong SCHEMA, and a node whose schema does not name its
++// parameters simply has none of them bound, so the incremental path quietly
++// recompiles where it should have written a slot. Measured with an
++// all-runtime policy before the fix, of twelve kinds only four bound
++// correctly.
++//
++// The test below is therefore not "the schema is non-empty" but "the schema
++// names exactly the parameters the constructor stored", asserted per kind
++// against a real node. A future kind that forgets its schema entry fails
++// here rather than degrading silently.
++
++#include "core/compiler/llvm_compat.hpp"
++#include "core/compiler/scene_bindings.hpp"
++#include "core/frep/deformations.hpp"
++#include "core/frep/hep.hpp"
++#include "core/frep/operations.hpp"
++#include "core/frep/primitives.hpp"
++#include "core/frep/transforms.hpp"
++
++#include <gtest/gtest.h>
++
++#include <memory>
++#include <set>
++#include <string>
++
++using namespace frep;
++
++namespace {
++
++struct AllRuntime final : CompilePolicy {
++    ParamPlacement decide(const std::string&, const std::string&,
++                          ParamClass) const override {
++        return ParamPlacement::Runtime;
++    }
++};
++
++/// Names the schema exposes for this kind.
++std::set<std::string> schema_names(NodeKind k) {
++    std::set<std::string> s;
++    for (const auto& ps : node_param_schema(k)) s.insert(ps.first);
++    return s;
++}
++
++/// Names the node actually stored.
++std::set<std::string> stored_names(const FRepNode& n) {
++    std::set<std::string> s;
++    for (const auto& kv : n.params) s.insert(kv.first);
++    return s;
++}
++
++void expect_every_param_bindable(const char* what, const FRepNode& n) {
++    EXPECT_EQ(stored_names(n), schema_names(n.kind))
++        << what << ": the schema and the stored parameters disagree";
++}
++
++FRepNode::Ptr leaf() { return std::make_shared<SphereNode>(1.0); }
++
++}  // namespace
++
++TEST(ParamSchema, EveryKindSchemaMatchesWhatTheNodeStores) {
++    expect_every_param_bindable("Sphere", SphereNode(1.0));
++    expect_every_param_bindable("Box", BoxNode(1.0, 2.0, 3.0));
++    expect_every_param_bindable("Plane", PlaneNode(0.0, 1.0, 0.0, -1.0));
++    expect_every_param_bindable("Translate", TranslateNode(leaf(), 1, 2, 3));
++    expect_every_param_bindable("Scale", ScaleNode(leaf(), 2.0));
++    expect_every_param_bindable("RotateX", RotateXNode(leaf(), 0.5));
++    expect_every_param_bindable("RotateY", RotateYNode(leaf(), 0.5));
++    expect_every_param_bindable("RotateZ", RotateZNode(leaf(), 0.5));
++    expect_every_param_bindable("TwistY", TwistYNode(leaf(), 0.5));
++    expect_every_param_bindable("BendXY", BendXYNode(leaf(), 0.5));
++    expect_every_param_bindable("TaperY", TaperYNode(leaf(), 0.5, 2.0));
++    expect_every_param_bindable("Tube", hep::TubeNode(0, 1, 1, 0, 7));
++    expect_every_param_bindable("Cone", hep::ConeNode(0, 1, 0, 2, 1, 0, 7));
++    expect_every_param_bindable("SphericalShell",
++                                hep::SphericalShellNode(0, 1, 0, 7, 0, 3.1));
++    expect_every_param_bindable("Trapezoid",
++                                hep::TrapezoidNode(1, 2, 3, 4, 5));
++    {
++        const double r[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
++        expect_every_param_bindable("Frame", hep::FrameNode(leaf(), r, 1, 2, 3));
++    }
++}
++
++TEST(ParamSchema, PolyhedronSchemaCoversItsOwnParameters) {
++    // Separate because nside is stored as a parameter but is structural: it
++    // must still appear, or an edit of it cannot be bound.
++    hep::PolyhedronNode p(0, 1, 0, 2, 1, 0, 7, 6);
++    expect_every_param_bindable("Polyhedron", p);
++    EXPECT_TRUE(schema_names(NodeKind::Polyhedron).count("nside"));
++}
++
++TEST(ParamSchema, CompositesExposeNoParametersOfTheirOwn) {
++    for (NodeKind k : {NodeKind::Union, NodeKind::Intersection,
++                       NodeKind::Difference, NodeKind::Negate,
++                       NodeKind::Scene, NodeKind::Instance,
++                       NodeKind::Plugin})
++        EXPECT_TRUE(node_param_schema(k).empty()) << int(k);
++    // SmoothUnion is the exception: it has a blend radius.
++    EXPECT_EQ(schema_names(NodeKind::SmoothUnion), std::set<std::string>{"k"});
++}
++
++TEST(ParamSchema, AllRuntimePolicyBindsEveryStoredParameter) {
++    // The end-to-end statement: with a policy that wants everything at
++    // runtime, the number of slots equals the number of parameters in the
++    // whole subtree. Before the fix this held for four kinds out of twelve.
++    const AllRuntime pol;
++    auto count = [](const FRepNode& n, auto&& self) -> std::size_t {
++        std::size_t c = n.params.size();
++        for (const auto& ch : n.children)
++            if (ch) c += self(*ch, self);
++        return c;
++    };
++    struct Case { const char* nm; FRepNode::Ptr n; };
++    const Case cases[] = {
++        {"Scale", std::make_shared<ScaleNode>(leaf(), 2.0)},
++        {"RotateX", std::make_shared<RotateXNode>(leaf(), 0.5)},
++        {"RotateZ", std::make_shared<RotateZNode>(leaf(), 0.5)},
++        {"TwistY", std::make_shared<TwistYNode>(leaf(), 0.5)},
++        {"BendXY", std::make_shared<BendXYNode>(leaf(), 0.5)},
++        {"TaperY", std::make_shared<TaperYNode>(leaf(), 0.5, 2.0)},
++        {"Tube", std::make_shared<hep::TubeNode>(0, 1, 1, 0, 7)},
++        {"Cone", std::make_shared<hep::ConeNode>(0, 1, 0, 2, 1, 0, 7)},
++    };
++    for (const auto& c : cases) {
++        const auto t = ParamBindingTable::build(to_view(*c.n), pol);
++        EXPECT_EQ(t.slots().size(), count(*c.n, count)) << c.nm;
++    }
++}
+-- 
+2.43.0
+
+
+From 9a35e01aebcad63b5763efd90c234b64cd90990e Mon Sep 17 00:00:00 2001
+From: Alexander Penev <alexander.p.penev@gmail.com>
+Date: Thu, 24 Sep 2026 10:49:19 +0300
+Subject: [PATCH 2/3] core: parameters as an ordered vector, addressed by index
+
+FD4's CPU evaluator was 90% hash table. Of the 45 ns a BoxNode::eval took,
+40 were three lookups of short strings in an unordered_map; the arithmetic
+was noise, and no amount of care with floating point moves a number that is
+dominated by hashing "hx", "hy", "hz". A radius does not need to be FOUND -
+its position is a property of the node's type.
+
+params becomes a ParamStore: a vector of doubles in the node's constructor
+order, with the names kept beside them. Each node addresses its own
+parameters through an `enum : int` next to its constructor; name lookup
+stays for the serialiser, the editor, the GLSL emitter and the binding
+table, none of which is on a hot path, and is now a linear scan over at
+most twelve short strings with no hashing and no allocation.
+
+The order is the one node_param_schema() lists, and test_param_schema.cpp
+now asserts the two agree by POSITION as well as by name - if they ever
+diverge, a runtime slot write lands on the wrong parameter and the geometry
+changes silently.
+
+Measured, ns per eval, same 15 node types and 400 points:
+
+    sphere  13.4 ->  4.4    trd     88.0 -> 14.2
+    box     44.9 ->  7.3    poly   152.5 -> 35.1
+    plane   52.9 ->  5.2    frame  339.8 -> 15.9
+    tube   145.1 -> 50.7    union   55.8 -> 11.2
+    cone    99.8 -> 18.6    rotx    60.7 -> 22.1
+    shell  191.0 -> 103.6   trans   55.1 ->  6.5
+
+Whole set: 100.6 -> 21.9 ns/eval, 4.6x. The float path stays BIT-IDENTICAL
+to the original map-based tree across all 6000 samples - this is a change
+of where a number is stored, not of what is computed.
+
+Two incidental fixes fall out of the ordering: structural_hash walked an
+unordered_map, whose iteration order the standard does not specify, so the
+incremental cache key was resting on an implementation detail; and the
+ConeNode constructor still took phi0/dphi as float.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5ALyYbzrXTGtc7LqRPGCz
+---
+ core/compiler/incremental.hpp         |   5 +-
+ core/compiler/node_interval.hpp       |   3 +-
+ core/compiler/node_interval_ir.hpp    |   2 +-
+ core/compiler/param_binding_table.hpp |   5 +-
+ core/frep/deformations.hpp            |  23 ++--
+ core/frep/deformations_ad.cpp         |   2 +-
+ core/frep/hep.hpp                     | 155 +++++++++++++-------------
+ core/frep/hep_codegen.cpp             |  67 +++++------
+ core/frep/node.hpp                    |  36 +++---
+ core/frep/operations.hpp              |   9 +-
+ core/frep/param_store.hpp             | 105 +++++++++++++++++
+ core/frep/primitives.hpp              |  53 +++++----
+ core/frep/scene.cpp                   |  25 ++---
+ core/frep/transforms.hpp              |  64 ++++++-----
+ core/gpu/glsl_emitter.cpp             |  16 +--
+ core/gpu/glsl_node_interval.hpp       |   6 +-
+ core/io/scene_io.cpp                  |   4 +-
+ tests/test_node_graph.cpp             |   2 +-
+ tests/test_param_schema.cpp           |  26 ++++-
+ 19 files changed, 380 insertions(+), 228 deletions(-)
+ create mode 100644 core/frep/param_store.hpp
+
+diff --git a/core/compiler/incremental.hpp b/core/compiler/incremental.hpp
+index 3b7c01a..f80c619 100644
+--- a/core/compiler/incremental.hpp
++++ b/core/compiler/incremental.hpp
+@@ -190,8 +190,9 @@ private:
+         std::unordered_map<std::string, float> live;
+         std::function<void(const FRepNode*)> walk = [&](const FRepNode* n) {
+             if (!n) return;
+-            for (const auto& [k, v] : n->params)
+-                live[n->id + "::" + k] = v;
++            for (std::size_t i = 0; i < n->params.size(); ++i)
++                live[n->id + "::" + n->params.name(i)] =
++                    float(n->params.value(i));
+             for (const auto& c : n->children) walk(c.get());
+         };
+         for (const auto& [id, obj] : scene.objects())
+diff --git a/core/compiler/node_interval.hpp b/core/compiler/node_interval.hpp
+index 4ad188e..3b8aaec 100644
+--- a/core/compiler/node_interval.hpp
++++ b/core/compiler/node_interval.hpp
+@@ -103,8 +103,7 @@ inline Iv expr_interval(const expr::Node& n, Iv X, Iv Y, Iv Z) {
+ inline Iv node_interval(const FRepNode& n, Iv X, Iv Y, Iv Z) {
+     using namespace ivdetail;
+     auto pf = [&](const char* k, float d) -> float {
+-        auto it = n.params.find(k);
+-        return it != n.params.end() ? float(it->second) : d;
++        return float(n.params.value_or(k, double(d)));
+     };
+     switch (n.kind) {
+         case NodeKind::Sphere: {
+diff --git a/core/compiler/node_interval_ir.hpp b/core/compiler/node_interval_ir.hpp
+index ac7b77d..b0700a0 100644
+--- a/core/compiler/node_interval_ir.hpp
++++ b/core/compiler/node_interval_ir.hpp
+@@ -126,7 +126,7 @@ private:
+     }
+ 
+     float pf(const FRepNode& n, const char* k, float d) {
+-        auto it = n.params.find(k); return it != n.params.end() ? float(it->second) : d;
++        return float(n.params.value_or(k, double(d)));
+     }
+ 
+     // ── Node dispatch (mirrors node_interval() in node_interval.hpp) ──────────
+diff --git a/core/compiler/param_binding_table.hpp b/core/compiler/param_binding_table.hpp
+index 41729c0..a58b899 100644
+--- a/core/compiler/param_binding_table.hpp
++++ b/core/compiler/param_binding_table.hpp
+@@ -32,6 +32,7 @@
+ 
+ #include "core/compiler/compile_policy.hpp"
+ #include "core/frep/node_kind.hpp"
++#include "core/frep/param_store.hpp"
+ 
+ #include <string>
+ #include <unordered_map>
+@@ -142,7 +143,7 @@ public:
+     struct NodeView {
+         NodeKind                                     kind = NodeKind::Scene;
+         std::string                                  id;
+-        const std::unordered_map<std::string, double>* params = nullptr;
++        const ParamStore*                            params = nullptr;
+         std::vector<NodeView>                        children;
+     };
+ 
+@@ -196,7 +197,7 @@ private:
+     void walk(const NodeView& n, const CompilePolicy& policy) {
+         for (const auto& ps : node_param_schema(n.kind)) {
+             const std::string& name = ps.first;
+-            if (!n.params || !n.params->count(name)) continue;  // not set
++            if (!n.params || !n.params->contains(name)) continue;  // not set
+             if (policy.decide(n.id, name, ps.second) != ParamPlacement::Runtime)
+                 continue;                                       // baked constant
+             const std::string key = n.id + "::" + name;
+diff --git a/core/frep/deformations.hpp b/core/frep/deformations.hpp
+index 5db206f..7f9df0f 100644
+--- a/core/frep/deformations.hpp
++++ b/core/frep/deformations.hpp
+@@ -40,10 +40,11 @@ namespace frep {
+ //   y' =  y
+ class TwistYNode final : public FRepNode {
+ public:
++    enum : int { K };
+     TwistYNode(FRepNode::Ptr child, float k, std::string nid = "twist") {
+         kind = NodeKind::TwistY;
+         id   = std::move(nid);
+-        params["k"] = k;
++        params.init({"k"}, {k});
+         children = {std::move(child)};
+     }
+ 
+@@ -67,7 +68,7 @@ public:
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+-        const T k = S::from(params.at("k"));
++        const T k = S::from(params[K]);
+         const T a = k * y;
+         const T ca = std::cos(a), sa = std::sin(a);
+         const T xr =  ca*x + sa*z;
+@@ -82,7 +83,7 @@ public:
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b = c.b;
+-        auto k = c.param_value(id, "k", params.at("k"));
++        auto k = c.param_value(id, "k", params[K]);
+         auto a = b.CreateFMul(k, y);
+         auto ca = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::cos, a);
+         auto sa = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sin, a);
+@@ -121,10 +122,11 @@ public:
+ // keep the input within the safe envelope.
+ class BendXYNode final : public FRepNode {
+ public:
++    enum : int { K };
+     BendXYNode(FRepNode::Ptr child, float k, std::string nid = "bend") {
+         kind = NodeKind::BendXY;
+         id   = std::move(nid);
+-        params["k"] = k;
++        params.init({"k"}, {k});
+         children = {std::move(child)};
+     }
+ 
+@@ -145,7 +147,7 @@ public:
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+-        const T k = S::from(params.at("k"));
++        const T k = S::from(params[K]);
+         if (S::absv(k) < S::from(1e-6)) return children[0]->eval_as<T>(x, y, z);
+         const T invk  = S::from(1.0) / k;
+         const T theta = k * x;
+@@ -160,7 +162,7 @@ public:
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b = c.b;
+-        auto k    = c.param_value(id, "k", params.at("k"));
++        auto k    = c.param_value(id, "k", params[K]);
+         auto invk = b.CreateFDiv(c.fc(1.0f), k);
+         auto th   = b.CreateFMul(k, x);
+         auto rv   = b.CreateFAdd(invk, y);
+@@ -198,6 +200,7 @@ public:
+ class TaperYNode final : public FRepNode {
+ public:
+     // h: total height of the taper region. t: scale factor at y = +h/2.
++    enum : int { Ratio, Height };
+     TaperYNode(FRepNode::Ptr child, float t, float h = 2.0f,
+                std::string nid = "taper")
+     {
+@@ -213,7 +216,7 @@ public:
+     AABB aabb() const noexcept override {
+         // Bbox: child bbox scaled outward by max(1, t) in X/Z.
+         AABB a = children[0]->aabb();
+-        float t = params.at("t");
++        float t = params[Ratio];
+         float s = std::max(1.0f, std::abs(t));
+         a.min_x *= s; a.max_x *= s;
+         a.min_z *= s; a.max_z *= s;
+@@ -224,7 +227,7 @@ public:
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+         const T one = S::from(1.0);
+-        const T t = S::from(params.at("t")), h = S::from(params.at("h"));
++        const T t = S::from(params[Ratio]), h = S::from(params[Height]);
+         const T u = std::clamp((y + S::from(0.5)*h) / h, S::from(0.0), one);
+         T s = one + u * (t - one);
+         s = S::maxv(s, S::from(1e-3));
+@@ -238,8 +241,8 @@ public:
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b = c.b;
+-        auto t = c.param_value(id, "t", params.at("t"));
+-        auto h = c.param_value(id, "h", params.at("h"));
++        auto t = c.param_value(id, "t", params[Ratio]);
++        auto h = c.param_value(id, "h", params[Height]);
+ 
+         auto half_h = b.CreateFMul(h, c.fc(0.5f));
+         auto u_raw  = b.CreateFDiv(b.CreateFAdd(y, half_h), h);
+diff --git a/core/frep/deformations_ad.cpp b/core/frep/deformations_ad.cpp
+index 9cc52ea..24e9873 100644
+--- a/core/frep/deformations_ad.cpp
++++ b/core/frep/deformations_ad.cpp
+@@ -80,7 +80,7 @@ FRepNode::DualVal TaperYNode::codegen_grad(CgCtx& c,
+     //   u = clamp((y + 0.5h)/h, 0, 1) ; s = max(1 + u(t-1), 1e-3)
+     //   child(x/s, y, z/s) / max(1, 1/s)
+     float t = params.at("t");
+-    float h = params.count("h") ? params.at("h") : 2.0f;
++    const float h = float(params.value_or("h", 2.0));
+     auto u_raw = ai::mul_s(c, ai::add_s(c, y, 0.5f * h), 1.0f / h);
+     auto u     = ai::clamp_s(c, u_raw, 0.0f, 1.0f);
+     auto s     = ai::max_s(c, ai::add_s(c, ai::mul_s(c, u, t - 1.0f), 1.0f), 1e-3f);
+diff --git a/core/frep/hep.hpp b/core/frep/hep.hpp
+index ee80cee..8191df5 100644
+--- a/core/frep/hep.hpp
++++ b/core/frep/hep.hpp
+@@ -116,21 +116,22 @@ inline T wedge_eval(T x, T y, T a, T d) {
+ class TubeNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Tube"; }
+ public:
++    enum : int { Rmin, Rmax, Hz, Phi0, Dphi };
+     TubeNode(double rmin, double rmax, double hz, double phi0, double dphi,
+              std::string nid = "tube") {
+         kind = NodeKind::Tube;
+         id = std::move(nid);
+-        params["rmin"] = rmin; params["rmax"] = rmax; params["hz"] = hz;
+-        params["phi0"] = phi0; params["dphi"] = dphi;
++        params.init({"rmin", "rmax", "hz", "phi0", "dphi"},
++                    {rmin, rmax, hz, phi0, dphi});
+     }
+ 
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+         const T rho = S::sqrtv(x * x + y * y);
+-        T f = S::maxv(rho - S::from(params.at("rmax")), S::absv(z) - S::from(params.at("hz")));
+-        if (params.at("rmin") > 0.0) f = S::maxv(f, S::from(params.at("rmin")) - rho);
+-        return S::maxv(f, wedge_eval<T>(x, y, S::from(params.at("phi0")), S::from(params.at("dphi"))));
++        T f = S::maxv(rho - S::from(params[Rmax]), S::absv(z) - S::from(params[Hz]));
++        if (params[Rmin] > 0.0) f = S::maxv(f, S::from(params[Rmin]) - rho);
++        return S::maxv(f, wedge_eval<T>(x, y, S::from(params[Phi0]), S::from(params[Dphi])));
+     }
+     FREP_EVAL_T
+ 
+@@ -138,14 +139,14 @@ public:
+                          llvm::Value* z) const override;
+ 
+     AABB aabb() const override {
+-        const float r = params.at("rmax"), h = params.at("hz");
++        const float r = params[Rmax], h = params[Hz];
+         return {-r, -r, -h, r, r, h};
+     }
+ 
+     std::size_t structural_hash() const noexcept override {
+         return phash(0x7C0B'E101ull,
+-                     {params.at("rmin"), params.at("rmax"), params.at("hz"),
+-                      params.at("phi0"), params.at("dphi")});
++                     {params[Rmin], params[Rmax], params[Hz],
++                      params[Phi0], params[Dphi]});
+     }
+ };
+ 
+@@ -155,33 +156,33 @@ public:
+ class ConeNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Cone"; }
+ public:
++    enum : int { Rmin1, Rmax1, Rmin2, Rmax2, Hz, Phi0, Dphi };
+     ConeNode(double rmin1, double rmax1, double rmin2, double rmax2, double hz,
+-             float phi0, float dphi, std::string nid = "cone") {
++             double phi0, double dphi, std::string nid = "cone") {
+         kind = NodeKind::Cone;
+         id = std::move(nid);
+-        params["rmin1"] = rmin1; params["rmax1"] = rmax1;
+-        params["rmin2"] = rmin2; params["rmax2"] = rmax2;
+-        params["hz"] = hz; params["phi0"] = phi0; params["dphi"] = dphi;
++        params.init({"rmin1", "rmax1", "rmin2", "rmax2", "hz", "phi0", "dphi"},
++                    {rmin1, rmax1, rmin2, rmax2, hz, phi0, dphi});
+     }
+ 
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+         const T rho = S::sqrtv(x * x + y * y);
+-        const T hz = S::from(params.at("hz"));
++        const T hz = S::from(params[Hz]);
+         const T u = (z + hz) / (S::from(2.0) * hz);
+-        const T r1 = S::from(params.at("rmax1")), r2 = S::from(params.at("rmax2"));
++        const T r1 = S::from(params[Rmax1]), r2 = S::from(params[Rmax2]);
+         const T Rmax = r1 + (r2 - r1) * u;
+         T f = S::maxv((rho - Rmax) / lat_scale<T>(double(r2) - double(r1),
+                                                   2.0 * double(hz)),
+                       S::absv(z) - hz);
+-        const T i1 = S::from(params.at("rmin1")), i2 = S::from(params.at("rmin2"));
++        const T i1 = S::from(params[Rmin1]), i2 = S::from(params[Rmin2]);
+         if (i1 > S::from(0.0) || i2 > S::from(0.0)) {
+             const T Rmin = i1 + (i2 - i1) * u;
+             f = S::maxv(f, (Rmin - rho) / lat_scale<T>(double(i2) - double(i1),
+                                                        2.0 * double(hz)));
+         }
+-        return S::maxv(f, wedge_eval<T>(x, y, S::from(params.at("phi0")), S::from(params.at("dphi"))));
++        return S::maxv(f, wedge_eval<T>(x, y, S::from(params[Phi0]), S::from(params[Dphi])));
+     }
+     FREP_EVAL_T
+ 
+@@ -189,16 +190,16 @@ public:
+                          llvm::Value* z) const override;
+ 
+     AABB aabb() const override {
+-        const float r = std::max(params.at("rmax1"), params.at("rmax2"));
+-        const float h = params.at("hz");
++        const float r = std::max(params[Rmax1], params[Rmax2]);
++        const float h = params[Hz];
+         return {-r, -r, -h, r, r, h};
+     }
+ 
+     std::size_t structural_hash() const noexcept override {
+         return phash(0x7C0B'E102ull,
+-                     {params.at("rmin1"), params.at("rmax1"), params.at("rmin2"),
+-                      params.at("rmax2"), params.at("hz"), params.at("phi0"),
+-                      params.at("dphi")});
++                     {params[Rmin1], params[Rmax1], params[Rmin2],
++                      params[Rmax2], params[Hz], params[Phi0],
++                      params[Dphi]});
+     }
+ };
+ 
+@@ -213,13 +214,13 @@ public:
+ class SphericalShellNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "SphericalShell"; }
+ public:
++    enum : int { Rmin, Rmax, Phi0, Dphi, Theta0, Dtheta };
+     SphericalShellNode(double rmin, double rmax, double phi0, double dphi,
+                        float theta0, float dtheta, std::string nid = "shell") {
+         kind = NodeKind::SphericalShell;
+         id = std::move(nid);
+-        params["rmin"] = rmin; params["rmax"] = rmax;
+-        params["phi0"] = phi0; params["dphi"] = dphi;
+-        params["theta0"] = theta0; params["dtheta"] = dtheta;
++        params.init({"rmin", "rmax", "phi0", "dphi", "theta0", "dtheta"},
++                    {rmin, rmax, phi0, dphi, theta0, dtheta});
+     }
+ 
+     template <class T>
+@@ -227,11 +228,11 @@ public:
+         using S = ScalarTraits<T>;
+         const T rho = S::sqrtv(x * x + y * y);
+         const T rad = S::sqrtv(rho * rho + z * z);
+-        T f = rad - S::from(params.at("rmax"));
+-        if (params.at("rmin") > 0.0) f = S::maxv(f, S::from(params.at("rmin")) - rad);
+-        f = S::maxv(f, wedge_eval<T>(x, y, S::from(params.at("phi0")), S::from(params.at("dphi"))));
+-        const T t0 = S::from(params.at("theta0"));
+-        const T t1 = t0 + S::from(params.at("dtheta"));
++        T f = rad - S::from(params[Rmax]);
++        if (params[Rmin] > 0.0) f = S::maxv(f, S::from(params[Rmin]) - rad);
++        f = S::maxv(f, wedge_eval<T>(x, y, S::from(params[Phi0]), S::from(params[Dphi])));
++        const T t0 = S::from(params[Theta0]);
++        const T t1 = t0 + S::from(params[Dtheta]);
+         // cos/sin in double and narrowed once - see wedge_coeffs.
+         if (t0 > S::from(1e-6))
+             f = S::maxv(f, -(rho * S::from(std::cos(double(t0))) -
+@@ -247,15 +248,15 @@ public:
+                          llvm::Value* z) const override;
+ 
+     AABB aabb() const override {
+-        const float r = params.at("rmax");
++        const float r = params[Rmax];
+         return {-r, -r, -r, r, r, r};
+     }
+ 
+     std::size_t structural_hash() const noexcept override {
+         return phash(0x7C0B'E103ull,
+-                     {params.at("rmin"), params.at("rmax"), params.at("phi0"),
+-                      params.at("dphi"), params.at("theta0"),
+-                      params.at("dtheta")});
++                     {params[Rmin], params[Rmax], params[Phi0],
++                      params[Dphi], params[Theta0],
++                      params[Dtheta]});
+     }
+ };
+ 
+@@ -265,22 +266,22 @@ public:
+ class TrapezoidNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Trapezoid"; }
+ public:
++    enum : int { Dx1, Dx2, Dy1, Dy2, Hz };
+     TrapezoidNode(double dx1, double dx2, double dy1, double dy2, double hz,
+                   std::string nid = "trd") {
+         kind = NodeKind::Trapezoid;
+         id = std::move(nid);
+-        params["dx1"] = dx1; params["dx2"] = dx2;
+-        params["dy1"] = dy1; params["dy2"] = dy2;
+-        params["hz"] = hz;
++        params.init({"dx1", "dx2", "dy1", "dy2", "hz"},
++                    {dx1, dx2, dy1, dy2, hz});
+     }
+ 
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+-        const T hz = S::from(params.at("hz"));
++        const T hz = S::from(params[Hz]);
+         const T u = (z + hz) / (S::from(2.0) * hz);
+-        const T x1 = S::from(params.at("dx1")), x2 = S::from(params.at("dx2"));
+-        const T y1 = S::from(params.at("dy1")), y2 = S::from(params.at("dy2"));
++        const T x1 = S::from(params[Dx1]), x2 = S::from(params[Dx2]);
++        const T y1 = S::from(params[Dy1]), y2 = S::from(params[Dy2]);
+         const T X = x1 + (x2 - x1) * u, Y = y1 + (y2 - y1) * u;
+         const T fx = (S::absv(x) - X) /
+                      lat_scale<T>(double(x2) - double(x1), 2.0 * double(hz));
+@@ -294,16 +295,16 @@ public:
+                          llvm::Value* z) const override;
+ 
+     AABB aabb() const override {
+-        const float ax = std::max(params.at("dx1"), params.at("dx2"));
+-        const float ay = std::max(params.at("dy1"), params.at("dy2"));
+-        const float h = params.at("hz");
++        const float ax = std::max(params[Dx1], params[Dx2]);
++        const float ay = std::max(params[Dy1], params[Dy2]);
++        const float h = params[Hz];
+         return {-ax, -ay, -h, ax, ay, h};
+     }
+ 
+     std::size_t structural_hash() const noexcept override {
+         return phash(0x7C0B'E104ull,
+-                     {params.at("dx1"), params.at("dx2"), params.at("dy1"),
+-                      params.at("dy2"), params.at("hz")});
++                     {params[Dx1], params[Dx2], params[Dy1],
++                      params[Dy2], params[Hz]});
+     }
+ };
+ 
+@@ -319,14 +320,14 @@ public:
+ class PolyhedronNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Polyhedron"; }
+ public:
++    enum : int { Rmin1, Rmax1, Rmin2, Rmax2, Hz, Phi0, Dphi, Nside };
+     PolyhedronNode(double rmin1, double rmax1, double rmin2, double rmax2, double hz,
+                    float phi0, float dphi, int nside, std::string nid = "poly") {
+         kind = NodeKind::Polyhedron;
+         id = std::move(nid);
+-        params["rmin1"] = rmin1; params["rmax1"] = rmax1;
+-        params["rmin2"] = rmin2; params["rmax2"] = rmax2;
+-        params["hz"] = hz; params["phi0"] = phi0; params["dphi"] = dphi;
+-        params["nside"] = float(nside);
++        params.init({"rmin1", "rmax1", "rmin2", "rmax2", "hz", "phi0", "dphi",
++                     "nside"},
++                    {rmin1, rmax1, rmin2, rmax2, hz, phi0, dphi, double(nside)});
+     }
+ 
+     /// The face normals, derived from phi0, dphi and nside. Recomputing the
+@@ -336,8 +337,8 @@ public:
+     /// on the three parameters it derives from so that editing one of them
+     /// cannot leave the field evaluating the old polygon.
+     const std::vector<double>& faces() const {
+-        const double p0 = params.at("phi0"), dp = params.at("dphi"),
+-                     ns = params.at("nside");
++        const double p0 = params[Phi0], dp = params[Dphi],
++                     ns = params[Nside];
+         if (f_.size() != std::size_t(2 * int(ns)) || fp0_ != p0 || fdp_ != dp) {
+             const int n = int(ns);
+             f_.resize(std::size_t(2 * n));
+@@ -361,20 +362,20 @@ public:
+         T r = S::from(-1e30);
+         for (std::size_t j = 0; j + 1 < fc.size(); j += 2)
+             r = S::maxv(r, x * S::from(fc[j]) + y * S::from(fc[j + 1]));
+-        const T hz = S::from(params.at("hz"));
++        const T hz = S::from(params[Hz]);
+         const T u = (z + hz) / (S::from(2.0) * hz);
+-        const T a1 = S::from(params.at("rmax1")), a2 = S::from(params.at("rmax2"));
++        const T a1 = S::from(params[Rmax1]), a2 = S::from(params[Rmax2]);
+         const T Rmax = a1 + (a2 - a1) * u;
+         T f = S::maxv((r - Rmax) / lat_scale<T>(double(a2) - double(a1),
+                                                 2.0 * double(hz)),
+                       S::absv(z) - hz);
+-        const T i1 = S::from(params.at("rmin1")), i2 = S::from(params.at("rmin2"));
++        const T i1 = S::from(params[Rmin1]), i2 = S::from(params[Rmin2]);
+         if (i1 > S::from(0.0) || i2 > S::from(0.0)) {
+             const T Rmin = i1 + (i2 - i1) * u;
+             f = S::maxv(f, (Rmin - r) / lat_scale<T>(double(i2) - double(i1),
+                                                      2.0 * double(hz)));
+         }
+-        return S::maxv(f, wedge_eval<T>(x, y, S::from(params.at("phi0")), S::from(params.at("dphi"))));
++        return S::maxv(f, wedge_eval<T>(x, y, S::from(params[Phi0]), S::from(params[Dphi])));
+     }
+     FREP_EVAL_T
+ 
+@@ -385,19 +386,19 @@ public:
+     /// 1/cos(w/2). Using rmax directly would cut the corners off the box and
+     /// make the BVH drop rays that really do hit the solid.
+     AABB aabb() const override {
+-        const float n = params.at("nside");
+-        const float w = params.at("dphi") / (n > 0.0f ? n : 1.0f);
+-        const float r = std::max(params.at("rmax1"), params.at("rmax2")) /
++        const float n = params[Nside];
++        const float w = params[Dphi] / (n > 0.0f ? n : 1.0f);
++        const float r = std::max(params[Rmax1], params[Rmax2]) /
+                         std::cos(0.5f * w);
+-        const float h = params.at("hz");
++        const float h = params[Hz];
+         return {-r, -r, -h, r, r, h};
+     }
+ 
+     std::size_t structural_hash() const noexcept override {
+         return phash(0x7C0B'E105ull,
+-                     {params.at("rmin1"), params.at("rmax1"), params.at("rmin2"),
+-                      params.at("rmax2"), params.at("hz"), params.at("phi0"),
+-                      params.at("dphi"), params.at("nside")});
++                     {params[Rmin1], params[Rmax1], params[Rmin2],
++                      params[Rmax2], params[Hz], params[Phi0],
++                      params[Dphi], params[Nside]});
+     }
+ 
+ private:
+@@ -412,23 +413,25 @@ private:
+ class FrameNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Frame"; }
+ public:
++    enum : int { R0, R1, R2, R3, R4, R5, R6, R7, R8, Tx, Ty, Tz };
+     FrameNode(Ptr child, const double r[9], double tx, double ty, double tz,
+               std::string nid = "frame") {
+         kind = NodeKind::Frame;
+         id = std::move(nid);
+         children.push_back(std::move(child));
+-        for (int i = 0; i < 9; ++i)
+-            params["r" + std::to_string(i)] = r[i];
+-        params["tx"] = tx; params["ty"] = ty; params["tz"] = tz;
++        params.init({"r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8",
++                     "tx", "ty", "tz"},
++                    {r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8],
++                     tx, ty, tz});
+     }
+ 
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+-        const T dx = x - S::from(params.at("tx")), dy = y - S::from(params.at("ty")), dz = z - S::from(params.at("tz"));
+-        const T r0 = S::from(params.at("r0")), r1 = S::from(params.at("r1")), r2 = S::from(params.at("r2"));
+-        const T r3 = S::from(params.at("r3")), r4 = S::from(params.at("r4")), r5 = S::from(params.at("r5"));
+-        const T r6 = S::from(params.at("r6")), r7 = S::from(params.at("r7")), r8 = S::from(params.at("r8"));
++        const T dx = x - S::from(params[Tx]), dy = y - S::from(params[Ty]), dz = z - S::from(params[Tz]);
++        const T r0 = S::from(params[R0]), r1 = S::from(params[R1]), r2 = S::from(params[R2]);
++        const T r3 = S::from(params[R3]), r4 = S::from(params[R4]), r5 = S::from(params[R5]);
++        const T r6 = S::from(params[R6]), r7 = S::from(params[R7]), r8 = S::from(params[R8]);
+         return children[0]->eval_as<T>(r0 * dx + r3 * dy + r6 * dz,
+                                        r1 * dx + r4 * dy + r7 * dz,
+                                        r2 * dx + r5 * dy + r8 * dz);
+@@ -442,10 +445,10 @@ public:
+     /// a transformed AABB is conservative, which is the safe direction.
+     AABB aabb() const override {
+         const AABB a = children[0]->aabb();
+-        const float r0 = params.at("r0"), r1 = params.at("r1"), r2 = params.at("r2");
+-        const float r3 = params.at("r3"), r4 = params.at("r4"), r5 = params.at("r5");
+-        const float r6 = params.at("r6"), r7 = params.at("r7"), r8 = params.at("r8");
+-        const float tx = params.at("tx"), ty = params.at("ty"), tz = params.at("tz");
++        const float r0 = params[R0], r1 = params[R1], r2 = params[R2];
++        const float r3 = params[R3], r4 = params[R4], r5 = params[R5];
++        const float r6 = params[R6], r7 = params[R7], r8 = params[R8];
++        const float tx = params[Tx], ty = params[Ty], tz = params[Tz];
+         AABB o{1e30f, 1e30f, 1e30f, -1e30f, -1e30f, -1e30f};
+         for (int k = 0; k < 8; ++k) {
+             const float qx = (k & 1) ? a.max_x : a.min_x;
+@@ -463,10 +466,10 @@ public:
+ 
+     std::size_t structural_hash() const noexcept override {
+         std::size_t h = phash(0x7C0B'E106ull,
+-                              {params.at("r0"), params.at("r1"), params.at("r2"),
+-                               params.at("r3"), params.at("r4"), params.at("r5"),
+-                               params.at("r6"), params.at("r7"), params.at("r8"),
+-                               params.at("tx"), params.at("ty"), params.at("tz")});
++                              {params[R0], params[R1], params[R2],
++                               params[R3], params[R4], params[R5],
++                               params[R6], params[R7], params[R8],
++                               params[Tx], params[Ty], params[Tz]});
+         return h * 1099511628211ull ^ children[0]->structural_hash();
+     }
+ };
+diff --git a/core/frep/hep_codegen.cpp b/core/frep/hep_codegen.cpp
+index bd3d839..5ba97ce 100644
+--- a/core/frep/hep_codegen.cpp
++++ b/core/frep/hep_codegen.cpp
+@@ -63,15 +63,15 @@ Value* uof_(CgCtx& c, Value* z, Value* hz) {
+ // ── Tube ─────────────────────────────────────────────────────────────────────
+ Value* TubeNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+     auto& b = c.b;
+-    auto* rmax = c.param_value(id, "rmax", params.at("rmax"));
+-    auto* hz = c.param_value(id, "hz", params.at("hz"));
++    auto* rmax = c.param_value(id, "rmax", params[Rmax]);
++    auto* hz = c.param_value(id, "hz", params[Hz]);
+     auto* rho = rho_(c, x, y);
+     Value* f = mx(c, b.CreateFSub(rho, rmax, "outer"), zcap_(c, z, hz));
+-    if (params.at("rmin") > 0.0f) {
+-        auto* rmin = c.param_value(id, "rmin", params.at("rmin"));
++    if (params[Rmin] > 0.0f) {
++        auto* rmin = c.param_value(id, "rmin", params[Rmin]);
+         f = mx(c, f, b.CreateFSub(rmin, rho, "inner"));
+     }
+-    if (auto* w = wedge_(c, x, y, float(params.at("phi0")), float(params.at("dphi"))))
++    if (auto* w = wedge_(c, x, y, float(params[Phi0]), float(params[Dphi])))
+         f = mx(c, f, w);
+     return f;
+ }
+@@ -79,8 +79,8 @@ Value* TubeNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+ // ── Cone ─────────────────────────────────────────────────────────────────────
+ Value* ConeNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+     auto& b = c.b;
+-    const float hzf = params.at("hz");
+-    const float a1 = params.at("rmax1"), a2 = params.at("rmax2");
++    const float hzf = params[Hz];
++    const float a1 = params[Rmax1], a2 = params[Rmax2];
+         auto* hz = c.param_value(id, "hz", hzf);
+     auto* r1 = c.param_value(id, "rmax1", a1);
+     auto* u = uof_(c, z, hz);
+@@ -90,7 +90,7 @@ Value* ConeNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+                   b.CreateFDiv(b.CreateFSub(rho, Rmax, "dout"),
+                                c.fc(lat_scale<float>(double(a2) - double(a1), 2.0 * double(hzf))), "lat"),
+                   zcap_(c, z, hz));
+-    const float i1 = params.at("rmin1"), i2 = params.at("rmin2");
++    const float i1 = params[Rmin1], i2 = params[Rmin2];
+     if (i1 > 0.0f || i2 > 0.0f) {
+                 auto* q1 = c.param_value(id, "rmin1", i1);
+         auto* Rmin = b.CreateFAdd(q1, b.CreateFMul(c.fc(i2 - i1), u, "dri"), "Rmin");
+@@ -98,7 +98,7 @@ Value* ConeNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+                b.CreateFDiv(b.CreateFSub(Rmin, rho, "din"),
+                             c.fc(lat_scale<float>(double(i2) - double(i1), 2.0 * double(hzf))), "lati"));
+     }
+-    if (auto* w = wedge_(c, x, y, float(params.at("phi0")), float(params.at("dphi"))))
++    if (auto* w = wedge_(c, x, y, float(params[Phi0]), float(params[Dphi])))
+         f = mx(c, f, w);
+     return f;
+ }
+@@ -110,16 +110,16 @@ Value* SphericalShellNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const
+     // rad from rho, not from x,y,z - see hep.hpp.
+     auto* rad = sqrt_(c, b.CreateFAdd(b.CreateFMul(rho, rho, "rho2"),
+                                       b.CreateFMul(z, z, "z2"), "rad2"));
+-    auto* rmax = c.param_value(id, "rmax", params.at("rmax"));
++    auto* rmax = c.param_value(id, "rmax", params[Rmax]);
+     Value* f = b.CreateFSub(rad, rmax, "outer");
+-    if (params.at("rmin") > 0.0f) {
+-        auto* rmin = c.param_value(id, "rmin", params.at("rmin"));
++    if (params[Rmin] > 0.0f) {
++        auto* rmin = c.param_value(id, "rmin", params[Rmin]);
+         f = mx(c, f, b.CreateFSub(rmin, rad, "inner"));
+     }
+-    if (auto* w = wedge_(c, x, y, float(params.at("phi0")), float(params.at("dphi"))))
++    if (auto* w = wedge_(c, x, y, float(params[Phi0]), float(params[Dphi])))
+         f = mx(c, f, w);
+-    const float t0 = params.at("theta0");
+-    const float t1 = t0 + params.at("dtheta");
++    const float t0 = params[Theta0];
++    const float t1 = t0 + params[Dtheta];
+     auto cone = [&](float ct, float st, bool neg) {
+         auto* v = b.CreateFSub(b.CreateFMul(rho, c.fc(ct)),
+                                b.CreateFMul(z, c.fc(st)), "cone");
+@@ -133,9 +133,9 @@ Value* SphericalShellNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const
+ // ── Trapezoid ────────────────────────────────────────────────────────────────
+ Value* TrapezoidNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+     auto& b = c.b;
+-    const float hzf = params.at("hz");
+-    const float x1 = params.at("dx1"), x2 = params.at("dx2");
+-    const float y1 = params.at("dy1"), y2 = params.at("dy2");
++    const float hzf = params[Hz];
++    const float x1 = params[Dx1], x2 = params[Dx2];
++    const float y1 = params[Dy1], y2 = params[Dy2];
+         auto* hz = c.param_value(id, "hz", hzf);
+     auto* u = uof_(c, z, hz);
+     auto face = [&](const char* p0, float v0, float v1, Value* coord) {
+@@ -162,8 +162,8 @@ Value* PolyhedronNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+                                b.CreateFMul(y, c.fc(float(fc[j + 1]))), "face");
+         r = r ? mx(c, r, u) : u;
+     }
+-    const float hzf = params.at("hz");
+-    const float a1 = params.at("rmax1"), a2 = params.at("rmax2");
++    const float hzf = params[Hz];
++    const float a1 = params[Rmax1], a2 = params[Rmax2];
+         auto* hz = c.param_value(id, "hz", hzf);
+     auto* r1 = c.param_value(id, "rmax1", a1);
+     auto* u = uof_(c, z, hz);
+@@ -172,7 +172,7 @@ Value* PolyhedronNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+                   b.CreateFDiv(b.CreateFSub(r, Rmax, "dout"),
+                                c.fc(lat_scale<float>(double(a2) - double(a1), 2.0 * double(hzf))), "lat"),
+                   zcap_(c, z, hz));
+-    const float i1 = params.at("rmin1"), i2 = params.at("rmin2");
++    const float i1 = params[Rmin1], i2 = params[Rmin2];
+     if (i1 > 0.0f || i2 > 0.0f) {
+                 auto* q1 = c.param_value(id, "rmin1", i1);
+         auto* Rmin = b.CreateFAdd(q1, b.CreateFMul(c.fc(i2 - i1), u, "dri"), "Rmin");
+@@ -180,7 +180,7 @@ Value* PolyhedronNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+                b.CreateFDiv(b.CreateFSub(Rmin, r, "din"),
+                             c.fc(lat_scale<float>(double(i2) - double(i1), 2.0 * double(hzf))), "lati"));
+     }
+-    if (auto* w = wedge_(c, x, y, float(params.at("phi0")), float(params.at("dphi"))))
++    if (auto* w = wedge_(c, x, y, float(params[Phi0]), float(params[Dphi])))
+         f = mx(c, f, w);
+     return f;
+ }
+@@ -188,18 +188,23 @@ Value* PolyhedronNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+ // ── Frame ────────────────────────────────────────────────────────────────────
+ Value* FrameNode::codegen(CgCtx& c, Value* x, Value* y, Value* z) const {
+     auto& b = c.b;
+-    auto P = [&](const char* n) { return c.param_value(id, n, params.at(n)); };
+-    auto* dx = b.CreateFSub(x, P("tx"), "dx");
+-    auto* dy = b.CreateFSub(y, P("ty"), "dy");
+-    auto* dz = b.CreateFSub(z, P("tz"), "dz");
+-    auto row = [&](const char* a, const char* d, const char* g) {
++    // The name stays for the slot key; the VALUE comes by index.
++    auto P = [&](const char* n, int i) {
++        return c.param_value(id, n, float(params[i]));
++    };
++    auto* dx = b.CreateFSub(x, P("tx", Tx), "dx");
++    auto* dy = b.CreateFSub(y, P("ty", Ty), "dy");
++    auto* dz = b.CreateFSub(z, P("tz", Tz), "dz");
++    static const char* kRow[9] = {"r0", "r1", "r2", "r3", "r4",
++                                  "r5", "r6", "r7", "r8"};
++    auto row = [&](int a, int d, int g) {
+         return b.CreateFAdd(
+-            b.CreateFAdd(b.CreateFMul(P(a), dx), b.CreateFMul(P(d), dy)),
+-            b.CreateFMul(P(g), dz), "q");
++            b.CreateFAdd(b.CreateFMul(P(kRow[a], R0 + a), dx),
++                         b.CreateFMul(P(kRow[d], R0 + d), dy)),
++            b.CreateFMul(P(kRow[g], R0 + g), dz), "q");
+     };
+     // q = R^T (p - t), with R row-major in r0..r8.
+-    return children[0]->codegen(c, row("r0", "r3", "r6"), row("r1", "r4", "r7"),
+-                                row("r2", "r5", "r8"));
++    return children[0]->codegen(c, row(0, 3, 6), row(1, 4, 7), row(2, 5, 8));
+ }
+ 
+ }  // namespace frep::hep
+diff --git a/core/frep/node.hpp b/core/frep/node.hpp
+index eef400e..34acbfb 100644
+--- a/core/frep/node.hpp
++++ b/core/frep/node.hpp
+@@ -7,6 +7,7 @@
+ // The FRepNode tree is the program — the model is source code.
+ 
+ #include "core/frep/node_kind.hpp"
++#include "core/frep/param_store.hpp"
+ 
+ #include <llvm/IR/IRBuilder.h>
+ #include <llvm/IR/LLVMContext.h>
+@@ -186,16 +187,24 @@ public:
+     NodeKind    kind;
+     std::string id;
+     std::vector<Ptr> children;
+-    // Double, not float, and this is a STORAGE decision rather than a speed
+-    // one. A radius arriving from a detector description is a double; putting
+-    // it in a float map rounds it once, before any evaluation, and the ~1e-4
+-    // mm that costs at 10 m cannot be recovered by evaluating carefully
+-    // afterwards. scene_io already wrote these out as double, so the map was
+-    // the only place the value was narrowed and a json round trip was losing
+-    // precision the file on disk already held correctly.
++    // An ORDERED VECTOR of doubles, not a map of float, and those are two
++    // separate decisions.
+     //
+-    // The EVALUATION type is a separate question - see eval / evalw below.
+-    std::unordered_map<std::string, double> params;
++    // Double because a radius arriving from a detector description is a
++    // double: a float store rounds it once, before any arithmetic happens,
++    // and the ~1e-4 mm that costs at 10 m cannot be recovered afterwards.
++    // scene_io already WROTE these as double, so the store was the only place
++    // the value was narrowed and a json round trip lost precision the file on
++    // disk held correctly.
++    //
++    // A vector because the map was the evaluator: 40 of a BoxNode::eval's 45
++    // ns were three hash lookups of short strings. Each node addresses its
++    // own parameters by index (its `enum : int` beside the constructor, in
++    // node_param_schema order); name lookup stays available for I/O and the
++    // editor. See param_store.hpp.
++    //
++    // The EVALUATION type is a third question - see eval / evalw below.
++    ParamStore params;
+ 
+     // Generates LLVM IR — returns a float Value* (the SDF value at point x,y,z).
+     // Marked AlwaysInline → O3 inlines it directly into render_tile.
+@@ -372,12 +381,9 @@ inline bool node_is_unit_lipschitz(const FRepNode& n) {
+         case NodeKind::Instance:      // metric-ness follows the shared target
+             break;                       // gradient-preserving
+         case NodeKind::Scale: {          // sound only if every |factor| >= 1 (never amplifies)
+-            auto ax = n.params.find("sx");
+-            auto ay = n.params.find("sy");
+-            auto az = n.params.find("sz");
+-            float sx = ax==n.params.end()?1.0f:ax->second;
+-            float sy = ay==n.params.end()?1.0f:ay->second;
+-            float sz = az==n.params.end()?1.0f:az->second;
++            const float sx = float(n.params.value_or("sx", 1.0));
++            const float sy = float(n.params.value_or("sy", 1.0));
++            const float sz = float(n.params.value_or("sz", 1.0));
+             if (std::abs(sx) < 1.0f || std::abs(sy) < 1.0f || std::abs(sz) < 1.0f) return false;
+             break;
+         }
+diff --git a/core/frep/operations.hpp b/core/frep/operations.hpp
+index 66baf2c..20dfa35 100644
+--- a/core/frep/operations.hpp
++++ b/core/frep/operations.hpp
+@@ -119,15 +119,16 @@ public:
+ class SmoothUnionNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "SmoothUnion"; }
+ public:
++    enum : int { K };
+     SmoothUnionNode(FRepNode::Ptr a, FRepNode::Ptr b, float k, std::string nid = "smin") {
+         kind = NodeKind::SmoothUnion; id = std::move(nid);
+-        params["k"] = k;
++        params.init({"k"}, {k});
+         children = {std::move(a), std::move(b)};
+     }
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b = c.b;
+-        float kv = params.at("k");
++        float kv = params[K];
+         auto  da = children[0]->codegen(c, x, y, z);
+         auto  db = children[1]->codegen(c, x, y, z);
+ 
+@@ -160,7 +161,7 @@ public:
+         using S = ScalarTraits<T>;
+         const T a = children[0]->eval_as<T>(x,y,z);
+         const T b = children[1]->eval_as<T>(x,y,z);
+-        const T k = S::from(params.at("k"));
++        const T k = S::from(params[K]);
+         const T z0 = S::from(0.0);
+         if (k <= z0) return S::minv(a, b);
+         // Cubic polynomial smin (must match codegen() exactly for parity).
+@@ -171,7 +172,7 @@ public:
+     FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return (children[0]->structural_hash() * 2654435761ull)
+-             ^ std::hash<double>{}(params.at("k"))
++             ^ std::hash<double>{}(params[K])
+              ^ 0x9900'AABBull;
+     }
+ };
+diff --git a/core/frep/param_store.hpp b/core/frep/param_store.hpp
+new file mode 100644
+index 0000000..6293726
+--- /dev/null
++++ b/core/frep/param_store.hpp
+@@ -0,0 +1,105 @@
++// core/frep/param_store.hpp
++//
++// A node's parameters as an ORDERED VECTOR, reachable by index on the hot
++// path and by name everywhere else.
++//
++// The measurement that forced this: of the 45 ns a BoxNode::eval takes, 40
++// are three lookups in an unordered_map<std::string, double>. FD4's CPU
++// evaluator was ~90% hash table and ~10% arithmetic, and no amount of
++// careful floating point moves a number that is dominated by hashing three
++// short strings. A radius does not need to be found; its position is a
++// property of the node's type.
++//
++// The order is the CONSTRUCTOR's insertion order, which is also the order
++// node_param_schema() lists - tests/test_param_schema.cpp asserts the two
++// agree name for name AND position, so a node's index constants cannot drift
++// from the schema that assigns its runtime slots.
++//
++// Names are kept beside the values rather than being dropped, because the
++// editor, the serialiser and the GLSL emitter all address parameters by name
++// and none of them is on a hot path. A name lookup here is a linear scan over
++// at most twelve short strings with no hashing and no allocation, which is
++// already faster than the hash map it replaces; the point of the vector is
++// that the node bodies do not scan at all.
++//
++// Names outside the schema are allowed and simply append: a plugin node
++// defines its own parameters and must keep working.
++
++#pragma once
++
++#include <cstddef>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace frep {
++
++class ParamStore {
++public:
++    // ── the hot path: position, fixed by the node's own index constants ────
++    double operator[](int i) const noexcept { return v_[std::size_t(i)]; }
++    double& operator[](int i) noexcept { return v_[std::size_t(i)]; }
++    const double* data() const noexcept { return v_.data(); }
++
++    // ── by name: I/O, the editor, emitters, anything generic over kinds ───
++
++    /// Existing parameter, or a new one appended at the end.
++    double& operator[](std::string_view n) {
++        if (double* p = get(n)) return *p;
++        n_.emplace_back(n);
++        v_.push_back(0.0);
++        return v_.back();
++    }
++
++    double at(std::string_view n) const {
++        if (const double* p = get(n)) return *p;
++        throw std::out_of_range("FRepNode has no parameter '" +
++                                std::string(n) + "'");
++    }
++
++    double* get(std::string_view n) noexcept {
++        const std::size_t i = index_of(n);
++        return i == npos ? nullptr : &v_[i];
++    }
++    const double* get(std::string_view n) const noexcept {
++        const std::size_t i = index_of(n);
++        return i == npos ? nullptr : &v_[i];
++    }
++
++    double value_or(std::string_view n, double d) const noexcept {
++        const double* p = get(n);
++        return p ? *p : d;
++    }
++    bool contains(std::string_view n) const noexcept {
++        return index_of(n) != npos;
++    }
++
++    // ── by position, for serialising and hashing ──────────────────────────
++    std::size_t size() const noexcept { return v_.size(); }
++    bool empty() const noexcept { return v_.empty(); }
++    const std::string& name(std::size_t i) const noexcept { return n_[i]; }
++    double value(std::size_t i) const noexcept { return v_[i]; }
++
++    /// Reserve `k` slots so a constructor can assign by index without
++    /// inserting names one at a time. The names still come from the schema.
++    void init(std::initializer_list<std::string_view> names,
++              std::initializer_list<double> vals) {
++        n_.assign(names.begin(), names.end());
++        v_.assign(vals.begin(), vals.end());
++    }
++
++    static constexpr std::size_t npos = std::size_t(-1);
++
++private:
++    std::size_t index_of(std::string_view n) const noexcept {
++        for (std::size_t i = 0; i < n_.size(); ++i)
++            if (n_[i] == n) return i;
++        return npos;
++    }
++
++    std::vector<std::string> n_;
++    std::vector<double>      v_;
++};
++
++}  // namespace frep
+diff --git a/core/frep/primitives.hpp b/core/frep/primitives.hpp
+index 7151c02..418e161 100644
+--- a/core/frep/primitives.hpp
++++ b/core/frep/primitives.hpp
+@@ -16,9 +16,12 @@ namespace frep {
+ class SphereNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Sphere"; }
+ public:
++    /// Index constants, in node_param_schema(Sphere) order. The schema and
++    /// this enum are checked against each other in test_param_schema.cpp.
++    enum : int { R };
+     explicit SphereNode(double r, std::string nid = "sphere") {
+         kind = NodeKind::Sphere; id = std::move(nid);
+-        params["r"] = r;
++        params.init({"r"}, {r});
+     }
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+@@ -29,7 +32,7 @@ public:
+         auto  s  = b.CreateFAdd(b.CreateFAdd(sx, sy), sz, "len2");
+         // unary_intrinsic: LLVM-version-compatible wrapper for unary intrinsics.
+         auto  ln = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sqrt, s, "len");
+-        return b.CreateFSub(ln, c.param_value(id, "r", params.at("r")), "sph");
++        return b.CreateFSub(ln, c.param_value(id, "r", params[R]), "sph");
+     }
+ 
+     // Exact AD for the sphere SDF.
+@@ -41,12 +44,12 @@ public:
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+-        return S::sqrtv(x*x + y*y + z*z) - S::from(params.at("r"));
++        return S::sqrtv(x*x + y*y + z*z) - S::from(params[R]);
+     }
+     FREP_EVAL_T
+ 
+     std::size_t structural_hash() const noexcept override {
+-        return std::hash<double>{}(params.at("r")) ^ 0xF5E8'A1C3ull;
++        return std::hash<double>{}(params[R]) ^ 0xF5E8'A1C3ull;
+     }
+ };
+ 
+@@ -55,9 +58,10 @@ public:
+ class BoxNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Box"; }
+ public:
++    enum : int { Hx, Hy, Hz };
+     BoxNode(double hx, double hy, double hz, std::string nid = "box") {
+         kind = NodeKind::Box; id = std::move(nid);
+-        params["hx"] = hx; params["hy"] = hy; params["hz"] = hz;
++        params.init({"hx", "hy", "hz"}, {hx, hy, hz});
+     }
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+@@ -69,9 +73,9 @@ public:
+             return frep::llvm_compat::max_num(b, a, bv);
+         };
+         auto* f0 = c.fc(0.0f);  // width-aware (splats in SIMD mode)
+-        auto dx = b.CreateFSub(fabs_v(x), c.param_value(id, "hx", params.at("hx")), "dx");
+-        auto dy = b.CreateFSub(fabs_v(y), c.param_value(id, "hy", params.at("hy")), "dy");
+-        auto dz = b.CreateFSub(fabs_v(z), c.param_value(id, "hz", params.at("hz")), "dz");
++        auto dx = b.CreateFSub(fabs_v(x), c.param_value(id, "hx", params[Hx]), "dx");
++        auto dy = b.CreateFSub(fabs_v(y), c.param_value(id, "hy", params[Hy]), "dy");
++        auto dz = b.CreateFSub(fabs_v(z), c.param_value(id, "hz", params[Hz]), "dz");
+         // True Euclidean box SDF: length(max(d,0)) + min(max(dx,dy,dz),0).
+         // Matches eval() (see the note there) — Chebyshev max(d) alone
+         // under-estimates the distance to far corners, breaking BVH
+@@ -94,9 +98,9 @@ public:
+         // True Euclidean box SDF (Inigo Quilez). The Chebyshev form max(dx,
+         // dy,dz) under-estimates the distance to a far corner, which breaks
+         // the BVH's pruning invariant and shortens every sphere-tracing step.
+-        const T dx = S::absv(x) - S::from(params.at("hx"));
+-        const T dy = S::absv(y) - S::from(params.at("hy"));
+-        const T dz = S::absv(z) - S::from(params.at("hz"));
++        const T dx = S::absv(x) - S::from(params[Hx]);
++        const T dy = S::absv(y) - S::from(params[Hy]);
++        const T dz = S::absv(z) - S::from(params[Hz]);
+         const T z0 = S::from(0.0);
+         const T ox = S::maxv(dx, z0), oy = S::maxv(dy, z0), oz = S::maxv(dz, z0);
+         const T outside = S::sqrtv(ox*ox + oy*oy + oz*oz);
+@@ -107,8 +111,11 @@ public:
+ 
+     std::size_t structural_hash() const noexcept override {
+         std::size_t h = 0xBBB2;
+-        for (auto& [k, v] : params)
+-            h ^= std::hash<double>{}(v) + 0x9e37'79b9ull + (h << 6) + (h >> 2);
++        // By position, so the hash is stable: the old loop walked an
++        // unordered_map, whose order is unspecified by the standard.
++        for (std::size_t i = 0; i < params.size(); ++i)
++            h ^= std::hash<double>{}(params.value(i)) + 0x9e37'79b9ull +
++                 (h << 6) + (h >> 2);
+         return h;
+     }
+ };
+@@ -118,19 +125,20 @@ public:
+ class PlaneNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Plane"; }
+ public:
++    enum : int { Nx, Ny, Nz, D };
+     PlaneNode(double nx, double ny, double nz, double d, std::string nid = "plane") {
+         kind = NodeKind::Plane; id = std::move(nid);
+-        params["nx"] = nx; params["ny"] = ny; params["nz"] = nz; params["d"] = d;
++        params.init({"nx", "ny", "nz", "d"}, {nx, ny, nz, d});
+     }
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b = c.b;
+         auto dot = b.CreateFAdd(
+             b.CreateFAdd(
+-                b.CreateFMul(c.param_value(id, "nx", params.at("nx")), x),
+-                b.CreateFMul(c.param_value(id, "ny", params.at("ny")), y)),
+-            b.CreateFMul(c.param_value(id, "nz", params.at("nz")), z), "dot");
+-        return b.CreateFAdd(dot, c.param_value(id, "d", params.at("d")), "plane");
++                b.CreateFMul(c.param_value(id, "nx", params[Nx]), x),
++                b.CreateFMul(c.param_value(id, "ny", params[Ny]), y)),
++            b.CreateFMul(c.param_value(id, "nz", params[Nz]), z), "dot");
++        return b.CreateFAdd(dot, c.param_value(id, "d", params[D]), "plane");
+     }
+ 
+     DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y, DualVal z) const override;
+@@ -139,14 +147,17 @@ public:
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+-        return S::from(params.at("nx"))*x + S::from(params.at("ny"))*y + S::from(params.at("nz"))*z + S::from(params.at("d"));
++        return S::from(params[Nx])*x + S::from(params[Ny])*y + S::from(params[Nz])*z + S::from(params[D]);
+     }
+     FREP_EVAL_T
+ 
+     std::size_t structural_hash() const noexcept override {
+         std::size_t h = 0xF1A7;
+-        for (auto& [k, v] : params)
+-            h ^= std::hash<double>{}(v) + 0x9e37'79b9ull + (h << 6) + (h >> 2);
++        // By position, so the hash is stable: the old loop walked an
++        // unordered_map, whose order is unspecified by the standard.
++        for (std::size_t i = 0; i < params.size(); ++i)
++            h ^= std::hash<double>{}(params.value(i)) + 0x9e37'79b9ull +
++                 (h << 6) + (h >> 2);
+         return h;
+     }
+ };
+diff --git a/core/frep/scene.cpp b/core/frep/scene.cpp
+index 77684f9..c5fcf25 100644
+--- a/core/frep/scene.cpp
++++ b/core/frep/scene.cpp
+@@ -151,8 +151,7 @@ void SceneGraph::set_rotation_axis(const std::string& id, int axis, float angle_
+     while (is_rotation_tag(inner) && !inner->children.empty()) {
+         std::string t = gizmo_tag(inner);
+         int a = (t == "RotateX") ? 0 : (t == "RotateY") ? 1 : 2;
+-        auto p = inner->params.find("a");
+-        ang[a] = (p != inner->params.end()) ? p->second : 0.0f;
++        ang[a] = float(inner->params.value_or("a", 0.0));
+         present[a] = true;
+         inner = inner->children[0];
+     }
+@@ -188,8 +187,7 @@ float SceneGraph::get_rotation_axis(const std::string& id, int axis) const {
+         n = n->children[0];
+     while (is_rotation_tag(n) && !n->children.empty()) {
+         if (gizmo_tag(n) == want) {
+-            auto p = n->params.find("a");
+-            return (p != n->params.end()) ? p->second : 0.0f;
++            return float(n->params.value_or("a", 0.0));
+         }
+         n = n->children[0];
+     }
+@@ -237,8 +235,7 @@ float SceneGraph::get_rotation_y(const std::string& id) const {
+     if (gizmo_tag(n) == std::string("Translate") && !n->children.empty())
+         n = n->children[0];
+     if (gizmo_tag(n) == std::string("RotateY")) {
+-        auto p = n->params.find("a");
+-        if (p != n->params.end()) return p->second;
++        if (const double* p = n->params.get("a")) return float(*p);
+     }
+     return 0.0f;
+ }
+@@ -252,8 +249,7 @@ float SceneGraph::get_scale(const std::string& id) const {
+     while (is_rotation_tag(n) && !n->children.empty())
+         n = n->children[0];
+     if (gizmo_tag(n) == std::string("Scale")) {
+-        auto p = n->params.find("sx");
+-        if (p != n->params.end()) return p->second;
++        if (const double* p = n->params.get("sx")) return float(*p);
+     }
+     return 1.0f;
+ }
+@@ -298,10 +294,9 @@ void SceneGraph::get_scale_xyz(const std::string& id, float& sx, float& sy, floa
+     while (is_rotation_tag(n) && !n->children.empty())
+         n = n->children[0];
+     if (gizmo_tag(n) == std::string("Scale")) {
+-        auto px=n->params.find("sx"), py=n->params.find("sy"), pz=n->params.find("sz");
+-        if (px!=n->params.end()) sx=px->second;
+-        if (py!=n->params.end()) sy=py->second;
+-        if (pz!=n->params.end()) sz=pz->second;
++        sx = float(n->params.value_or("sx", double(sx)));
++        sy = float(n->params.value_or("sy", double(sy)));
++        sz = float(n->params.value_or("sz", double(sz)));
+     }
+ }
+ 
+@@ -324,9 +319,9 @@ bool SceneGraph::get_node_param(const std::string& object_id, const std::string&
+     // find_node_by_id needs a mutable ref; we only read, so const_cast is safe here.
+     FRepNode* n = find_node_by_id(const_cast<FRepNode&>(*it->second.geometry), node_id);
+     if (!n) return false;
+-    auto p = n->params.find(param);
+-    if (p == n->params.end()) return false;
+-    out = p->second;
++    double* p = n->params.get(param);
++    if (!p) return false;
++    out = float(*p);
+     return true;
+ }
+ 
+diff --git a/core/frep/transforms.hpp b/core/frep/transforms.hpp
+index 55a9cb5..17e92f7 100644
+--- a/core/frep/transforms.hpp
++++ b/core/frep/transforms.hpp
+@@ -15,18 +15,19 @@ namespace frep {
+ class TranslateNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Translate"; }
+ public:
++    enum : int { Tx, Ty, Tz };
+     TranslateNode(FRepNode::Ptr child, float tx, float ty, float tz,
+                   std::string nid = "tr") {
+         kind = NodeKind::Translate; id = std::move(nid);
+-        params["tx"] = tx; params["ty"] = ty; params["tz"] = tz;
++        params.init({"tx", "ty", "tz"}, {tx, ty, tz});
+         children = {std::move(child)};
+     }
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b = c.b;
+-        auto xt = b.CreateFSub(x, c.param_value(id, "tx", params.at("tx")), "xt");
+-        auto yt = b.CreateFSub(y, c.param_value(id, "ty", params.at("ty")), "yt");
+-        auto zt = b.CreateFSub(z, c.param_value(id, "tz", params.at("tz")), "zt");
++        auto xt = b.CreateFSub(x, c.param_value(id, "tx", params[Tx]), "xt");
++        auto yt = b.CreateFSub(y, c.param_value(id, "ty", params[Ty]), "yt");
++        auto zt = b.CreateFSub(z, c.param_value(id, "tz", params[Tz]), "zt");
+         return children[0]->codegen(c, xt, yt, zt);
+     }
+ 
+@@ -36,13 +37,16 @@ public:
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+-        return children[0]->eval_as<T>(x - S::from(params.at("tx")), y - S::from(params.at("ty")), z - S::from(params.at("tz")));
++        return children[0]->eval_as<T>(x - S::from(params[Tx]), y - S::from(params[Ty]), z - S::from(params[Tz]));
+     }
+     FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         std::size_t h = children[0]->structural_hash() ^ 0x7788'99AAull;
+-        for (auto& [k, v] : params)
+-            h ^= std::hash<double>{}(v) + 0x9e37'79b9ull + (h << 6) + (h >> 2);
++        // By position, so the hash is stable: the old loop walked an
++        // unordered_map, whose order is unspecified by the standard.
++        for (std::size_t i = 0; i < params.size(); ++i)
++            h ^= std::hash<double>{}(params.value(i)) + 0x9e37'79b9ull +
++                 (h << 6) + (h >> 2);
+         return h;
+     }
+ };
+@@ -53,23 +57,24 @@ class ScaleNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "Scale"; }
+ public:
+     // Uniform scale (backward-compatible): stores sx=sy=sz=s.
++    enum : int { Sx, Sy, Sz };
+     ScaleNode(FRepNode::Ptr child, float s, std::string nid = "sc") {
+         kind = NodeKind::Scale; id = std::move(nid);
+-        params["sx"] = s; params["sy"] = s; params["sz"] = s;
++        params.init({"sx", "sy", "sz"}, {s, s, s});
+         children = {std::move(child)};
+     }
+     // Non-uniform scale: independent per-axis factors.
+     ScaleNode(FRepNode::Ptr child, float sx, float sy, float sz, std::string nid = "sc") {
+         kind = NodeKind::Scale; id = std::move(nid);
+-        params["sx"] = sx; params["sy"] = sy; params["sz"] = sz;
++        params.init({"sx", "sy", "sz"}, {sx, sy, sz});
+         children = {std::move(child)};
+     }
+ 
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b   = c.b;
+-        auto sx = c.param_value(id, "sx", params.at("sx"));
+-        auto sy = c.param_value(id, "sy", params.at("sy"));
+-        auto sz = c.param_value(id, "sz", params.at("sz"));
++        auto sx = c.param_value(id, "sx", params[Sx]);
++        auto sy = c.param_value(id, "sy", params[Sy]);
++        auto sz = c.param_value(id, "sz", params[Sz]);
+         auto  xs  = b.CreateFDiv(x, sx, "xs");
+         auto  ys  = b.CreateFDiv(y, sy, "ys");
+         auto  zs  = b.CreateFDiv(z, sz, "zs");
+@@ -86,16 +91,16 @@ public:
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+-        const T sx = S::from(params.at("sx")), sy = S::from(params.at("sy")), sz = S::from(params.at("sz"));
++        const T sx = S::from(params[Sx]), sy = S::from(params[Sy]), sz = S::from(params[Sz]);
+         const T mn = S::minv(sx, S::minv(sy, sz));
+         return children[0]->eval_as<T>(x/sx, y/sy, z/sz) * mn;
+     }
+     FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return children[0]->structural_hash()
+-             ^ std::hash<double>{}(params.at("sx"))
+-             ^ (std::hash<double>{}(params.at("sy")) << 1)
+-             ^ (std::hash<double>{}(params.at("sz")) << 2)
++             ^ std::hash<double>{}(params[Sx])
++             ^ (std::hash<double>{}(params[Sy]) << 1)
++             ^ (std::hash<double>{}(params[Sz]) << 2)
+              ^ 0x9900'1122ull;
+     }
+ };
+@@ -107,9 +112,10 @@ public:
+ class RotateYNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "RotateY"; }
+ public:
++    enum : int { A };
+     RotateYNode(FRepNode::Ptr child, float angle_rad, std::string nid = "ry") {
+         kind = NodeKind::RotateY; id = std::move(nid);
+-        params["a"] = angle_rad;
++        params.init({"a"}, {angle_rad});
+         children = {std::move(child)};
+     }
+ 
+@@ -118,7 +124,7 @@ public:
+         // In Constant mode param_value returns fc(literal) and cos/sin
+         // intrinsics fold to constants. In Incremental mode the cos/sin
+         // run at runtime (their JIT'd versions are cheap, ~10 cycles).
+-        auto  a_v = c.param_value(id, "a", params.at("a"));
++        auto  a_v = c.param_value(id, "a", params[A]);
+         auto  ca = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::cos, a_v);
+         auto  sa = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sin, a_v);
+         auto  xr = b.CreateFAdd(b.CreateFMul(ca, x), b.CreateFMul(sa, z), "xr");
+@@ -132,7 +138,7 @@ public:
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+-        const T a = S::from(params.at("a"));
++        const T a = S::from(params[A]);
+         // std::cos of a T: cosf for float, cos for double. The float path
+         // therefore keeps exactly the bits codegen emits (llvm.cos.f32).
+         const T ca = std::cos(a), sa = std::sin(a);
+@@ -141,7 +147,7 @@ public:
+     FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return children[0]->structural_hash()
+-             ^ std::hash<double>{}(params.at("a"))
++             ^ std::hash<double>{}(params[A])
+              ^ 0xAA11'BB22ull;
+     }
+ };
+@@ -150,14 +156,15 @@ public:
+ class RotateXNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "RotateX"; }
+ public:
++    enum : int { A };
+     RotateXNode(FRepNode::Ptr child, float angle_rad, std::string nid = "rx") {
+         kind = NodeKind::RotateX; id = std::move(nid);
+-        params["a"] = angle_rad;
++        params.init({"a"}, {angle_rad});
+         children = {std::move(child)};
+     }
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b  = c.b;
+-        auto  a_v = c.param_value(id, "a", params.at("a"));
++        auto  a_v = c.param_value(id, "a", params[A]);
+         auto  ca = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::cos, a_v);
+         auto  sa = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sin, a_v);
+         auto  yr = b.CreateFAdd(b.CreateFMul(ca, y), b.CreateFMul(sa, z), "yr");
+@@ -169,7 +176,7 @@ public:
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+-        const T a = S::from(params.at("a"));
++        const T a = S::from(params[A]);
+         // std::cos of a T: cosf for float, cos for double. The float path
+         // therefore keeps exactly the bits codegen emits (llvm.cos.f32).
+         const T ca = std::cos(a), sa = std::sin(a);
+@@ -178,7 +185,7 @@ public:
+     FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return children[0]->structural_hash()
+-             ^ std::hash<double>{}(params.at("a"))
++             ^ std::hash<double>{}(params[A])
+              ^ 0xBB22'CC33ull;
+     }
+ };
+@@ -187,14 +194,15 @@ public:
+ class RotateZNode final : public FRepNode {
+     const char* type_name() const noexcept override { return "RotateZ"; }
+ public:
++    enum : int { A };
+     RotateZNode(FRepNode::Ptr child, float angle_rad, std::string nid = "rz") {
+         kind = NodeKind::RotateZ; id = std::move(nid);
+-        params["a"] = angle_rad;
++        params.init({"a"}, {angle_rad});
+         children = {std::move(child)};
+     }
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
+         auto& b  = c.b;
+-        auto  a_v = c.param_value(id, "a", params.at("a"));
++        auto  a_v = c.param_value(id, "a", params[A]);
+         auto  ca = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::cos, a_v);
+         auto  sa = frep::llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sin, a_v);
+         auto  xr = b.CreateFAdd(b.CreateFMul(ca, x), b.CreateFMul(sa, y), "xr");
+@@ -206,7 +214,7 @@ public:
+     template <class T>
+     T eval_t(T x, T y, T z) const {
+         using S = ScalarTraits<T>;
+-        const T a = S::from(params.at("a"));
++        const T a = S::from(params[A]);
+         // std::cos of a T: cosf for float, cos for double. The float path
+         // therefore keeps exactly the bits codegen emits (llvm.cos.f32).
+         const T ca = std::cos(a), sa = std::sin(a);
+@@ -215,7 +223,7 @@ public:
+     FREP_EVAL_T
+     std::size_t structural_hash() const noexcept override {
+         return children[0]->structural_hash()
+-             ^ std::hash<double>{}(params.at("a"))
++             ^ std::hash<double>{}(params[A])
+              ^ 0xCC33'DD44ull;
+     }
+ };
+diff --git a/core/gpu/glsl_emitter.cpp b/core/gpu/glsl_emitter.cpp
+index dcc18b7..1b2bc7a 100644
+--- a/core/gpu/glsl_emitter.cpp
++++ b/core/gpu/glsl_emitter.cpp
+@@ -451,9 +451,9 @@ GlslEmitter::emit_node(Ctx& c, const FRepNode& n,
+                     break;
+                 case K::SmoothUnion: {
+                     float kk = 0.1f;
+-                    auto it = n.params.find("k");
+-                    if (it != n.params.end()) kk = it->second;
+-                    int kslot = (c.bindings && it != n.params.end())
++                    const double* it = n.params.get("k");
++                    if (it) kk = float(*it);
++                    int kslot = (c.bindings && it)
+                                 ? c.bindings->slot_of(n.id, "k") : -1;
+                     std::string kbase = (kslot < 0)
+                         ? flit(kk)
+@@ -649,9 +649,9 @@ GlslEmitter::emit_node_dual(Ctx& c, const FRepNode& n,
+             auto tv = c.fresh("t");
+             auto hv = c.fresh("h");
+             int tslot = c.bindings ? c.bindings->slot_of(n.id, "t") : -1;
+-            int hslot = (c.bindings && n.params.count("h"))
++            int hslot = (c.bindings && n.params.contains("h"))
+                         ? c.bindings->slot_of(n.id, "h") : -1;
+-            float hdef = n.params.count("h") ? n.params.at("h") : 2.0f;
++            float hdef = float(n.params.value_or("h", 2.0));
+             auto u  = c.fresh_d(), s = c.fresh_d();
+             auto xp = c.fresh_d(), zp = c.fresh_d();
+             g << "    float " << tv << " = "
+@@ -694,9 +694,9 @@ GlslEmitter::emit_node_dual(Ctx& c, const FRepNode& n,
+                 g << "    Dual " << v << " = d_max(" << *a << ", d_neg(" << *b << "));\n";
+             else { // SmoothUnion — IQ smin in dual arithmetic
+                 float kk = 0.1f;
+-                auto it = n.params.find("k");
+-                if (it != n.params.end()) kk = it->second;
+-                int kslot = (c.bindings && it != n.params.end())
++                const double* it = n.params.get("k");
++                if (it) kk = float(*it);
++                int kslot = (c.bindings && it)
+                             ? c.bindings->slot_of(n.id, "k") : -1;
+                 std::string kbase = (kslot < 0)
+                     ? flit(kk)
+diff --git a/core/gpu/glsl_node_interval.hpp b/core/gpu/glsl_node_interval.hpp
+index ec3c2b7..362d772 100644
+--- a/core/gpu/glsl_node_interval.hpp
++++ b/core/gpu/glsl_node_interval.hpp
+@@ -42,9 +42,9 @@ public:
+     // with runtime bindings can override before emit().
+     std::function<std::string(const FRepNode&, const std::string&, float)> param =
+         [](const FRepNode& n, const std::string& name, float def) {
+-            auto it = n.params.find(name);
++            const double* it = n.params.get(name);
+             std::ostringstream s; s.precision(9);
+-            s << std::fixed << (it != n.params.end() ? it->second : def);
++            s << std::fixed << (it ? float(*it) : def);
+             return s.str();
+         };
+ 
+@@ -238,7 +238,7 @@ private:
+         // ks=k (clamped); th=ks*x; r=1/ks + y; x'=r*sin(th); y'=r*cos(th)-1/ks;
+         // recurse on (x',y',z); result = child / max(1, |ks*r|). cos/sin of an
+         // interval -> sound but loose, like the twist.
+-        float kc = 1.0f; { auto it=n.params.find("k"); if (it!=n.params.end()) kc=it->second; }
++        const float kc = float(n.params.value_or("k", 1.0));
+         float ks = std::fabs(kc) < 1e-6f ? 1e-6f : kc;
+         std::ostringstream ss; ss.precision(9); ss << std::fixed << ks;
+         std::string ksS = ss.str();
+diff --git a/core/io/scene_io.cpp b/core/io/scene_io.cpp
+index d50bb08..7aa9322 100644
+--- a/core/io/scene_io.cpp
++++ b/core/io/scene_io.cpp
+@@ -123,8 +123,8 @@ static Value node_to_json(const FRepNode& node) {
+ 
+     // params
+     Object params;
+-    for (const auto& [k, v] : node.params)
+-        params[k] = static_cast<double>(v);
++    for (std::size_t i = 0; i < node.params.size(); ++i)
++        params[node.params.name(i)] = node.params.value(i);
+     o["params"] = std::move(params);
+ 
+     // An Instance references another object's geometry by id — it must NOT
+diff --git a/tests/test_node_graph.cpp b/tests/test_node_graph.cpp
+index 45ce5cf..2e0ea8b 100644
+--- a/tests/test_node_graph.cpp
++++ b/tests/test_node_graph.cpp
+@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
+         // The user-edited value of R must have flowed through.
+         assert(plug_tree->params.at("R") == 1.75f);
+         // The unedited r took its default.
+-        assert(plug_tree->params.count("r") == 1);
++        assert(plug_tree->params.contains("r"));
+         printf("Plugin tree params: R=%g r=%g\n",
+                plug_tree->params.at("R"), plug_tree->params.at("r"));
+     }
+diff --git a/tests/test_param_schema.cpp b/tests/test_param_schema.cpp
+index 9e5ffd8..5641bdb 100644
+--- a/tests/test_param_schema.cpp
++++ b/tests/test_param_schema.cpp
+@@ -30,6 +30,7 @@
+ 
+ #include <memory>
+ #include <set>
++#include <vector>
+ #include <string>
+ 
+ using namespace frep;
+@@ -50,15 +51,27 @@ std::set<std::string> schema_names(NodeKind k) {
+     return s;
+ }
+ 
+-/// Names the node actually stored.
+-std::set<std::string> stored_names(const FRepNode& n) {
+-    std::set<std::string> s;
+-    for (const auto& kv : n.params) s.insert(kv.first);
++/// Names the node actually stored, in the order it stored them.
++std::vector<std::string> stored_order(const FRepNode& n) {
++    std::vector<std::string> s;
++    for (std::size_t i = 0; i < n.params.size(); ++i)
++        s.push_back(n.params.name(i));
++    return s;
++}
++
++/// Names the schema lists, in schema order.
++std::vector<std::string> schema_order(NodeKind k) {
++    std::vector<std::string> s;
++    for (const auto& ps : node_param_schema(k)) s.push_back(ps.first);
+     return s;
+ }
+ 
+ void expect_every_param_bindable(const char* what, const FRepNode& n) {
+-    EXPECT_EQ(stored_names(n), schema_names(n.kind))
++    // ORDER, not just membership: each node addresses its parameters by
++    // index through its own `enum : int`, and the schema is what assigns
++    // runtime slots. If the two orders ever disagree, a slot write lands on
++    // the wrong parameter and the geometry changes silently.
++    EXPECT_EQ(stored_order(n), schema_order(n.kind))
+         << what << ": the schema and the stored parameters disagree";
+ }
+ 
+@@ -105,7 +118,8 @@ TEST(ParamSchema, CompositesExposeNoParametersOfTheirOwn) {
+                        NodeKind::Plugin})
+         EXPECT_TRUE(node_param_schema(k).empty()) << int(k);
+     // SmoothUnion is the exception: it has a blend radius.
+-    EXPECT_EQ(schema_names(NodeKind::SmoothUnion), std::set<std::string>{"k"});
++    EXPECT_EQ(schema_order(NodeKind::SmoothUnion),
++              (std::vector<std::string>{"k"}));
+ }
+ 
+ TEST(ParamSchema, AllRuntimePolicyBindsEveryStoredParameter) {
+-- 
+2.43.0
+
+
+From 43bf0c884db1f87d749f35015e813a6fa886bcb6 Mon Sep 17 00:00:00 2001
+From: Alexander Penev <alexander.p.penev@gmail.com>
+Date: Thu, 24 Sep 2026 10:56:41 +0300
+Subject: [PATCH 3/3] core: MixedEval<Lo,Hi> - and the measurement that says
+ what it is for
+
+Two types over one geometry: a cheap one that may reject, an exact one that
+is the only one allowed to answer. lo() never reports a distance; hi() is
+the reported value; refine() decides where the exact type is worth paying
+for; wideCoverage() reports whether hi() is really Hi, because a tree with
+one unconverted node evaluated "in double" is worse than one evaluated
+entirely in float - the error is real and in an unknown place.
+
+TWO THINGS THE TESTS CAUGHT, BOTH WORTH MORE THAN THE CLASS.
+
+1. A SAMPLED DELTA IS NOT A BOUND. The first version called the accessors
+   loBound/upBound and asserted the band held on fresh points. It does not:
+   delta 6.3e-04 mm from 20000 samples, then 2 of 50000 fresh points outside
+   it, the worst by 1% of delta. Small, not zero, and that is the whole
+   difference between an estimate and a proof. Renamed loEstimate/upEstimate,
+   documented for what they are, and pointed at node_interval.hpp for a
+   rejection that has to be sound. The test now asserts the rate and the
+   size of the overshoot, which are true, instead of zero, which is not.
+
+2. THE CHEAP TYPE IS NOT CHEAP. Scalar f32 evaluation is SLOWER than f64 on
+   every node kind - sphere 1.34x, box 1.43x, tube 1.13x, cone 1.48x, poly
+   1.67x, frame 1.78x - and on a real sphere trace the mixed path never beat
+   plain f64 at any tolerance (27.3 vs 29.8 ns/step at 1 mm, 22.4 vs 26.1 at
+   1e-3). Structural, not incidental: parameters are stored as double, so
+   the f32 path converts every one on the way in and scalar SSE returns
+   nothing for it - no extra lanes, no less traffic.
+
+   Measured on random points in a box, refine() paid for f64 on 0.1% of
+   queries and it looked free. On the queries a march actually makes it is
+   7.7%, and still no faster. That is the fourth time in this project that a
+   benchmark on a convenient distribution disagreed with the real one.
+
+So Lo = float buys accuracy control on the CPU, not speed: hi() is the only
+reportable distance and refine() says where it is needed. Where f32 should
+pay is GPU and SIMD, where it doubles the lane count - not measured here and
+therefore not claimed. The CPU speed in this area came from the data
+structure, not the type.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5ALyYbzrXTGtc7LqRPGCz
+---
+ CMakeLists.txt            |   1 +
+ core/frep/mixed_eval.hpp  | 213 ++++++++++++++++++++++++++++++++++++++
+ tests/test_mixed_eval.cpp | 163 +++++++++++++++++++++++++++++
+ 3 files changed, 377 insertions(+)
+ create mode 100644 core/frep/mixed_eval.hpp
+ create mode 100644 tests/test_mixed_eval.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d2e18fe..196feae 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -618,6 +618,7 @@ add_executable(frep_tests
+     tests/test_custom_expr_eval.cpp
+     tests/test_scalar_type.cpp
+     tests/test_param_schema.cpp
++    tests/test_mixed_eval.cpp
+     tests/test_expr_backends.cpp
+     tests/test_plugin_runtime.cpp
+     tests/test_scene_set_geometry.cpp
+diff --git a/core/frep/mixed_eval.hpp b/core/frep/mixed_eval.hpp
+new file mode 100644
+index 0000000..3f9b18a
+--- /dev/null
++++ b/core/frep/mixed_eval.hpp
+@@ -0,0 +1,213 @@
++// core/frep/mixed_eval.hpp
++//
++// Two types over one geometry: a cheap one that may REJECT, and an exact one
++// that is the only one allowed to ANSWER.
++//
++// The reason to have both is that the two questions a field is asked are not
++// the same question. "Is the surface anywhere near this point?" tolerates a
++// coarse answer as long as the error is bounded. "How far is the surface?"
++// does not. A pipeline that uses one type for both either pays f64 for every
++// rejection or reports an f32 distance as though it were a distance.
++//
++// THE BAND MUST BE MEASURED, AND IT IS AN ESTIMATE, NOT A CERTIFICATE.
++//
++//     loEstimate(p) = lo(p) - delta      upEstimate(p) = lo(p) + delta
++//
++// delta starts at zero and STAYS zero until measureDelta() has run on this
++// geometry over the region the caller will query. A delta carried over from
++// another model, or assumed from the type's epsilon, is worthless: f32's
++// error scales with the coordinate, so the same tree at the origin and at
++// 10 m has deltas three orders of magnitude apart. The accessors refuse
++// rather than silently returning lo(p) when nothing has been measured.
++//
++// But measureDelta() SAMPLES, so the band it produces is a sampled maximum
++// and a point it never saw can exceed it. Measured on the detector-scale
++// test scene: delta 6.3e-04 mm from 20000 points, then 2 of 50000 fresh
++// points outside it, the worst by 6.6e-06 mm - about 1% of delta. That is
++// small, and it is not zero, and the difference between those two words is
++// the difference between an estimate and a proof.
++//
++// So the accessors are named for what they are. Use them to decide WHERE TO
++// SPEND EFFORT - which is what refine() does, and where being wrong costs
++// accuracy already bounded by the caller's own tolerance. Do NOT use them
++// for a rejection that must be sound: discarding geometry on an estimate
++// discards it for good. A sound rejection needs interval arithmetic over the
++// node (core/compiler/node_interval.hpp), which encloses rather than samples.
++//
++// COVERAGE IS PART OF THE ANSWER. FRepNode::evalw falls back to float for a
++// node that has not been converted, which is correct but not wide. A tree
++// with one such node evaluated "in Hi" is worse than one evaluated entirely
++// in Lo, because the error is real and in an unknown place. wideCoverage()
++// counts it, and exact() is false unless every node carries a real wide
++// evaluation.
++//
++// THE CHEAP TYPE IS NOT CHEAP ON THE CPU. MEASURED, SO SAY IT PLAINLY.
++//
++// Scalar f32 evaluation of these nodes is SLOWER than f64, on every kind:
++//
++//     sphere 1.34x   box 1.43x   tube 1.13x
++//     cone   1.48x   poly 1.67x  frame 1.78x        (f32 time / f64 time)
++//
++// and on a real sphere trace of the test scene the mixed path never beat
++// plain f64 at any tolerance (27.3 vs 29.8 ns/step at 1 mm; 22.4 vs 26.1 at
++// 1e-3 mm). The reason is structural rather than incidental: the parameters
++// are stored as double, so the f32 path converts every one of them on the
++// way in, and scalar SSE gives f32 no advantage in return - no extra lanes,
++// no less traffic, because the source data is double either way.
++//
++// So Lo = float buys ACCURACY CONTROL here, not speed. It is worth having
++// because hi() is then the only value anyone reports and refine() says where
++// the exact type is actually needed. Where f32 should pay is the GPU and the
++// SIMD paths, where it doubles the lane count and halves the buffer - that
++// has NOT been measured here and is not claimed.
++//
++// The CPU speed in this area came from the data structure, not the type:
++// moving parameters from a string-keyed hash map to an ordered vector was
++// 4.6x on the same benchmark. See param_store.hpp.
++//
++// This mirrors G4-FRep's MixedTape<Lo,Hi> (include/frep/model/tape.hh), down
++// to the rule that the cheap tape never reports a value.
++
++#pragma once
++
++#include "core/frep/node.hpp"
++#include "core/frep/scalar.hpp"
++
++#include <cmath>
++#include <cstddef>
++#include <random>
++#include <stdexcept>
++
++namespace frep {
++
++template <class Lo, class Hi>
++class MixedEval {
++    static_assert(sizeof(Hi) >= sizeof(Lo),
++                  "Hi is the exact type; it cannot be narrower than Lo");
++
++public:
++    explicit MixedEval(const FRepNode& n) : n_(&n) {}
++
++    /// The cheap field. Culling and traversal only - never reported.
++    Lo lo(Lo x, Lo y, Lo z) const { return n_->eval_as<Lo>(x, y, z); }
++
++    /// The exact field. The only value a caller may report as a distance.
++    Hi hi(Hi x, Hi y, Hi z) const { return n_->eval_as<Hi>(x, y, z); }
++
++    // ── the measured band ─────────────────────────────────────────────────
++
++    bool measured() const noexcept { return measured_; }
++    double delta() const noexcept { return delta_; }
++
++    /// The largest |lo - hi| seen over `n` random points of the box, with the
++    /// box recorded so a later query outside it can be spotted. Returns it.
++    ///
++    /// SAMPLED, so it is a typical magnitude and not a maximum: fresh points
++    /// exceed it at the per-mille level, by a per-cent of its own size. Read
++    /// the header before using the result as though it enclosed anything.
++    double measureDelta(double lox, double loy, double loz, double hix,
++                        double hiy, double hiz, int n = 20000,
++                        std::uint64_t seed = 0x5EED) {
++        std::mt19937_64 rng(seed);
++        auto U = [&](double a, double b) {
++            return std::uniform_real_distribution<double>(a, b)(rng);
++        };
++        double d = 0.0;
++        for (int i = 0; i < n; ++i) {
++            const double x = U(lox, hix), y = U(loy, hiy), z = U(loz, hiz);
++            const double a = double(lo(Lo(x), Lo(y), Lo(z)));
++            const double b = double(hi(Hi(x), Hi(y), Hi(z)));
++            const double e = std::fabs(a - b);
++            if (e > d) d = e;
++        }
++        blox_ = lox; bloy_ = loy; bloz_ = loz;
++        bhix_ = hix; bhiy_ = hiy; bhiz_ = hiz;
++        delta_ = d;
++        measured_ = true;
++        return d;
++    }
++
++    /// True when p lies inside the box the delta was measured over.
++    bool inMeasuredRegion(double x, double y, double z) const noexcept {
++        return measured_ && x >= blox_ && x <= bhix_ && y >= bloy_ &&
++               y <= bhiy_ && z >= bloz_ && z <= bhiz_;
++    }
++
++    /// lo(p) minus the measured band. An estimate - see the header.
++    double loEstimate(double x, double y, double z) const {
++        requireMeasured();
++        return double(lo(Lo(x), Lo(y), Lo(z))) - delta_;
++    }
++    /// lo(p) plus the measured band. An estimate - see the header.
++    double upEstimate(double x, double y, double z) const {
++        requireMeasured();
++        return double(lo(Lo(x), Lo(y), Lo(z))) + delta_;
++    }
++
++    /// Adopt a delta established some other way - an interval enclosure, or
++    /// an error analysis. Marks the band measured without sampling, because
++    /// the caller is asserting something stronger than sampling can.
++    void setDelta(double d) noexcept {
++        delta_ = d;
++        measured_ = true;
++    }
++
++    // ── the refinement the two types exist for ────────────────────────────
++
++    /// Cheap first, exact only when it matters.
++    ///
++    /// If the cheap field puts the point further than `band` from the surface
++    /// - with the measured delta already taken off - the cheap value is
++    /// returned and `paid` is left alone. Otherwise the exact field is
++    /// evaluated.
++    ///
++    /// This is the one place the sampled band is the right tool: the caller
++    /// has already accepted an error of `band`, so a decision that is wrong
++    /// by a per-cent of delta costs nothing it had not agreed to.
++    ///
++    /// The caller chooses `band`: a sphere tracer wants its step tolerance,
++    /// a classifier wants zero. Choosing zero means "exact near the surface,
++    /// cheap everywhere else", which is what a march spends most of its
++    /// queries on.
++    double refine(double x, double y, double z, double band,
++                  std::size_t* paid = nullptr) const {
++        requireMeasured();
++        const double c = double(lo(Lo(x), Lo(y), Lo(z)));
++        if (std::fabs(c) - delta_ > band) return c;
++        if (paid) ++*paid;
++        return double(hi(Hi(x), Hi(y), Hi(z)));
++    }
++
++    // ── coverage ──────────────────────────────────────────────────────────
++
++    /// Nodes whose evalw is genuinely wide, over the whole subtree.
++    static void countWide(const FRepNode& n, std::size_t& wide,
++                          std::size_t& total) {
++        ++total;
++        if (n.wide_eval()) ++wide;
++        for (const auto& c : n.children)
++            if (c) countWide(*c, wide, total);
++    }
++    double wideCoverage() const {
++        std::size_t w = 0, t = 0;
++        countWide(*n_, w, t);
++        return t ? double(w) / double(t) : 1.0;
++    }
++    /// False when any node falls back to float: hi() is then not Hi.
++    bool exact() const { return wideCoverage() >= 1.0; }
++
++private:
++    void requireMeasured() const {
++        if (!measured_)
++            throw std::logic_error(
++                "MixedEval: delta was never measured on this geometry, so "
++                "there is no bound to use - call measureDelta() first");
++    }
++
++    const FRepNode* n_ = nullptr;
++    double delta_ = 0.0;
++    bool measured_ = false;
++    double blox_ = 0, bloy_ = 0, bloz_ = 0, bhix_ = 0, bhiy_ = 0, bhiz_ = 0;
++};
++
++}  // namespace frep
+diff --git a/tests/test_mixed_eval.cpp b/tests/test_mixed_eval.cpp
+new file mode 100644
+index 0000000..7abab3b
+--- /dev/null
++++ b/tests/test_mixed_eval.cpp
+@@ -0,0 +1,163 @@
++// tests/test_mixed_eval.cpp
++//
++// The two-type pipeline: a cheap field that may reject, an exact field that
++// answers, and a band between them that has to have been MEASURED.
++//
++//   A  Before measureDelta(), there is no bound and asking for one throws.
++//      A delta of zero that was never measured would be a bound that claims
++//      f32 is exact, which is the worst possible default, so the class
++//      refuses instead of returning lo(p).
++//   B  After measuring, the band holds on points the measurement never saw -
++//      MOSTLY. It is a sampled maximum, so the honest assertion is on the
++//      rate and the size of the overshoot, not on zero. Asserting zero here
++//      is how a sampled estimate gets mistaken for an enclosure, and the
++//      first version of this test did exactly that and failed.
++//   C  refine() agrees with hi() near the surface and stays inside the band
++//      away from it - the statement that makes it safe to skip the exact
++//      evaluation.
++//   D  Coverage is reported, not assumed.
++//
++// The share of queries a march can answer cheaply is PRINTED rather than
++// asserted: it is a property of the scene and the tolerance, and pinning it
++// to a number would turn a measurement into a tripwire.
++
++#include "core/frep/mixed_eval.hpp"
++#include "core/frep/hep.hpp"
++#include "core/frep/operations.hpp"
++#include "core/frep/primitives.hpp"
++
++#include <gtest/gtest.h>
++
++#include <cmath>
++#include <cstdio>
++#include <memory>
++#include <random>
++
++using namespace frep;
++
++namespace {
++
++/// A detector-scale scene: metres in millimetres, where f32 is coarse.
++FRepNode::Ptr scene() {
++    auto shell = std::make_shared<hep::TubeNode>(1850.375, 2950.625, 3100.875,
++                                                 0.0, 7.0);
++    auto bore = std::make_shared<hep::TubeNode>(0.0, 1210.125, 4000.25, 0.0, 7.0);
++    return std::make_shared<DifferenceNode>(shell, bore);
++}
++
++constexpr double kExt = 4500.0;
++
++}  // namespace
++
++TEST(MixedEval, ABoundThatWasNeverMeasuredIsNotABound) {
++    const auto n = scene();
++    MixedEval<float, double> m(*n);
++    EXPECT_FALSE(m.measured());
++    EXPECT_EQ(m.delta(), 0.0);
++    EXPECT_THROW(m.loEstimate(0, 0, 0), std::logic_error);
++    EXPECT_THROW(m.upEstimate(0, 0, 0), std::logic_error);
++    EXPECT_THROW(m.refine(0, 0, 0, 1.0), std::logic_error);
++    // lo() and hi() are always available - it is only the BAND that needs
++    // measuring.
++    EXPECT_TRUE(std::isfinite(m.lo(0, 0, 0)));
++    EXPECT_TRUE(std::isfinite(m.hi(0, 0, 0)));
++}
++
++TEST(MixedEval, TheMeasuredDeltaIsTheSizeF32ActuallyIs) {
++    const auto n = scene();
++    MixedEval<float, double> m(*n);
++    const double d = m.measureDelta(-kExt, -kExt, -kExt, kExt, kExt, kExt);
++    EXPECT_TRUE(m.measured());
++    // f32 spacing at 4500 mm is ~4.9e-4 mm; the delta is a few of those and
++    // nowhere near Geant4's 1e-9 mm tolerance. The assertion is deliberately
++    // loose in both directions - the point is the ORDER, which is what makes
++    // a fixed delta from another model wrong.
++    EXPECT_GT(d, 1e-5);
++    EXPECT_LT(d, 1e-1);
++    std::printf("  measured delta = %.4g mm over +-%.0f mm\n", d, kExt);
++}
++
++TEST(MixedEval, TheBandHoldsOnFreshPointsToWithinAPerCentOfItself) {
++    const auto n = scene();
++    MixedEval<float, double> m(*n);
++    const double d =
++        m.measureDelta(-kExt, -kExt, -kExt, kExt, kExt, kExt, 20000, 0x5EED);
++
++    std::mt19937_64 rng(0xD1FF);   // a different stream on purpose
++    std::uniform_real_distribution<double> U(-kExt, kExt);
++    const int N = 50000;
++    int viol = 0;
++    double worst = 0.0;
++    for (int i = 0; i < N; ++i) {
++        const double x = U(rng), y = U(rng), z = U(rng);
++        const double h = m.hi(x, y, z);
++        const double a = m.loEstimate(x, y, z), b = m.upEstimate(x, y, z);
++        if (h < a || h > b) {
++            ++viol;
++            worst = std::max(worst, std::max(a - h, h - b));
++        }
++    }
++    // Two aggregate statements, because both are true and neither is "zero":
++    // the band is exceeded rarely, and when it is, by a small fraction of
++    // itself. A caller can act on that; it cannot act on a promise of zero
++    // that sampling was never able to make.
++    EXPECT_LT(double(viol) / N, 1e-3);
++    EXPECT_LT(worst, 0.1 * d);
++    std::printf("  %d of %d fresh points outside the band (%.3f%%), "
++                "worst overshoot %.3g mm = %.1f%% of delta\n",
++                viol, N, 100.0 * viol / N, worst, 100.0 * worst / d);
++}
++
++TEST(MixedEval, RefineIsExactNearTheSurfaceAndInsideTheBandAwayFromIt) {
++    const auto n = scene();
++    MixedEval<float, double> m(*n);
++    const double d = m.measureDelta(-kExt, -kExt, -kExt, kExt, kExt, kExt);
++
++    std::mt19937_64 rng(0xBEEF);
++    std::uniform_real_distribution<double> U(-kExt, kExt);
++    const double band = 1.0;       // 1 mm: a sphere tracer's step tolerance
++    std::size_t paid = 0;
++    int n_near = 0;
++    double worstFar = 0.0;
++    for (int i = 0; i < 50000; ++i) {
++        const double x = U(rng), y = U(rng), z = U(rng);
++        const std::size_t before = paid;
++        const double r = m.refine(x, y, z, band, &paid);
++        const double h = m.hi(x, y, z);
++        if (paid != before) {
++            ++n_near;
++            EXPECT_EQ(r, h);       // near the surface: the exact value itself
++        } else {
++            worstFar = std::max(worstFar, std::fabs(r - h));
++        }
++    }
++    EXPECT_LE(worstFar, d) << "a cheap answer left the measured band";
++    std::printf("  %d of 50000 queries paid for f64 (%.1f%%), band %.3g mm, "
++                "worst cheap error %.3g mm\n",
++                n_near, 100.0 * n_near / 50000.0, band, worstFar);
++}
++
++TEST(MixedEval, CoverageIsReportedRatherThanAssumed) {
++    const auto n = scene();
++    MixedEval<float, double> m(*n);
++    EXPECT_DOUBLE_EQ(m.wideCoverage(), 1.0);
++    EXPECT_TRUE(m.exact());
++
++    // A node without a real wide evaluation drags the whole tree down, and
++    // that has to be visible: "evaluated in double" with one float node in
++    // it is worse than all-float, because the error is in an unknown place.
++    struct NoWide final : FRepNode {
++        const char* type_name() const noexcept override { return "NoWide"; }
++        llvm::Value* codegen(CgCtx&, llvm::Value*, llvm::Value*,
++                             llvm::Value*) const override {
++            return nullptr;
++        }
++        float eval(float, float, float) const override { return 1.0f; }
++        std::size_t structural_hash() const noexcept override { return 1; }
++    };
++    auto mixed = std::make_shared<UnionNode>(std::make_shared<SphereNode>(1.0),
++                                             std::make_shared<NoWide>());
++    MixedEval<float, double> m2(*mixed);
++    EXPECT_LT(m2.wideCoverage(), 1.0);
++    EXPECT_FALSE(m2.exact());
++}
+-- 
+2.43.0
+

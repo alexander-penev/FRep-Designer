@@ -231,6 +231,52 @@ llvm::Function* SceneCodegen::emit_scene_sdf(const FRepNode& root) {
     return fn;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// emit_scene_sdf_f64
+// double scene_sdf_f64(double x, double y, double z, float* params)
+// ─────────────────────────────────────────────────────────────────────────────
+std::vector<std::string> SceneCodegen::f64_blockers(const FRepNode& root) {
+    std::vector<std::string> out;
+    std::function<void(const FRepNode&)> walk = [&](const FRepNode& n) {
+        // The same flag eval/evalw use: a node that cannot evaluate wide
+        // cannot emit wide either, because in both cases the reason is a
+        // float-shaped payload (a grid, a separate builder) rather than the
+        // arithmetic.
+        if (!n.wide_eval()) out.emplace_back(n.type_name());
+        for (const auto& c : n.children)
+            if (c) walk(*c);
+    };
+    walk(root);
+    return out;
+}
+
+llvm::Function* SceneCodegen::emit_scene_sdf_f64(const FRepNode& root) {
+    auto* f64 = llvm::Type::getDoubleTy(ctx_);
+    auto* fty = llvm::FunctionType::get(f64, {f64, f64, f64, fptr()}, false);
+    auto* fn  = llvm::Function::Create(fty, llvm::Function::ExternalLinkage,
+                                       "scene_sdf_f64", mod_.get());
+    fn->addFnAttr(llvm::Attribute::AlwaysInline);
+    fn->addFnAttr(llvm::Attribute::NoUnwind);
+    fn->addFnAttr(llvm::Attribute::WillReturn);
+
+    auto* bb = llvm::BasicBlock::Create(ctx_, "entry", fn);
+    llvm::IRBuilder<> b(bb);
+
+    auto it = fn->arg_begin();
+    auto* x  = &*it++; x->setName("x");
+    auto* y  = &*it++; y->setName("y");
+    auto* z  = &*it++; z->setName("z");
+    auto* pb = &*it++; pb->setName("params");
+
+    CgCtx cctx = make_cgctx(b, pb);
+    cctx.scalar = ScalarKind::F64;
+    auto* result = root.codegen(cctx, x, y, z);
+    b.CreateRet(result);
+
+    verify_fn(fn);
+    return fn;
+}
+
 // Diagnostic / scalability variant — see header. Each object becomes a
 // standalone non-inlined function obj_sdf_N(x,y,z,params)->float; scene_sdf
 // calls them in sequence and folds with min(). The point is that LLVM

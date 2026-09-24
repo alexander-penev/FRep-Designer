@@ -182,7 +182,8 @@ public:
         if (it == objects_.end()) return {0, 0, 0};
         const FRepNode* g = it->second.geometry.get();
         if (g && std::string(g->type_name()) == "Translate") {
-            return { g->params.at("tx"), g->params.at("ty"), g->params.at("tz") };
+            return { float(g->params.at("tx")), float(g->params.at("ty")),
+                     float(g->params.at("tz")) };
         }
         return {0, 0, 0};
     }

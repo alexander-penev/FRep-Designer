@@ -20,6 +20,7 @@
 
 #include "core/frep/expr_ast.hpp"
 #include "core/frep/node.hpp"
+#include "core/frep/scalar.hpp"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -123,10 +124,12 @@ public:
         id   = std::move(nid);
     }
 
-    float eval(float x, float y, float z) const override {
+    template <class T>
+    T eval_t(T x, T y, T z) const {
         ensure_parsed();
-        return eval_ast(*ast_, x, y, z);
+        return eval_ast<T>(*ast_, x, y, z);
     }
+    FREP_EVAL_T
 
     llvm::Value* codegen(CgCtx& c, llvm::Value* x,
                          llvm::Value* y, llvm::Value* z) const override;
@@ -171,7 +174,10 @@ private:
         if (!ast_) ast_ = expr::fold(expr::parse(expr_));
     }
 
-    static float eval_ast(const expr::Node& n, float x, float y, float z);
+    /// The AST in T. Instantiated for float and double in custom_expr.cpp;
+    /// one body, so the two cannot drift.
+    template <class T>
+    static T eval_ast(const expr::Node& n, T x, T y, T z);
     static void  emit_glsl_ast(std::ostream& out, const expr::Node& n);
 };
 

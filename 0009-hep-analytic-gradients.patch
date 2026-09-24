@@ -1,0 +1,678 @@
+From ec6ebbf33e235454eed7b12ee91f6583e669261c Mon Sep 17 00:00:00 2001
+From: Alexander Penev <alexander.p.penev@gmail.com>
+Date: Thu, 24 Sep 2026 12:40:35 +0300
+Subject: [PATCH] core: analytic gradients for the six HEP nodes
+
+They inherited FRepNode's finite-difference fallback, which steps by
+h = 1e-3 in ABSOLUTE units. At detector scale that is the f32 spacing itself
+(~1e-3 mm at 1e4 mm), so the difference quotient lands on a handful of
+discrete values and the gradient stops being a unit vector. Measured on a
+Tube, |grad| where it must be 1:
+
+        scale      1 mm    1.043
+        scale    100 mm    1.007
+        scale   1000 mm    1.023
+        scale  10000 mm    1.092      <- 9% at 10 m
+
+A normal that is 9% long is a wrong direction, not a noisy one, and a
+project whose premise is analytic derivatives should not be taking them by
+subtraction.
+
+hep_ad.cpp mirrors eval_t and codegen piece for piece. The subgradient at a
+max() seam is the active piece's, which ad_ir::max already selects. Each
+piece is unit-gradient by construction - that is what dividing a slanted
+face by sqrt(1+k^2) is FOR - so a max of them is unit everywhere it is
+differentiable, which makes |grad| = 1 an invariant rather than a tolerance.
+
+After, over 4000 points per kind spanning +-5 m:
+
+    Tube 1.2e-07   Cone 1.6e-07   Shell 1.6e-07   Trd 7.8e-08
+    Poly 6.7e-08   TubeWedge 1.2e-07   Frame(Tube) 1.4e-07
+
+which is f32 epsilon, and it does not grow with scale. Direction checked
+against a central difference taken in DOUBLE on evalw - an independent
+oracle, not the gradient code - giving cos = 1.000000 at the worst of 2000
+points for all seven.
+
+One guard worth naming: d(sqrt(u))/du is infinite at u = 0, and the axis of
+a tube is an ordinary interior point a navigator really does query. The
+VALUE is left exact and only the derivative's denominator is floored, so the
+field is unchanged and the gradient there is merely large instead of NaN.
+
+The IR is 45 instructions against 28, so 1.61x and not the 3x the call count
+suggests - the Tube's value body is small next to the dual bookkeeping.
+Quoting 3x because three calls are emitted would be reasoning from the code
+instead of from the measurement; the reason to write these was accuracy, and
+the size is a bonus.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01B5ALyYbzrXTGtc7LqRPGCz
+---
+ CMakeLists.txt        |   2 +
+ core/frep/hep.hpp     |  36 ++++++
+ core/frep/hep_ad.cpp  | 252 ++++++++++++++++++++++++++++++++++++++++++
+ tests/test_hep_ad.cpp | 251 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 541 insertions(+)
+ create mode 100644 core/frep/hep_ad.cpp
+ create mode 100644 tests/test_hep_ad.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1da2da9..b86daa9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -135,6 +135,7 @@ add_library(frep_core STATIC
+     core/frep/deformations_ad.cpp
+     core/frep/aabb.cpp
+     core/frep/hep_codegen.cpp
++    core/frep/hep_ad.cpp
+     core/frep/scene.cpp
+     core/frep/mesh_sdf.cpp
+     core/accel/guard_calibration.cpp
+@@ -621,6 +622,7 @@ add_executable(frep_tests
+     tests/test_mixed_eval.cpp
+     tests/test_codegen_f64.cpp
+     tests/test_simd_scalar_type.cpp
++    tests/test_hep_ad.cpp
+     tests/test_expr_backends.cpp
+     tests/test_plugin_runtime.cpp
+     tests/test_scene_set_geometry.cpp
+diff --git a/core/frep/hep.hpp b/core/frep/hep.hpp
+index 8191df5..e69a311 100644
+--- a/core/frep/hep.hpp
++++ b/core/frep/hep.hpp
+@@ -138,6 +138,12 @@ public:
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+ 
++    /// Analytic forward-mode gradient. Mirrors eval_t/codegen piece for
++    /// piece; the subgradient at a max() seam is the active piece's, which
++    /// is what ad_ir::max already selects.
++    DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y,
++                         DualVal z) const override;
++
+     AABB aabb() const override {
+         const float r = params[Rmax], h = params[Hz];
+         return {-r, -r, -h, r, r, h};
+@@ -189,6 +195,12 @@ public:
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+ 
++    /// Analytic forward-mode gradient. Mirrors eval_t/codegen piece for
++    /// piece; the subgradient at a max() seam is the active piece's, which
++    /// is what ad_ir::max already selects.
++    DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y,
++                         DualVal z) const override;
++
+     AABB aabb() const override {
+         const float r = std::max(params[Rmax1], params[Rmax2]);
+         const float h = params[Hz];
+@@ -247,6 +259,12 @@ public:
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+ 
++    /// Analytic forward-mode gradient. Mirrors eval_t/codegen piece for
++    /// piece; the subgradient at a max() seam is the active piece's, which
++    /// is what ad_ir::max already selects.
++    DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y,
++                         DualVal z) const override;
++
+     AABB aabb() const override {
+         const float r = params[Rmax];
+         return {-r, -r, -r, r, r, r};
+@@ -294,6 +312,12 @@ public:
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+ 
++    /// Analytic forward-mode gradient. Mirrors eval_t/codegen piece for
++    /// piece; the subgradient at a max() seam is the active piece's, which
++    /// is what ad_ir::max already selects.
++    DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y,
++                         DualVal z) const override;
++
+     AABB aabb() const override {
+         const float ax = std::max(params[Dx1], params[Dx2]);
+         const float ay = std::max(params[Dy1], params[Dy2]);
+@@ -382,6 +406,12 @@ public:
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+ 
++    /// Analytic forward-mode gradient. Mirrors eval_t/codegen piece for
++    /// piece; the subgradient at a max() seam is the active piece's, which
++    /// is what ad_ir::max already selects.
++    DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y,
++                         DualVal z) const override;
++
+     /// rmax is the distance to a FACE, so the corner radius is larger by
+     /// 1/cos(w/2). Using rmax directly would cut the corners off the box and
+     /// make the BVH drop rays that really do hit the solid.
+@@ -441,6 +471,12 @@ public:
+     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y,
+                          llvm::Value* z) const override;
+ 
++    /// Analytic forward-mode gradient. Mirrors eval_t/codegen piece for
++    /// piece; the subgradient at a max() seam is the active piece's, which
++    /// is what ad_ir::max already selects.
++    DualVal codegen_grad(CgCtx& c, DualVal x, DualVal y,
++                         DualVal z) const override;
++
+     /// The child's box mapped forward (p = R q + t) and re-boxed. The AABB of
+     /// a transformed AABB is conservative, which is the safe direction.
+     AABB aabb() const override {
+diff --git a/core/frep/hep_ad.cpp b/core/frep/hep_ad.cpp
+new file mode 100644
+index 0000000..28414b5
+--- /dev/null
++++ b/core/frep/hep_ad.cpp
+@@ -0,0 +1,252 @@
++// core/frep/hep_ad.cpp
++//
++// Analytic forward-mode gradients for the six HEP node types.
++//
++// Without these the nodes inherited FRepNode's finite-difference fallback,
++// which evaluates the whole subtree THREE times and steps by h = 1e-3 in
++// absolute units. At detector scale that step is the same order as the f32
++// spacing (~1e-3 mm at 1e4 mm), so the difference quotient lands on a few
++// discrete values and the gradient stops being a unit vector. Measured on a
++// Tube, |grad| where it should be 1:
++//
++//     scale      1 mm   1.043
++//     scale    100 mm   1.007
++//     scale   1000 mm   1.023
++//     scale  10000 mm   1.092
++//
++// against a Sphere's analytic gradient, which is 1.0000 at every scale. A
++// normal that is 9% long is a wrong direction, not a slightly noisy one, and
++// this project exists to get derivatives from the geometry rather than around
++// it.
++//
++// Each body mirrors eval_t and codegen piece for piece and in the same order.
++// The value the dual carries must therefore equal what codegen() emits, which
++// is why a division by a constant goes through ad_ir::div against a constant
++// dual rather than a multiply by its reciprocal.
++//
++// THE SUBGRADIENT AT A SEAM is the active piece's: ad_ir::max already selects
++// the dual of whichever branch won, which is the right choice for a field
++// built as a max of pieces. At the seam itself the derivative does not exist
++// and either one-sided value is admissible.
++
++#include "ad_ir.hpp"
++#include "hep.hpp"
++
++namespace frep::hep {
++
++namespace ai = ad_ir;
++using D = FRepNode::DualVal;
++
++namespace {
++
++/// rho = sqrt(x^2 + y^2), with the axis guarded.
++///
++/// d(sqrt(u))/du is 1/(2 sqrt(u)), which is infinite at u = 0 - and the axis
++/// of a tube is an ordinary interior point that a navigator really does
++/// query. The value is left exact and only the DERIVATIVE's denominator is
++/// floored, so the field is unchanged and the gradient there is merely large
++/// instead of NaN.
++D rho_d(CgCtx& c, D x, D y) {
++    auto& b = c.b;
++    auto* u = b.CreateFAdd(b.CreateFMul(x.val, x.val),
++                           b.CreateFMul(y.val, y.val), "rho2");
++    auto* v = llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sqrt, u, "rho");
++    auto* du = b.CreateFAdd(b.CreateFMul(b.CreateFMul(c.fc(2.0), x.val), x.dot),
++                            b.CreateFMul(b.CreateFMul(c.fc(2.0), y.val), y.dot),
++                            "drho2");
++    auto* den = llvm_compat::max_num(b, b.CreateFMul(c.fc(2.0), v),
++                                     c.fc(1e-12), "den");
++    return {v, b.CreateFDiv(du, den, "drho")};
++}
++
++/// The same wedge as eval_t, as a dual. Null when there is no cut, in which
++/// case the caller omits the term exactly as the value path does.
++bool wedge_d(CgCtx& c, D x, D y, double a, double d, D& out) {
++    float sa, ca, sb, cb;
++    bool use_max = true;
++    if (!wedge_coeffs<float>(float(a), float(d), sa, ca, sb, cb, use_max))
++        return false;
++    D fa = ai::sub(c, ai::mul_s(c, x, sa), ai::mul_s(c, y, ca));
++    D fb = ai::add(c, ai::mul_s(c, x, sb), ai::mul_s(c, y, cb));
++    out = use_max ? ai::max(c, fa, fb) : ai::min(c, fa, fb);
++    return true;
++}
++
++/// |z| - hz
++D zcap_d(CgCtx& c, D z, llvm::Value* hz) {
++    return ai::sub_s(c, ai::fabs(c, z), hz);
++}
++
++/// u = (z + hz) / (2 hz), the frustum interpolation. hz may be a runtime
++/// slot, so the denominator is a value rather than a literal.
++D uof_d(CgCtx& c, D z, llvm::Value* hz) {
++    D num = ai::add_s(c, z, hz);
++    D den = ai::constant(c, 0.0f);
++    den.val = c.b.CreateFMul(c.fc(2.0), hz, "2hz");
++    return ai::div(c, num, den);
++}
++
++/// a / k for a compile-time constant k, through FDiv so the VALUE matches
++/// what codegen() emits bit for bit.
++D div_k(CgCtx& c, D a, float k) { return ai::div(c, a, ai::constant(c, k)); }
++
++}  // namespace
++
++// ── Tube ─────────────────────────────────────────────────────────────────────
++D TubeNode::codegen_grad(CgCtx& c, D x, D y, D z) const {
++    auto* rmax = c.param_value(id, "rmax", float(params[Rmax]));
++    auto* hz = c.param_value(id, "hz", float(params[Hz]));
++    D rho = rho_d(c, x, y);
++    D f = ai::max(c, ai::sub_s(c, rho, rmax), zcap_d(c, z, hz));
++    if (params[Rmin] > 0.0) {
++        auto* rmin = c.param_value(id, "rmin", float(params[Rmin]));
++        f = ai::max(c, f, ai::neg(c, ai::sub_s(c, rho, rmin)));
++    }
++    D w{};
++    if (wedge_d(c, x, y, params[Phi0], params[Dphi], w)) f = ai::max(c, f, w);
++    return f;
++}
++
++// ── Cone ─────────────────────────────────────────────────────────────────────
++D ConeNode::codegen_grad(CgCtx& c, D x, D y, D z) const {
++    const double hzf = params[Hz];
++    const double a1 = params[Rmax1], a2 = params[Rmax2];
++    auto* hz = c.param_value(id, "hz", float(hzf));
++    auto* r1 = c.param_value(id, "rmax1", float(a1));
++    D u = uof_d(c, z, hz);
++    // Rmax = r1 + (r2 - r1) u : u carries dz, so the slant contributes to the
++    // gradient. This is the term a finite difference gets worst.
++    D Rmax = ai::add_s(c, ai::mul_s(c, u, float(a2 - a1)), r1);
++    D rho = rho_d(c, x, y);
++    D f = ai::max(c,
++                  div_k(c, ai::sub(c, rho, Rmax),
++                        lat_scale<float>(a2 - a1, 2.0 * hzf)),
++                  zcap_d(c, z, hz));
++    const double i1 = params[Rmin1], i2 = params[Rmin2];
++    if (i1 > 0.0 || i2 > 0.0) {
++        auto* q1 = c.param_value(id, "rmin1", float(i1));
++        D Rmin = ai::add_s(c, ai::mul_s(c, u, float(i2 - i1)), q1);
++        f = ai::max(c, f,
++                    div_k(c, ai::sub(c, Rmin, rho),
++                          lat_scale<float>(i2 - i1, 2.0 * hzf)));
++    }
++    D w{};
++    if (wedge_d(c, x, y, params[Phi0], params[Dphi], w)) f = ai::max(c, f, w);
++    return f;
++}
++
++// ── SphericalShell ───────────────────────────────────────────────────────────
++D SphericalShellNode::codegen_grad(CgCtx& c, D x, D y, D z) const {
++    D rho = rho_d(c, x, y);
++    // rad from rho, not from x,y,z - see hep.hpp. The same guard applies at
++    // the origin, so it goes through the same helper shape.
++    auto& b = c.b;
++    auto* u = b.CreateFAdd(b.CreateFMul(rho.val, rho.val),
++                           b.CreateFMul(z.val, z.val), "rad2");
++    auto* v = llvm_compat::unary_intrinsic(b, llvm::Intrinsic::sqrt, u, "rad");
++    auto* du =
++        b.CreateFAdd(b.CreateFMul(b.CreateFMul(c.fc(2.0), rho.val), rho.dot),
++                     b.CreateFMul(b.CreateFMul(c.fc(2.0), z.val), z.dot), "drad2");
++    auto* den = llvm_compat::max_num(b, b.CreateFMul(c.fc(2.0), v), c.fc(1e-12));
++    D rad{v, b.CreateFDiv(du, den, "drad")};
++
++    auto* rmax = c.param_value(id, "rmax", float(params[Rmax]));
++    D f = ai::sub_s(c, rad, rmax);
++    if (params[Rmin] > 0.0) {
++        auto* rmin = c.param_value(id, "rmin", float(params[Rmin]));
++        f = ai::max(c, f, ai::neg(c, ai::sub_s(c, rad, rmin)));
++    }
++    D w{};
++    if (wedge_d(c, x, y, params[Phi0], params[Dphi], w)) f = ai::max(c, f, w);
++
++    const double t0 = params[Theta0];
++    const double t1 = t0 + params[Dtheta];
++    // rho cos(t) - z sin(t): linear in (rho, z), so the dual is the same
++    // combination of their duals.
++    auto cone = [&](double t, bool neg) {
++        D v2 = ai::sub(c, ai::mul_s(c, rho, float(std::cos(t))),
++                       ai::mul_s(c, z, float(std::sin(t))));
++        return neg ? ai::neg(c, v2) : v2;
++    };
++    if (t0 > 1e-6) f = ai::max(c, f, cone(t0, true));
++    if (t1 < M_PI - 1e-6) f = ai::max(c, f, cone(t1, false));
++    return f;
++}
++
++// ── Trapezoid ────────────────────────────────────────────────────────────────
++D TrapezoidNode::codegen_grad(CgCtx& c, D x, D y, D z) const {
++    const double hzf = params[Hz];
++    auto* hz = c.param_value(id, "hz", float(hzf));
++    D u = uof_d(c, z, hz);
++    auto face = [&](const char* p0, int idx, double v0, double v1, D coord) {
++        auto* base = c.param_value(id, p0, float(v0));
++        (void)idx;
++        D half = ai::add_s(c, ai::mul_s(c, u, float(v1 - v0)), base);
++        return div_k(c, ai::sub(c, ai::fabs(c, coord), half),
++                     lat_scale<float>(v1 - v0, 2.0 * hzf));
++    };
++    D fx = face("dx1", Dx1, params[Dx1], params[Dx2], x);
++    D fy = face("dy1", Dy1, params[Dy1], params[Dy2], y);
++    return ai::max(c, ai::max(c, fx, fy), zcap_d(c, z, hz));
++}
++
++// ── Polyhedron ───────────────────────────────────────────────────────────────
++D PolyhedronNode::codegen_grad(CgCtx& c, D x, D y, D z) const {
++    const std::vector<double>& fc = faces();
++    // A max of linear functions: its gradient is the winning face's normal,
++    // which is exactly what ad_ir::max selects. No branch, no transcendental.
++    D r{};
++    bool first = true;
++    for (std::size_t j = 0; j + 1 < fc.size(); j += 2) {
++        D u = ai::add(c, ai::mul_s(c, x, float(fc[j])),
++                      ai::mul_s(c, y, float(fc[j + 1])));
++        r = first ? u : ai::max(c, r, u);
++        first = false;
++    }
++    const double hzf = params[Hz];
++    const double a1 = params[Rmax1], a2 = params[Rmax2];
++    auto* hz = c.param_value(id, "hz", float(hzf));
++    auto* r1 = c.param_value(id, "rmax1", float(a1));
++    D u = uof_d(c, z, hz);
++    D Rmax = ai::add_s(c, ai::mul_s(c, u, float(a2 - a1)), r1);
++    D f = ai::max(c,
++                  div_k(c, ai::sub(c, r, Rmax),
++                        lat_scale<float>(a2 - a1, 2.0 * hzf)),
++                  zcap_d(c, z, hz));
++    const double i1 = params[Rmin1], i2 = params[Rmin2];
++    if (i1 > 0.0 || i2 > 0.0) {
++        auto* q1 = c.param_value(id, "rmin1", float(i1));
++        D Rmin = ai::add_s(c, ai::mul_s(c, u, float(i2 - i1)), q1);
++        f = ai::max(c, f,
++                    div_k(c, ai::sub(c, Rmin, r),
++                          lat_scale<float>(i2 - i1, 2.0 * hzf)));
++    }
++    D w{};
++    if (wedge_d(c, x, y, params[Phi0], params[Dphi], w)) f = ai::max(c, f, w);
++    return f;
++}
++
++// ── Frame ────────────────────────────────────────────────────────────────────
++D FrameNode::codegen_grad(CgCtx& c, D x, D y, D z) const {
++    // q = R^T (p - t) with R constant, so the duals transform by the same
++    // linear map and no Jacobian term is needed. R is a rotation, so the
++    // gradient comes back unit-length without rescaling.
++    auto P = [&](const char* n, int i) {
++        return c.param_value(id, n, float(params[i]));
++    };
++    D dx = ai::sub_s(c, x, P("tx", Tx));
++    D dy = ai::sub_s(c, y, P("ty", Ty));
++    D dz = ai::sub_s(c, z, P("tz", Tz));
++    static const char* kRow[9] = {"r0", "r1", "r2", "r3", "r4",
++                                  "r5", "r6", "r7", "r8"};
++    auto row = [&](int a, int d, int g) {
++        return ai::add(c,
++                       ai::add(c, ai::mul_s(c, dx, P(kRow[a], R0 + a)),
++                               ai::mul_s(c, dy, P(kRow[d], R0 + d))),
++                       ai::mul_s(c, dz, P(kRow[g], R0 + g)));
++    };
++    return children[0]->codegen_grad(c, row(0, 3, 6), row(1, 4, 7),
++                                     row(2, 5, 8));
++}
++
++}  // namespace frep::hep
+diff --git a/tests/test_hep_ad.cpp b/tests/test_hep_ad.cpp
+new file mode 100644
+index 0000000..a6880e8
+--- /dev/null
++++ b/tests/test_hep_ad.cpp
+@@ -0,0 +1,251 @@
++// tests/test_hep_ad.cpp
++//
++// Analytic gradients for the six HEP nodes, against the property a distance
++// field has to have and against an independent oracle.
++//
++//   A  |grad f| = 1. Every piece of these fields is a unit-gradient function
++//      - that is what dividing a slanted face by sqrt(1+k^2) is FOR - and a
++//      max of unit-gradient pieces has a unit gradient everywhere it is
++//      differentiable. So this is not a tolerance, it is the invariant, and
++//      it is what the finite-difference fallback broke: measured on a Tube,
++//      |grad| was 1.043 at 1 mm and 1.092 at 10 m, because h = 1e-3 in
++//      absolute units is the f32 spacing itself at detector scale.
++//
++//   B  The direction agrees with a central difference taken in DOUBLE at a
++//      step scaled to the coordinate. That is a real oracle: it is computed
++//      from evalw, not from the gradient code, so an error in the chain rule
++//      cannot hide in both.
++//
++//   C  A rotated frame does not change the length. R is a rotation, so the
++//      chain rule needs no rescaling - and if a transpose were flipped, the
++//      direction would be wrong while the length stayed 1, which is why B
++//      exists as well.
++
++#include "core/compiler/codegen.hpp"
++#include "core/compiler/jit_engine.hpp"
++#include "core/frep/hep.hpp"
++#include "tests/test_support.hpp"
++
++#include <gtest/gtest.h>
++#include <llvm/Support/TargetSelect.h>
++
++#include <array>
++#include <cmath>
++#include <cstdio>
++#include <memory>
++#include <random>
++#include <string>
++#include <vector>
++
++using namespace frep;
++
++namespace {
++
++using GradFn = float (*)(float, float, float, float, float, float, float*);
++
++class LLVMInitAd : public ::testing::Environment {
++public:
++    void SetUp() override {
++        llvm::InitializeNativeTarget();
++        llvm::InitializeNativeTargetAsmPrinter();
++    }
++};
++[[maybe_unused]] auto* g_ad_env =
++    ::testing::AddGlobalTestEnvironment(new LLVMInitAd);
++
++GradFn jit_grad(const FRepNode& root) {
++    auto ctx = std::make_unique<llvm::LLVMContext>();
++    SceneCodegen cg(*ctx);
++    cg.emit_scene_sdf_grad(root);
++    auto& mod = *cg.module();
++    auto* g = mod.getFunction("scene_sdf_grad");
++    if (!g) return nullptr;
++    auto* f32 = llvm::Type::getFloatTy(*ctx);
++    auto* ptr = llvm::PointerType::getUnqual(*ctx);
++    auto* fty =
++        llvm::FunctionType::get(f32, {f32, f32, f32, f32, f32, f32, ptr}, false);
++    auto* w = llvm::Function::Create(fty, llvm::Function::ExternalLinkage,
++                                     "render_tile", &mod);
++    auto* bb = llvm::BasicBlock::Create(*ctx, "entry", w);
++    llvm::IRBuilder<> b(bb);
++    std::vector<llvm::Value*> args;
++    for (auto& a : w->args()) args.push_back(&a);
++    b.CreateRet(b.CreateCall(g, args));
++    auto mp = cg.take_module();
++    test::jit_pool().emplace_back(std::make_unique<JitEngine>());
++    auto r = test::jit_pool().back()->load(std::move(mp), std::move(ctx));
++    return r ? reinterpret_cast<GradFn>(*r) : nullptr;
++}
++
++/// The three partials, one directional derivative each.
++std::array<double, 3> grad_at(GradFn f, double x, double y, double z) {
++    float d = 0.0f;
++    std::array<double, 3> g{};
++    f(float(x), 1.0f, float(y), 0.0f, float(z), 0.0f, &d); g[0] = d;
++    f(float(x), 0.0f, float(y), 1.0f, float(z), 0.0f, &d); g[1] = d;
++    f(float(x), 0.0f, float(y), 0.0f, float(z), 1.0f, &d); g[2] = d;
++    return g;
++}
++
++double len(const std::array<double, 3>& g) {
++    return std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
++}
++
++/// Central difference in double, step scaled to the coordinate - the oracle.
++std::array<double, 3> fd_grad(const FRepNode& n, double x, double y, double z) {
++    const double h = 1e-6 * std::max(1.0, std::max({std::fabs(x), std::fabs(y),
++                                                    std::fabs(z)}));
++    return {(n.evalw(x + h, y, z) - n.evalw(x - h, y, z)) / (2 * h),
++            (n.evalw(x, y + h, z) - n.evalw(x, y - h, z)) / (2 * h),
++            (n.evalw(x, y, z + h) - n.evalw(x, y, z - h)) / (2 * h)};
++}
++
++struct Case { const char* nm; FRepNode::Ptr n; };
++
++std::vector<Case> cases() {
++    std::vector<Case> v;
++    v.push_back({"Tube", std::make_shared<hep::TubeNode>(1210.125, 2950.625,
++                                                         3100.875, 0.0, 7.0)});
++    v.push_back({"TubeWedge", std::make_shared<hep::TubeNode>(
++                                  800.0, 2000.0, 3000.0, 0.3, 2.1)});
++    v.push_back({"Cone", std::make_shared<hep::ConeNode>(
++                             300.0, 1500.0, 500.0, 2500.0, 4000.0, 0.0, 7.0)});
++    v.push_back({"Shell", std::make_shared<hep::SphericalShellNode>(
++                              900.5, 2141.25, 0.0, 7.0, 0.35, 1.9)});
++    v.push_back({"Trd", std::make_shared<hep::TrapezoidNode>(
++                            215.0, 587.5, 132.5, 445.0, 3110.0)});
++    v.push_back({"Poly", std::make_shared<hep::PolyhedronNode>(
++                             175.0, 882.5, 237.5, 1315.0, 2900.0, 0.13, 7.0, 6)});
++    {
++        const double r[9] = {0.8, 0.0, 0.6, 0.0, 1.0, 0.0, -0.6, 0.0, 0.8};
++        v.push_back({"Frame(Tube)",
++                     std::make_shared<hep::FrameNode>(
++                         std::make_shared<hep::TubeNode>(1210.125, 2950.625,
++                                                         3100.875, 0.0, 7.0),
++                         r, 150.0, -320.0, 480.0)});
++    }
++    return v;
++}
++
++}  // namespace
++
++TEST(HepAd, TheGradientIsAUnitVectorAtEveryScale) {
++    std::mt19937_64 rng(0x6AD);
++    for (auto& c : cases()) {
++        auto* f = jit_grad(*c.n);
++        ASSERT_NE(f, nullptr) << c.nm;
++        double worst = 0.0;
++        long n = 0, skipped = 0;
++        for (int i = 0; i < 4000; ++i) {
++            std::uniform_real_distribution<double> U(-5000.0, 5000.0);
++            const double x = U(rng), y = U(rng), z = U(rng);
++            // The axis is where d(sqrt)/du is guarded, and a seam is where
++            // two pieces tie; neither has a gradient to be wrong about.
++            if (std::sqrt(x * x + y * y) < 1.0) { ++skipped; continue; }
++            const auto g = grad_at(f, x, y, z);
++            const double L = len(g);
++            if (L == 0.0) { ++skipped; continue; }
++            worst = std::max(worst, std::fabs(L - 1.0));
++            ++n;
++        }
++        // f32 rounding over coordinates up to 5 m: a few 1e-4. The point is
++        // that it does not GROW with scale, which is what the fallback did.
++        EXPECT_LT(worst, 5e-3) << c.nm << ": worst ||grad| - 1| = " << worst;
++        std::printf("  %-12s worst ||grad|-1| = %.3g over %ld points "
++                    "(%ld skipped)\n", c.nm, worst, n, skipped);
++    }
++}
++
++TEST(HepAd, TheDirectionAgreesWithADoubleCentralDifference) {
++    std::mt19937_64 rng(0xD1F);
++    for (auto& c : cases()) {
++        auto* f = jit_grad(*c.n);
++        ASSERT_NE(f, nullptr) << c.nm;
++        double worstCos = 1.0;
++        long n = 0;
++        for (int i = 0; i < 2000; ++i) {
++            std::uniform_real_distribution<double> U(-5000.0, 5000.0);
++            const double x = U(rng), y = U(rng), z = U(rng);
++            if (std::sqrt(x * x + y * y) < 100.0) continue;
++            const auto a = grad_at(f, x, y, z);
++            const auto b = fd_grad(*c.n, x, y, z);
++            const double la = len(a), lb = len(b);
++            if (la < 0.5 || lb < 0.5) continue;
++            // Near a seam the two may pick different one-sided branches, and
++            // both are admissible; those show up as a low cosine on a small
++            // number of points, so the assertion is on the MEDIAN rather than
++            // the worst - a worst-case bound here would be asserting that no
++            // sample ever lands on a seam.
++            const double cosang =
++                (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb);
++            worstCos = std::min(worstCos, cosang);
++            ++n;
++            if (cosang < 0.999) continue;   // counted, not fatal
++        }
++        // Collect again for a median, cheaply: re-run with a fixed stream.
++        std::vector<double> cs;
++        std::mt19937_64 r2(0xD1F);
++        for (int i = 0; i < 2000; ++i) {
++            std::uniform_real_distribution<double> U(-5000.0, 5000.0);
++            const double x = U(r2), y = U(r2), z = U(r2);
++            if (std::sqrt(x * x + y * y) < 100.0) continue;
++            const auto a = grad_at(f, x, y, z);
++            const auto b = fd_grad(*c.n, x, y, z);
++            const double la = len(a), lb = len(b);
++            if (la < 0.5 || lb < 0.5) continue;
++            cs.push_back((a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb));
++        }
++        ASSERT_FALSE(cs.empty()) << c.nm;
++        std::sort(cs.begin(), cs.end());
++        const double med = cs[cs.size() / 2];
++        const double p01 = cs[cs.size() / 100];
++        EXPECT_GT(med, 0.99999) << c.nm << ": median cos = " << med;
++        std::printf("  %-12s median cos %.6f, 1%% %.6f, worst %.6f "
++                    "over %zu points\n", c.nm, med, p01, cs.front(), cs.size());
++    }
++}
++
++TEST(HepAd, AnalyticEmitsLessIrThanTheFiniteDifference) {
++    // The fallback emits codegen() three times - at p+h, p-h and p - so it
++    // should be the larger body. Counted as IR instructions, which are
++    // deterministic, rather than as a wall-clock ratio, and counted for the
++    // SAME node through both paths.
++    //
++    // 45 against 28, so 1.61x and not the 3x the call count suggests: the
++    // Tube's value body is small next to the dual bookkeeping, and the
++    // fallback's three calls share the parameter constants. The size was
++    // never the reason to write these - the accuracy was - and quoting 3x
++    // because three calls are emitted would be reasoning from the code
++    // instead of from the measurement.
++    auto tube = std::make_shared<hep::TubeNode>(1210.125, 2950.625, 3100.875,
++                                                0.0, 7.0);
++
++    auto count = [&](bool analytic) {
++        llvm::LLVMContext ctx;
++        llvm::Module mod("count", ctx);
++        auto* f32 = llvm::Type::getFloatTy(ctx);
++        auto* fty = llvm::FunctionType::get(
++            f32, {f32, f32, f32, f32, f32, f32}, false);
++        auto* fn = llvm::Function::Create(fty, llvm::Function::ExternalLinkage,
++                                          "g", &mod);
++        auto* bb = llvm::BasicBlock::Create(ctx, "entry", fn);
++        llvm::IRBuilder<> b(bb);
++        CgCtx c{ctx, mod, b};
++        auto it = fn->arg_begin();
++        FRepNode::DualVal x{&*it++, &*it++};
++        FRepNode::DualVal y{&*it++, &*it++};
++        FRepNode::DualVal z{&*it++, &*it++};
++        const auto d = analytic
++                           ? tube->codegen_grad(c, x, y, z)
++                           : tube->FRepNode::codegen_grad(c, x, y, z);
++        b.CreateRet(d.dot);
++        std::size_t n = 0;
++        for (auto& block : *fn) n += block.size();
++        return n;
++    };
++
++    const std::size_t fd = count(false), an = count(true);
++    std::printf("  Tube gradient IR: finite difference %zu, analytic %zu "
++                "(%.2fx)\n", fd, an, double(fd) / double(an));
++    EXPECT_LT(an, fd) << "the analytic body should be the smaller one";
++}
+-- 
+2.43.0
+

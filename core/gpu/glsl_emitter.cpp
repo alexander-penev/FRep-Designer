@@ -12,23 +12,7 @@
 
 namespace frep::gpu {
 
-namespace {
-
-// Helper: emit a float literal with enough precision for round-trip.
-std::string flit(float v) {
-    std::ostringstream os;
-    os << std::setprecision(9) << v;
-    std::string s = os.str();
-    // Ensure GLSL parses it as a float (presence of '.' or 'e').
-    if (s.find('.') == std::string::npos && s.find('e') == std::string::npos
-        && s.find('E') == std::string::npos)
-    {
-        s += ".0";
-    }
-    return s;
-}
-
-} // anon
+// flit() now lives in the header - glsl_hep.cpp needs it too.
 
 // Parameter choke point: literal when Constant / no table, P.v[slot] when
 // Runtime. All node emitters below build their GLSL arithmetic over pval()
@@ -403,6 +387,21 @@ GlslEmitter::emit_node(Ctx& c, const FRepNode& n,
         case K::BendXY:    return emit_bend_xy(c, n, x, y, z);
         case K::TaperY:    return emit_taper_y(c, n, x, y, z);
 
+        // HEP primitives (core/gpu/glsl_hep.cpp).
+        case K::Tube:           return emit_hep_tube(c, n, x, y, z);
+        case K::Cone:           return emit_hep_cone(c, n, x, y, z);
+        case K::SphericalShell: return emit_hep_shell(c, n, x, y, z);
+        case K::Trapezoid:      return emit_hep_trd(c, n, x, y, z);
+        case K::Polyhedron:     return emit_hep_poly(c, n, x, y, z);
+        case K::Frame: {
+            // Rewrites the point and recurses - the child is the value.
+            if (n.children.empty() || !n.children[0])
+                return std::unexpected(std::string("Frame has no child"));
+            std::string qx, qy, qz;
+            emit_hep_frame_coords(c, n, x, y, z, qx, qy, qz);
+            return emit_node(c, *n.children[0], qx, qy, qz);
+        }
+
         case K::Instance: {
             if (n.children.empty() || !n.children[0])
                 return std::string("1e30");        // dangling -> empty
@@ -451,9 +450,9 @@ GlslEmitter::emit_node(Ctx& c, const FRepNode& n,
                     break;
                 case K::SmoothUnion: {
                     float kk = 0.1f;
-                    auto it = n.params.find("k");
-                    if (it != n.params.end()) kk = it->second;
-                    int kslot = (c.bindings && it != n.params.end())
+                    const double* it = n.params.get("k");
+                    if (it) kk = float(*it);
+                    int kslot = (c.bindings && it)
                                 ? c.bindings->slot_of(n.id, "k") : -1;
                     std::string kbase = (kslot < 0)
                         ? flit(kk)
@@ -649,9 +648,9 @@ GlslEmitter::emit_node_dual(Ctx& c, const FRepNode& n,
             auto tv = c.fresh("t");
             auto hv = c.fresh("h");
             int tslot = c.bindings ? c.bindings->slot_of(n.id, "t") : -1;
-            int hslot = (c.bindings && n.params.count("h"))
+            int hslot = (c.bindings && n.params.contains("h"))
                         ? c.bindings->slot_of(n.id, "h") : -1;
-            float hdef = n.params.count("h") ? n.params.at("h") : 2.0f;
+            float hdef = float(n.params.value_or("h", 2.0));
             auto u  = c.fresh_d(), s = c.fresh_d();
             auto xp = c.fresh_d(), zp = c.fresh_d();
             g << "    float " << tv << " = "
@@ -694,9 +693,9 @@ GlslEmitter::emit_node_dual(Ctx& c, const FRepNode& n,
                 g << "    Dual " << v << " = d_max(" << *a << ", d_neg(" << *b << "));\n";
             else { // SmoothUnion — IQ smin in dual arithmetic
                 float kk = 0.1f;
-                auto it = n.params.find("k");
-                if (it != n.params.end()) kk = it->second;
-                int kslot = (c.bindings && it != n.params.end())
+                const double* it = n.params.get("k");
+                if (it) kk = float(*it);
+                int kslot = (c.bindings && it)
                             ? c.bindings->slot_of(n.id, "k") : -1;
                 std::string kbase = (kslot < 0)
                     ? flit(kk)
@@ -732,6 +731,20 @@ GlslEmitter::emit_node_dual(Ctx& c, const FRepNode& n,
             }
             return emit_node_dual(c, *target, x, y, z);   // delegate to target
         }
+        // HEP primitives (core/gpu/glsl_hep.cpp).
+        case K::Tube:           return emit_hep_tube_dual(c, n, x, y, z);
+        case K::Cone:           return emit_hep_cone_dual(c, n, x, y, z);
+        case K::SphericalShell: return emit_hep_shell_dual(c, n, x, y, z);
+        case K::Trapezoid:      return emit_hep_trd_dual(c, n, x, y, z);
+        case K::Polyhedron:     return emit_hep_poly_dual(c, n, x, y, z);
+        case K::Frame: {
+            if (n.children.empty() || !n.children[0])
+                return std::unexpected(std::string("Frame has no child"));
+            std::string qx, qy, qz;
+            emit_hep_frame_dual_coords(c, n, x, y, z, qx, qy, qz);
+            return emit_node_dual(c, *n.children[0], qx, qy, qz);
+        }
+
         default:
             // BendXY and plugin/mesh/custom nodes: no dual emitter yet.
             // Signal the caller to fall back to finite-difference normals
@@ -1369,7 +1382,14 @@ GlslEmitter::emit(const SceneGraph& scene, const TracerConfig& cfg_in,
             << "Dual d_add_s(Dual a, float s){ return Dual(a.v+s, a.g); }\n"
             << "Dual d_sub_s(Dual a, float s){ return Dual(a.v-s, a.g); }\n"
             << "Dual d_mul_s(Dual a, float s){ return Dual(a.v*s, a.g*s); }\n"
+            // A true divide, not a multiply by the reciprocal: the value
+            // path divides by the slant factor, and the dual has to produce
+            // the same bits or the two disagree on the surface itself.
+            << "Dual d_div_s(Dual a, float s){ return Dual(a.v/s, a.g/s); }\n"
             << "Dual d_neg(Dual a){ return Dual(-a.v, -a.g); }\n"
+            // |a|, after d_neg because GLSL has no forward declarations. The
+            // subgradient is sign(a), matching the CPU's ad_ir::fabs.
+            << "Dual d_abs(Dual a){ return (a.v >= 0.0) ? a : d_neg(a); }\n"
             << "Dual d_sqrt(Dual a){ float s=sqrt(max(a.v,1e-12)); return Dual(s, a.g*(0.5/s)); }\n"
             << "Dual d_sin(Dual a){ return Dual(sin(a.v), cos(a.v)*a.g); }\n"
             << "Dual d_cos(Dual a){ return Dual(cos(a.v), -sin(a.v)*a.g); }\n"

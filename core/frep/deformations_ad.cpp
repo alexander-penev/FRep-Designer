@@ -80,7 +80,7 @@ FRepNode::DualVal TaperYNode::codegen_grad(CgCtx& c,
     //   u = clamp((y + 0.5h)/h, 0, 1) ; s = max(1 + u(t-1), 1e-3)
     //   child(x/s, y, z/s) / max(1, 1/s)
     float t = params.at("t");
-    float h = params.count("h") ? params.at("h") : 2.0f;
+    const float h = float(params.value_or("h", 2.0));
     auto u_raw = ai::mul_s(c, ai::add_s(c, y, 0.5f * h), 1.0f / h);
     auto u     = ai::clamp_s(c, u_raw, 0.0f, 1.0f);
     auto s     = ai::max_s(c, ai::add_s(c, ai::mul_s(c, u, t - 1.0f), 1.0f), 1e-3f);
