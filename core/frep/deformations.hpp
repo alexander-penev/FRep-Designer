@@ -44,7 +44,11 @@ public:
     TwistYNode(FRepNode::Ptr child, float k, std::string nid = "twist") {
         kind = NodeKind::TwistY;
         id   = std::move(nid);
-        params.init({"k"}, {k});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"k"};
+            return n;
+        }(), {k});
         children = {std::move(child)};
     }
 
@@ -126,7 +130,11 @@ public:
     BendXYNode(FRepNode::Ptr child, float k, std::string nid = "bend") {
         kind = NodeKind::BendXY;
         id   = std::move(nid);
-        params.init({"k"}, {k});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"k"};
+            return n;
+        }(), {k});
         children = {std::move(child)};
     }
 

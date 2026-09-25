@@ -122,7 +122,11 @@ public:
     enum : int { K };
     SmoothUnionNode(FRepNode::Ptr a, FRepNode::Ptr b, float k, std::string nid = "smin") {
         kind = NodeKind::SmoothUnion; id = std::move(nid);
-        params.init({"k"}, {k});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"k"};
+            return n;
+        }(), {k});
         children = {std::move(a), std::move(b)};
     }
 

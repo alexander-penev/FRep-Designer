@@ -21,7 +21,11 @@ public:
     enum : int { R };
     explicit SphereNode(double r, std::string nid = "sphere") {
         kind = NodeKind::Sphere; id = std::move(nid);
-        params.init({"r"}, {r});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"r"};
+            return n;
+        }(), {r});
     }
 
     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
@@ -61,7 +65,11 @@ public:
     enum : int { Hx, Hy, Hz };
     BoxNode(double hx, double hy, double hz, std::string nid = "box") {
         kind = NodeKind::Box; id = std::move(nid);
-        params.init({"hx", "hy", "hz"}, {hx, hy, hz});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"hx", "hy", "hz"};
+            return n;
+        }(), {hx, hy, hz});
     }
 
     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
@@ -128,7 +136,11 @@ public:
     enum : int { Nx, Ny, Nz, D };
     PlaneNode(double nx, double ny, double nz, double d, std::string nid = "plane") {
         kind = NodeKind::Plane; id = std::move(nid);
-        params.init({"nx", "ny", "nz", "d"}, {nx, ny, nz, d});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"nx", "ny", "nz", "d"};
+            return n;
+        }(), {nx, ny, nz, d});
     }
 
     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {

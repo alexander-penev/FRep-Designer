@@ -625,6 +625,7 @@ add_executable(frep_tests
     tests/test_simd_scalar_type.cpp
     tests/test_hep_ad.cpp
     tests/test_glsl_hep.cpp
+    tests/test_cross_path.cpp
     tests/test_expr_backends.cpp
     tests/test_plugin_runtime.cpp
     tests/test_scene_set_geometry.cpp

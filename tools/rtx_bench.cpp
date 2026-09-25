@@ -66,9 +66,81 @@ gpu::RtAabb to_aabb(const FRepNode::AABB& b, float m = 0.05f) {
 
 }  // namespace
 
+// ── energy needs a longer window than one frame ─────────────────────────────
+//
+// The first version bracketed ONE render with the counter. At 512x512 that is
+// ~3.8 ms of CPU raymarch and ~0.55 ms of RT trace, and neither counter can
+// resolve that: RAPL updates about every millisecond, and NVML's power reading
+// is a sampled average whose update period is tens of milliseconds. What came
+// back was not the energy of the work, it was the counter's quantisation.
+//
+// It read as a plausible table, which is the dangerous part. On an RTX 2080
+// (25 Sep 2026) the cpu column was NON-MONOTONIC - N=4 rendered slower than
+// N=1 yet reported nearly double the efficiency - and the ratio said the RT
+// cores were ~12x LESS efficient per pixel than the CPU while being 6.9x
+// faster. For a 2080 at a couple of hundred watts against a CPU package at
+// some tens, the expectation is the opposite.
+//
+// So: repeat the operation until the window is long enough for the counter,
+// and measure energy and time over THAT window, the same one. The throughput
+// columns keep their old meaning (one hot loop, excluding JIT and setup) so
+// the table stays comparable with earlier runs; the energy columns are now
+// internally consistent instead of agreeing with nothing.
+struct EnergySample {
+    double joules  = 0.0;
+    double seconds = 0.0;
+    long   reps    = 0;
+    bool   ok      = false;
+};
+
+/// Repeat `once` until at least `min_ms` has passed, with the counter open
+/// across the whole run.
+template <class F>
+static EnergySample measure_energy(power::EnergyCounter* c, double min_ms,
+                                   F&& once) {
+    EnergySample s;
+    if (!c || !c->available()) return s;
+    const auto t0 = std::chrono::steady_clock::now();
+    c->begin();
+    double elapsed_ms = 0.0;
+    do {
+        once();
+        ++s.reps;
+        elapsed_ms = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - t0).count();
+    } while (elapsed_ms < min_ms);
+    auto j = c->end();
+    s.seconds = elapsed_ms / 1000.0;
+    if (j && *j > 0.0) { s.joules = *j; s.ok = true; }
+    return s;
+}
+
+// A reading outside this band is the counter misbehaving, not a result: no
+// CPU package or discrete GPU doing continuous work draws less than half a
+// watt, and nothing here draws two kilowatts. Printing the watts alongside is
+// what makes the number checkable at a glance - Mpix/kWh is not.
+constexpr double kMinWatts = 0.5;
+constexpr double kMaxWatts = 2000.0;
+
+/// "<Mpix/kWh> (<W> W)", or a dash and the reason.
+static std::string energy_cell(const EnergySample& s, double pixels_per_rep) {
+    if (!s.ok || s.seconds <= 0.0) return "-";
+    const double w = s.joules / s.seconds;
+    char buf[64];
+    if (w < kMinWatts || w > kMaxWatts) {
+        std::snprintf(buf, sizeof(buf), "? %.1fW", w);
+        return buf;
+    }
+    const double mpk =
+        power::pixels_per_kwh(pixels_per_rep * (double)s.reps, s.joules) / 1e6;
+    std::snprintf(buf, sizeof(buf), "%.0f (%.0fW)", mpk, w);
+    return buf;
+}
+
 int main(int argc, char** argv) {
     int W = 256, H = 256;
     bool energy = false;
+    double energy_ms = 250.0;   // minimum energy window; see measure_energy
     std::vector<int> counts = {1, 4, 16, 64};
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -80,13 +152,18 @@ int main(int argc, char** argv) {
                 "  --height N        frame height (default 256)\n"
                 "  --counts A,B,...  CSG group counts to sweep (default 1,4,16,64)\n"
                 "  --energy          measure CPU (RAPL) + GPU (NVML) energy, "
-                "report Mpix/kWh\n",
+                "report Mpix/kWh and watts\n"
+                "  --energy-ms N     minimum energy window, ms (default 250). "
+                "One frame is far below\n"
+                "                    what RAPL or NVML can resolve; the work "
+                "repeats until N ms have passed.\n",
                 argv[0]);
             return 0;
         }
         else if (a == "--width") W = next(W);
         else if (a == "--height") H = next(H);
         else if (a == "--energy") energy = true;
+        else if (a == "--energy-ms" && i + 1 < argc) energy_ms = std::atof(argv[++i]);
         else if (a == "--counts") {
             counts.clear();
             std::string s = argv[++i]; size_t p = 0;
@@ -99,8 +176,8 @@ int main(int argc, char** argv) {
     }
 
     auto caps = gpu::detect_rtx_caps();
-    std::printf("rtx_bench %dx%d  (%d Mpix/frame)\n[gpu_rtx backend] %s\n\n",
-                W, H, (int)((double)W * H / 1e6 + 0.5), caps.describe().c_str());
+    std::printf("rtx_bench %dx%d  (%.3f Mpix/frame)\n[gpu_rtx backend] %s\n\n",
+                W, H, (double)W * H / 1e6, caps.describe().c_str());
 
     // Optional energy counters (RAPL for CPU, NVML for GPU). Probed once; if a
     // counter isn't available the column is simply omitted — never invented.
@@ -128,7 +205,7 @@ int main(int argc, char** argv) {
     // single path can't reach (you can't turn 12 CPU cores into 512). Energy
     // (pix/kWh) and cost (pix/$) are separate axes for separate questions.
     if (energy)
-        std::printf("  %5s  %7s  %12s  %12s  %12s  %14s  %14s\n",
+        std::printf("  %5s  %7s  %12s  %12s  %12s  %16s  %16s\n",
                     "N", "groups", "cpu Mpix/s", "rtx Mpix/s", "sum Mpix/s",
                     "cpu Mpix/kWh", "rtx Mpix/kWh");
     else
@@ -152,15 +229,18 @@ int main(int argc, char** argv) {
         // Both become throughput below. Energy is measured around the render
         // call (a warmup render first so JIT compile isn't charged to energy).
         cpu.render(scene, W, H, exec::Tile{0, 0, W, H});  // warmup (JIT)
-        if (cpu_e_ok) cpu_e->begin();
         auto rc = cpu.render(scene, W, H, exec::Tile{0, 0, W, H});
-        std::optional<double> cpu_j = cpu_e_ok ? cpu_e->end() : std::nullopt;
         if (!rc.ok) { std::printf("  %5d  cpu render failed: %s\n", n, rc.error.c_str()); continue; }
         double cpu_trace_ms = rc.render_ms;  // raymarch hot loop only
+        EnergySample cpu_es;
+        if (cpu_e_ok)
+            cpu_es = measure_energy(cpu_e.get(), energy_ms, [&] {
+                (void)cpu.render(scene, W, H, exec::Tile{0, 0, W, H});
+            });
 
         // RT multi-BLAS path.
         double rtx_trace_ms = -1.0;
-        double gpu_j = -1.0;
+        EnergySample gpu_es;
         std::string err;
         do {
             auto ctx = gpu::RtxCtx::create();
@@ -192,12 +272,15 @@ int main(int argc, char** argv) {
             gpu::RtPushConstants pc;
             std::memcpy(&pc, &sp, sizeof(pc));
 
-            // GPU energy around the trace (the recurring per-frame GPU work).
-            if (gpu_e_ok) gpu_e->begin();
             auto img = gpu::rtx_trace_groups(*ctx, *accel, rgen, rints, rchit, rmiss, pc, W, H);
             if (!img) { err = img.error(); break; }
             rtx_trace_ms = img->trace_ms;
-            if (gpu_e_ok) { auto j = gpu_e->end(); if (j) gpu_j = *j; }
+            // The recurring per-frame GPU work, repeated over one window.
+            if (gpu_e_ok)
+                gpu_es = measure_energy(gpu_e.get(), energy_ms, [&] {
+                    (void)gpu::rtx_trace_groups(*ctx, *accel, rgen, rints,
+                                                rchit, rmiss, pc, W, H);
+                });
         } while (false);
 
         if (rtx_trace_ms < 0) {
@@ -207,19 +290,13 @@ int main(int argc, char** argv) {
             double cpu_tp = mpix / (cpu_trace_ms / 1000.0);
             double rtx_tp = mpix / (rtx_trace_ms / 1000.0);
             if (energy) {
-                // Mpix/kWh = pix/kWh / 1e6. A counter that read nothing prints
-                // a dash rather than a fabricated number.
-                double px = (double)W * H;
-                char cpu_ek[16] = "      -", rtx_ek[16] = "      -";
-                if (cpu_j && *cpu_j > 0)
-                    std::snprintf(cpu_ek, sizeof(cpu_ek), "%.1f",
-                                  power::pixels_per_kwh(px, *cpu_j) / 1e6);
-                if (gpu_j > 0)
-                    std::snprintf(rtx_ek, sizeof(rtx_ek), "%.1f",
-                                  power::pixels_per_kwh(px, gpu_j) / 1e6);
-                std::printf("  %5d  %7zu  %12.1f  %12.1f  %12.1f  %14s  %14s\n",
+                // A counter that read nothing, or one whose watts are outside
+                // the plausible band, prints a mark rather than a number.
+                const double px = (double)W * H;
+                std::printf("  %5d  %7zu  %12.1f  %12.1f  %12.1f  %16s  %16s\n",
                             n, groups.size(), cpu_tp, rtx_tp, cpu_tp + rtx_tp,
-                            cpu_ek, rtx_ek);
+                            energy_cell(cpu_es, px).c_str(),
+                            energy_cell(gpu_es, px).c_str());
             } else {
                 std::printf("  %5d  %7zu  %12.1f  %12.1f  %12.1f\n",
                             n, groups.size(), cpu_tp, rtx_tp, cpu_tp + rtx_tp);

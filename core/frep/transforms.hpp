@@ -19,7 +19,11 @@ public:
     TranslateNode(FRepNode::Ptr child, float tx, float ty, float tz,
                   std::string nid = "tr") {
         kind = NodeKind::Translate; id = std::move(nid);
-        params.init({"tx", "ty", "tz"}, {tx, ty, tz});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"tx", "ty", "tz"};
+            return n;
+        }(), {tx, ty, tz});
         children = {std::move(child)};
     }
 
@@ -60,13 +64,21 @@ public:
     enum : int { Sx, Sy, Sz };
     ScaleNode(FRepNode::Ptr child, float s, std::string nid = "sc") {
         kind = NodeKind::Scale; id = std::move(nid);
-        params.init({"sx", "sy", "sz"}, {s, s, s});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"sx", "sy", "sz"};
+            return n;
+        }(), {s, s, s});
         children = {std::move(child)};
     }
     // Non-uniform scale: independent per-axis factors.
     ScaleNode(FRepNode::Ptr child, float sx, float sy, float sz, std::string nid = "sc") {
         kind = NodeKind::Scale; id = std::move(nid);
-        params.init({"sx", "sy", "sz"}, {sx, sy, sz});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"sx", "sy", "sz"};
+            return n;
+        }(), {sx, sy, sz});
         children = {std::move(child)};
     }
 
@@ -115,7 +127,11 @@ public:
     enum : int { A };
     RotateYNode(FRepNode::Ptr child, float angle_rad, std::string nid = "ry") {
         kind = NodeKind::RotateY; id = std::move(nid);
-        params.init({"a"}, {angle_rad});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"a"};
+            return n;
+        }(), {angle_rad});
         children = {std::move(child)};
     }
 
@@ -159,7 +175,11 @@ public:
     enum : int { A };
     RotateXNode(FRepNode::Ptr child, float angle_rad, std::string nid = "rx") {
         kind = NodeKind::RotateX; id = std::move(nid);
-        params.init({"a"}, {angle_rad});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"a"};
+            return n;
+        }(), {angle_rad});
         children = {std::move(child)};
     }
     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {
@@ -197,7 +217,11 @@ public:
     enum : int { A };
     RotateZNode(FRepNode::Ptr child, float angle_rad, std::string nid = "rz") {
         kind = NodeKind::RotateZ; id = std::move(nid);
-        params.init({"a"}, {angle_rad});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"a"};
+            return n;
+        }(), {angle_rad});
         children = {std::move(child)};
     }
     llvm::Value* codegen(CgCtx& c, llvm::Value* x, llvm::Value* y, llvm::Value* z) const override {

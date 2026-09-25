@@ -89,6 +89,104 @@ inline bool wedge_coeffs(T a, T d, T& sa, T& ca, T& sb, T& cb, bool& use_max) {
     use_max = (d <= S::from(M_PI));
     return true;
 }
+/// The wedge coefficients, derived once and kept until phi0 or dphi change.
+///
+/// wedge_coeffs calls sin and cos on PARAMETERS - values that do not depend
+/// on the query point - so computing them per evaluation is work that has
+/// nothing to do with the point being asked about. Measured before this, on
+/// the same node with and without an active cut:
+///
+///     tube    3.41 ->  30.91 ns/eval    9.1x
+///     shell   4.15 ->  36.31 ns          8.8x   (58.56 with theta cuts too)
+///     cone   11.20 ->  40.04 ns          3.6x
+///
+/// and in the converter's models 50-75% of the angular solids carry a cut, so
+/// it is the common case rather than a corner. The compiled paths never had
+/// this - hep_codegen folds the coefficients into IR constants and the GLSL
+/// emitter into literals - so it was the INTERPRETER alone, which is what
+/// marching cubes, AABB refinement and MixedEval sample through.
+///
+/// Keyed on the parameters it derives from, exactly as PolyhedronNode::faces()
+/// is, so editing phi0 cannot leave the field evaluating the old wedge.
+///
+/// BOTH TYPES ARE STORED. eval_t<float> narrows phi0 before taking its sine
+/// and eval_t<double> does not, so the two produce different coefficients and
+/// caching one would silently change the other. The float path has to stay
+/// bit-identical to what it was; keeping both is four floats more per node.
+struct WedgeFold {
+    double p0 = 1e30, dp = 1e30;     // what the cache was built from
+    bool   active = false, use_max = true;
+    float  f[4] = {0, 0, 0, 0};      // sa, ca, sb, cb, as eval_t<float> makes them
+    double d[4] = {0, 0, 0, 0};      // as eval_t<double> makes them
+
+    /// Not const, and the node holds this as a `mutable` member: a const_cast
+    /// inside would say the same thing less honestly.
+    ///
+    /// THE CONSTRUCTOR PRIMES IT, so a render never takes this branch and two
+    /// threads evaluating one node do not both write. Only a parameter EDIT
+    /// re-enters it, which is single-threaded in the editor - the same
+    /// contract PolyhedronNode::faces() has always had.
+    void refresh(double phi0, double dphi) {
+        if (p0 == phi0 && dp == dphi) return;
+        p0 = phi0; dp = dphi;
+        float fa, fca, fb, fcb;
+        bool fm = true;
+        active = wedge_coeffs<float>(float(phi0), float(dphi), fa, fca, fb, fcb, fm);
+        f[0] = fa; f[1] = fca; f[2] = fb; f[3] = fcb;
+        double da, dca, db, dcb;
+        bool dm = true;
+        wedge_coeffs<double>(phi0, dphi, da, dca, db, dcb, dm);
+        d[0] = da; d[1] = dca; d[2] = db; d[3] = dcb;
+        use_max = fm;
+    }
+
+    /// The wedge term, or nothing when there is no cut - in which case the
+    /// caller omits it, exactly as the uncached path did.
+    template <class T>
+    bool value(double phi0, double dphi, T x, T y, T& out) {
+        refresh(phi0, dphi);
+        if (!active) return false;
+        using S = ScalarTraits<T>;
+        const T sa = T(sizeof(T) >= sizeof(double) ? d[0] : double(f[0]));
+        const T ca = T(sizeof(T) >= sizeof(double) ? d[1] : double(f[1]));
+        const T sb = T(sizeof(T) >= sizeof(double) ? d[2] : double(f[2]));
+        const T cb = T(sizeof(T) >= sizeof(double) ? d[3] : double(f[3]));
+        const T fa = x * sa - y * ca;
+        const T fb = x * sb + y * cb;
+        out = use_max ? S::maxv(fa, fb) : S::minv(fa, fb);
+        return true;
+    }
+};
+
+/// cos/sin of theta0 and theta0+dtheta, folded on the same rule as WedgeFold
+/// and stored in both types for the same reason.
+struct ThetaFold {
+    double t0 = 1e30, dt = 1e30;
+    bool   lo_on = false, hi_on = false;
+    float  f[4] = {0, 0, 0, 0};   // cos t0, sin t0, cos t1, sin t1
+    double d[4] = {0, 0, 0, 0};
+
+    void refresh(double theta0, double dtheta) {
+        if (t0 == theta0 && dt == dtheta) return;
+        t0 = theta0; dt = dtheta;
+        // eval_t<float> narrowed theta0 before taking its cosine; keep that.
+        const double a32 = double(float(theta0));
+        const double b32 = double(float(theta0) + float(dtheta));
+        f[0] = float(std::cos(a32)); f[1] = float(std::sin(a32));
+        f[2] = float(std::cos(b32)); f[3] = float(std::sin(b32));
+        const double b64 = theta0 + dtheta;
+        d[0] = std::cos(theta0); d[1] = std::sin(theta0);
+        d[2] = std::cos(b64);    d[3] = std::sin(b64);
+        lo_on = float(theta0) > 1e-6f;
+        hi_on = b32 < M_PI - 1e-6;
+    }
+
+    template <class T>
+    T get(int i) const {
+        return T(sizeof(T) >= sizeof(double) ? d[i] : double(f[i]));
+    }
+};
+
 /// sqrt(1 + k^2) for a slanted face, computed in DOUBLE and narrowed once.
 /// The same reason as wedge_coeffs: the parameters are float, but squaring a
 /// float slope and taking a float square root adds a second rounding the
@@ -121,8 +219,12 @@ public:
              std::string nid = "tube") {
         kind = NodeKind::Tube;
         id = std::move(nid);
-        params.init({"rmin", "rmax", "hz", "phi0", "dphi"},
-                    {rmin, rmax, hz, phi0, dphi});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"rmin", "rmax", "hz", "phi0", "dphi"};
+            return n;
+        }(), {rmin, rmax, hz, phi0, dphi});
+        fWedge.refresh(phi0, dphi);
     }
 
     template <class T>
@@ -131,7 +233,10 @@ public:
         const T rho = S::sqrtv(x * x + y * y);
         T f = S::maxv(rho - S::from(params[Rmax]), S::absv(z) - S::from(params[Hz]));
         if (params[Rmin] > 0.0) f = S::maxv(f, S::from(params[Rmin]) - rho);
-        return S::maxv(f, wedge_eval<T>(x, y, S::from(params[Phi0]), S::from(params[Dphi])));
+        T w{};
+        if (fWedge.value<T>(params[Phi0], params[Dphi], x, y, w))
+            f = S::maxv(f, w);
+        return f;
     }
     FREP_EVAL_T
 
@@ -154,6 +259,9 @@ public:
                      {params[Rmin], params[Rmax], params[Hz],
                       params[Phi0], params[Dphi]});
     }
+
+private:
+    mutable WedgeFold fWedge;
 };
 
 // ── Cone (G4Cons) ────────────────────────────────────────────────────────────
@@ -167,8 +275,12 @@ public:
              double phi0, double dphi, std::string nid = "cone") {
         kind = NodeKind::Cone;
         id = std::move(nid);
-        params.init({"rmin1", "rmax1", "rmin2", "rmax2", "hz", "phi0", "dphi"},
-                    {rmin1, rmax1, rmin2, rmax2, hz, phi0, dphi});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"rmin1", "rmax1", "rmin2", "rmax2", "hz", "phi0", "dphi"};
+            return n;
+        }(), {rmin1, rmax1, rmin2, rmax2, hz, phi0, dphi});
+        fWedge.refresh(phi0, dphi);
     }
 
     template <class T>
@@ -188,7 +300,10 @@ public:
             f = S::maxv(f, (Rmin - rho) / lat_scale<T>(double(i2) - double(i1),
                                                        2.0 * double(hz)));
         }
-        return S::maxv(f, wedge_eval<T>(x, y, S::from(params[Phi0]), S::from(params[Dphi])));
+        T w{};
+        if (fWedge.value<T>(params[Phi0], params[Dphi], x, y, w))
+            f = S::maxv(f, w);
+        return f;
     }
     FREP_EVAL_T
 
@@ -213,6 +328,9 @@ public:
                       params[Rmax2], params[Hz], params[Phi0],
                       params[Dphi]});
     }
+
+private:
+    mutable WedgeFold fWedge;
 };
 
 // ── SphericalShell (G4Sphere) ────────────────────────────────────────────────
@@ -231,8 +349,13 @@ public:
                        float theta0, float dtheta, std::string nid = "shell") {
         kind = NodeKind::SphericalShell;
         id = std::move(nid);
-        params.init({"rmin", "rmax", "phi0", "dphi", "theta0", "dtheta"},
-                    {rmin, rmax, phi0, dphi, theta0, dtheta});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"rmin", "rmax", "phi0", "dphi", "theta0", "dtheta"};
+            return n;
+        }(), {rmin, rmax, phi0, dphi, theta0, dtheta});
+        fWedge.refresh(phi0, dphi);
+        fTheta.refresh(theta0, dtheta);
     }
 
     template <class T>
@@ -242,16 +365,19 @@ public:
         const T rad = S::sqrtv(rho * rho + z * z);
         T f = rad - S::from(params[Rmax]);
         if (params[Rmin] > 0.0) f = S::maxv(f, S::from(params[Rmin]) - rad);
-        f = S::maxv(f, wedge_eval<T>(x, y, S::from(params[Phi0]), S::from(params[Dphi])));
-        const T t0 = S::from(params[Theta0]);
-        const T t1 = t0 + S::from(params[Dtheta]);
-        // cos/sin in double and narrowed once - see wedge_coeffs.
-        if (t0 > S::from(1e-6))
-            f = S::maxv(f, -(rho * S::from(std::cos(double(t0))) -
-                             z * S::from(std::sin(double(t0)))));
-        if (t1 < S::from(M_PI) - S::from(1e-6))
-            f = S::maxv(f, rho * S::from(std::cos(double(t1))) -
-                              z * S::from(std::sin(double(t1))));
+        {
+            T w{};
+            if (fWedge.value<T>(params[Phi0], params[Dphi], x, y, w))
+                f = S::maxv(f, w);
+        }
+        // The theta cones are the same story as the wedge: cos and sin of
+        // parameters, folded once. They were the other half of the 58.56 ns
+        // a fully cut shell cost.
+        fTheta.refresh(params[Theta0], params[Dtheta]);
+        if (fTheta.lo_on)
+            f = S::maxv(f, -(rho * fTheta.get<T>(0) - z * fTheta.get<T>(1)));
+        if (fTheta.hi_on)
+            f = S::maxv(f, rho * fTheta.get<T>(2) - z * fTheta.get<T>(3));
         return f;
     }
     FREP_EVAL_T
@@ -276,6 +402,10 @@ public:
                       params[Dphi], params[Theta0],
                       params[Dtheta]});
     }
+
+private:
+    mutable WedgeFold fWedge;
+    mutable ThetaFold fTheta;
 };
 
 // ── Trapezoid (G4Trd) ────────────────────────────────────────────────────────
@@ -289,8 +419,11 @@ public:
                   std::string nid = "trd") {
         kind = NodeKind::Trapezoid;
         id = std::move(nid);
-        params.init({"dx1", "dx2", "dy1", "dy2", "hz"},
-                    {dx1, dx2, dy1, dy2, hz});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"dx1", "dx2", "dy1", "dy2", "hz"};
+            return n;
+        }(), {dx1, dx2, dy1, dy2, hz});
     }
 
     template <class T>
@@ -349,9 +482,12 @@ public:
                    float phi0, float dphi, int nside, std::string nid = "poly") {
         kind = NodeKind::Polyhedron;
         id = std::move(nid);
-        params.init({"rmin1", "rmax1", "rmin2", "rmax2", "hz", "phi0", "dphi",
-                     "nside"},
-                    {rmin1, rmax1, rmin2, rmax2, hz, phi0, dphi, double(nside)});
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"rmin1", "rmax1", "rmin2", "rmax2", "hz", "phi0", "dphi", "nside"};
+            return n;
+        }(), {rmin1, rmax1, rmin2, rmax2, hz, phi0, dphi, double(nside)});
+        fWedge.refresh(phi0, dphi);
     }
 
     /// The face normals, derived from phi0, dphi and nside. Recomputing the
@@ -399,7 +535,10 @@ public:
             f = S::maxv(f, (Rmin - r) / lat_scale<T>(double(i2) - double(i1),
                                                      2.0 * double(hz)));
         }
-        return S::maxv(f, wedge_eval<T>(x, y, S::from(params[Phi0]), S::from(params[Dphi])));
+        T w{};
+        if (fWedge.value<T>(params[Phi0], params[Dphi], x, y, w))
+            f = S::maxv(f, w);
+        return f;
     }
     FREP_EVAL_T
 
@@ -432,6 +571,7 @@ public:
     }
 
 private:
+    mutable WedgeFold fWedge;
     mutable std::vector<double> f_;
     mutable double fp0_ = 1e30, fdp_ = 1e30;
 };
@@ -449,9 +589,11 @@ public:
         kind = NodeKind::Frame;
         id = std::move(nid);
         children.push_back(std::move(child));
-        params.init({"r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8",
-                     "tx", "ty", "tz"},
-                    {r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8],
+        params.init([]() -> const std::vector<std::string>& {
+            // One table per KIND, built once - see ParamStore::init.
+            static const std::vector<std::string> n{"r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "tx", "ty", "tz"};
+            return n;
+        }(), {r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8],
                      tx, ty, tz});
     }
 

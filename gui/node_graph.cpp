@@ -604,8 +604,9 @@ void NodeGraphScene::load_from_tree(const std::shared_ptr<FRepNode>& root) {
             return node;
         }
 
-        // Parameters.
-        for (auto& [k, v] : fnode->params) {
+        // Parameters. `const auto&`: ParamStore yields a proxy by value, so
+        // a non-const lvalue reference has nothing to bind to.
+        for (const auto& [k, v] : fnode->params) {
             QString qk = QString::fromStdString(k);
             if (node->param_values().count(qk))
                 node->param_values()[qk] = v;
